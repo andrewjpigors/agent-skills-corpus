@@ -1,0 +1,611 @@
+---
+name: orchestrator
+description: "자연어 요청을 받아 전체 개발 사이클을 자동 처리해야 할 때. — MUST TRIGGER: /nova:auto 호출, 사용자가 '전체 알아서 해줘' 유형의 요청을 할 때, 다중 에이전트 편성이 필요한 복합 작업."
+description_en: "Use when a natural-language request needs the entire development cycle auto-handled. — MUST TRIGGER: /nova:auto invocation, 'just handle everything' requests, or complex tasks requiring multi-agent formation."
+user-invocable: false
+---
+
+# Nova Orchestrator
+
+## 적용 규칙 (on-demand 로드)
+
+- `docs/nova-rules.md §2` Generator-Evaluator 분리 + 핸드오프 (self_verify 필드)
+- `docs/nova-rules.md §6` 복잡한 작업의 스프린트 분할 (각 스프린트 완료 = Evaluator 필수)
+- `docs/nova-rules.md §10` 관찰성 계약 — Phase 전이·스프린트 전환 시 이벤트 기록
+
+## 관찰성 훅 (v5.12.0+)
+
+**Phase 전이** 시 (예: Phase A→B, pending→running→completed) 이벤트 기록:
+
+```bash
+bash hooks/record-event.sh phase_transition "$(jq -cn \
+  --arg oid "$ORCHESTRATION_ID" \
+  --arg phase "$PHASE_NAME" \
+  --arg from "$FROM_STATUS" \
+  --arg to "$TO_STATUS" \
+  '{orchestration_id:$oid, phase_name:$phase, from_status:$from, to_status:$to}')"
+```
+
+**Sprint 전환** 시:
+```bash
+bash hooks/record-event.sh sprint_started "{...}"   # 착수
+bash hooks/record-event.sh sprint_completed "{...}" # 종료 (verdict 포함)
+```
+
+**블로커 감지/해소** 시 (§7 분류):
+```bash
+bash hooks/record-event.sh blocker_raised "$(jq -cn --arg t \"$BTYPE\" --arg c \"$CAUSE\" '{blocker_type:$t, cause:$c}')" 2>/dev/null || true
+bash hooks/record-event.sh blocker_resolved "$(jq -cn --arg t \"$BTYPE\" --arg r \"$RESOLUTION\" '{blocker_type:$t, resolution:$r}')" 2>/dev/null || true
+```
+
+Safe-default: 실패는 exit 0, 상위 파이프라인 영향 없음.
+
+자연어 한 줄을 받아서 설계→구현→검증→수정 전체 파이프라인을 자동 실행한다.
+
+## 핵심 원칙
+
+- 설계가 구현보다 먼저다 (CPS)
+- Generator ≠ Evaluator (역할 분리)
+- 구조화된 프롬프트가 자연어보다 낫다
+- 멀티 프로젝트 병렬 지원
+
+## 오케스트레이션 추적 (MCP 도구) — **필수 계약**
+
+**이 섹션은 soft 권고가 아니라 계약이다.** 각 Phase 진행 상황은 반드시 MCP 도구로 추적한다. 세션 중단 시 `.nova-orchestration.json`으로 복구 지점이 되며, 누락 시 Evolve 피드백 루프의 관찰 데이터가 공백이 된다.
+
+| 시점 | MCP 도구 호출 | 누락 시 영향 |
+|------|--------------|------------|
+| **Phase 0**: 오케스트레이션 등록 | `orchestration_start` — task, complexity, phases 전체 등록 | 세션 끊기면 복구 불가 + 외부에서 진행 조회 불가 |
+| Phase N 시작 | `orchestration_update` — status: "running" | 어느 Phase에서 끊겼는지 모름 |
+| Phase N 완료 | `orchestration_update` — status: "completed" + result | Phase 소요 시간·산출물 메트릭 공백 |
+| Phase N 실패 | `orchestration_update` — status: "failed" + result | 실패 패턴 분석 불가 |
+| 상태 확인 | `orchestration_status` — 현재 진행 상황 조회 | (조회용, 선택) |
+
+### Phase 0: 오케스트레이션 등록 (무조건 최우선)
+
+**요청 분석(Phase 1) 직전에 반드시 실행한다.** 분기 매트릭스 평가·Architect spawn·Design 재사용 판단 등 **어떤 다른 스텝보다 먼저**.
+
+```
+orchestration_start({
+  task: "사용자 프로필 페이지 구현",
+  complexity: "medium",
+  phases: [
+    { name: "설계", role: "Architect" },
+    { name: "구현", role: "Generator" },
+    { name: "검증", role: "Evaluator" }
+  ]
+})
+→ orch-abc123   # 이 ID를 이후 모든 update에서 참조
+```
+
+이후 Phase마다:
+
+```
+orchestration_update({ orchestration_id: "orch-abc123", phase_name: "설계", status: "running" })
+# ... Architect 실행 ...
+orchestration_update({ orchestration_id: "orch-abc123", phase_name: "설계", status: "completed", result: "CPS 설계서 작성 완료" })
+orchestration_update({ orchestration_id: "orch-abc123", phase_name: "구현", status: "running" })
+# ...
+```
+
+### Escape hatch는 단 하나 — 명시적 에러
+
+MCP 도구 호출이 **실제로 에러를 반환한** 경우에만 추적 없이 진행한다. "가볍게 스킵"하거나 "이번은 필요 없을 것 같아서 생략"은 계약 위반이다.
+
+호출 시도 후 에러 발생 시:
+- stderr에 `[Orchestrator] orchestration_start 호출 실패 — 추적 없이 진행: <에러 메시지>` 기록
+- 이후 Phase 진행은 기존 방식으로 계속
+
+사용 불가 환경이라는 **추정**만으로 호출 자체를 생략하지 않는다. 반드시 시도한다.
+
+### 사후 감사
+
+세션 종료 시 `hooks/audit-orchestration.sh`가 이 계약 준수 여부를 자동 검사한다. Generator/Evaluator Task 호출이 있었는데 `.nova-orchestration.json`에 오늘자 기록이 없으면 `orchestration_missing` 이벤트가 기록되고, 다음 세션 Evaluator가 이를 사용자에게 보고한다.
+
+## Execution
+
+### Phase 0: 오케스트레이션 등록 (필수, 최우선)
+
+요청을 받자마자 **Phase 1 분석 이전에** `orchestration_start`를 호출한다. 초기에 phases 구성이 불확실하면 최소 골격(Architect/Generator/Evaluator)으로 등록 후 `orchestration_update`로 필요 시 보완한다. **호출 자체를 스킵하지 않는다.**
+
+등록 없이 Phase 1 이후로 넘어가면 관찰성 계약을 위반한 것이며, 사후 감사(`hooks/audit-orchestration.sh`)가 `orchestration_missing` 이벤트를 기록한다.
+
+### Phase 1: 요청 분석
+
+사용자 요청에서 다음을 추출한다:
+
+- **프로젝트 경로**: 절대 경로 또는 현재 디렉토리 기준 상대 경로
+- **작업 목표**: 무엇을 만들거나 변경하는가
+- **복잡도**: 파일 수, 모듈 범위, 프로젝트 수로 판단
+- **멀티 프로젝트 여부**: 2개 이상 프로젝트에 걸친 요청인지 판단
+
+NOVA-STATE.md가 있으면 현재 스프린트 컨텍스트와 Phase를 참고한다.
+
+#### Plan/Design 재사용 분기
+
+요청 분석 직후, Phase 2 진입 전에 기존 산출물을 확인하고 분기한다.
+
+**slug 추출 규칙**:
+1. 요청에서 따옴표(`'` 또는 `"`) 안의 텍스트를 추출한다. 따옴표가 없으면 플래그(`--xxx`)를 제외한 전체 요청 텍스트를 사용한다.
+2. 공백을 `-`로 치환한다.
+3. 한글·영문·숫자·하이픈 이외의 특수문자를 제거한다. **한글은 유지한다.**
+4. 최종 slug 예시:
+   - `"건폐율 시각화 추가"` → `건폐율-시각화-추가`
+   - `"add carousel"` → `add-carousel`
+5. 플래그 제거 후 slug가 빈 문자열이면(예: `/nova:auto --fresh --design-only`), 재사용 분기를 건너뛰고 fresh 동작으로 진입한다. 경고 로그: `[Orchestrator] slug 추출 실패 — fresh 모드로 진행`. 요청에 플래그가 없고 텍스트도 비어 있는 경우에만 요청 첫 단어를 slug로 사용한다.
+
+**후보 매칭 규칙**:
+- `docs/plans/{slug}.md` — exact match 우선
+- exact match 실패 시 slug의 첫 단어로 시작하는(`startsWith`) 파일을 fuzzy 후보로 수집
+- 후보가 **2개 이상**이면 사용자에게 숫자 선택 프롬프트를 출력한다:
+  ```
+  다음 기존 Plan 중 재사용할 것을 선택하세요:
+  [1] {후보1}.md
+  [2] {후보2}.md
+  [f] fresh로 처음부터
+  ```
+
+**분기 매트릭스**:
+
+**우선순위**: 위에서 아래로 순차 평가한다. 먼저 매칭되는 행이 적용된다. 특히 Plan과 Design이 **모두** 존재하면 Design 행이 우선(Phase 2·3 스킵).
+
+| 조건 | 동작 |
+|------|------|
+| `--fresh` + `--deep` 동시 있음 | 기존 Plan/Design 무시 + deepplan 스킬 호출로 Plan 생성 → PlanReuseFlow로 진입. 로그: `[Orchestrator] fresh+deep 모드 — deepplan 호출 후 파이프라인 진입` |
+| `--fresh` 플래그 있음 (--deep 없음) | 재사용 무시 → fresh Architect (escape hatch). 로그: `[Orchestrator] fresh 모드 — 기존 Plan/Design 무시` |
+| `docs/designs/{slug}.md` 존재 | Phase 2·3 스킵 → Phase 4(Generator) 직행. Dev 프롬프트 기반으로 Design 파일 내용을 사용. 로그: `[Orchestrator] Design 재사용: docs/designs/{slug}.md — Phase 2·3 스킵` |
+| `docs/plans/{slug}.md`만 존재 + `--deep` | `--deep` 무시 + 경고 + Plan 재사용. 로그: `[Orchestrator] --deep 무시 — 기존 Plan 존중. 재실행하려면 --fresh --deep` |
+| `docs/plans/{slug}.md`만 존재 (Design 없음, --deep 없음) | Phase 2 Architect 실행. **단, Architect 프롬프트에 Plan 경로와 내용을 반드시 포함**하여 fresh 설계를 금지한다. 로그: `[Orchestrator] Plan 재사용: docs/plans/{slug}.md — Architect가 Plan 기반 설계` |
+| 둘 다 없음 + `--deep` | deepplan 스킬 호출 → `docs/plans/{slug}.md` 생성 → PlanReuseFlow로 진입. 로그: `[Orchestrator] deepplan 호출 — Plan 생성 후 파이프라인 진입` |
+| 둘 다 없음 | 기존 동작 유지 (fresh Architect) |
+
+**`--deep` 처리 의사코드**:
+
+```
+if flags.fresh and flags.deep:
+    log("[Orchestrator] fresh+deep 모드 — deepplan 호출 후 파이프라인 진입")
+    run_deepplan(request)   # docs/plans/{slug}.md 생성
+    return PlanReuseFlow(plan_path)
+
+if flags.fresh:
+    log("[Orchestrator] fresh 모드 — 기존 Plan/Design 무시")
+    return FreshFlow()
+
+if exists(design_path):
+    log("[Orchestrator] Design 재사용: {design_path} — Phase 2·3 스킵")
+    return DesignReuseFlow(design_path)
+
+if exists(plan_path) and flags.deep:
+    warn("[Orchestrator] --deep 무시 — 기존 Plan 존중. 재실행하려면 --fresh --deep")
+    return PlanReuseFlow(plan_path)
+
+if exists(plan_path):
+    log("[Orchestrator] Plan 재사용: {plan_path} — Architect가 Plan 기반 설계")
+    return PlanReuseFlow(plan_path)
+
+if flags.deep:
+    log("[Orchestrator] deepplan 호출 — Plan 생성 후 파이프라인 진입")
+    run_deepplan(request)   # docs/plans/{slug}.md 생성
+    return PlanReuseFlow(plan_path)
+
+return FreshFlow()  # 기존 동작
+```
+
+**Design 재사용 시 Phase 3 처리**:
+Phase 2·3을 스킵하므로, Phase 4 Dev 프롬프트는 Architect 설계서 대신 `docs/designs/{slug}.md` 내용을 기반으로 생성한다. Phase 3 프롬프트 변환 항목 표의 "Architect 설계서" 출처를 Design 파일로 대체한다.
+
+**Plan 재사용 시 Phase 2 처리**:
+Architect 서브에이전트 컨텍스트에 다음을 추가한다:
+```
+기존 Plan 파일: docs/plans/{slug}.md
+아래 Plan 내용을 기반으로 설계하라. 처음부터 새로 작성하지 않는다.
+Plan 내용에 없는 내용을 발명하지 말고, Plan의 Solution·Sprints 구조를 설계서에 반영하라.
+---
+{Plan 파일 전체 내용}
+---
+```
+
+**UI 변경 사전 감지** (선택적):
+   bash scripts/detect-ui-change.sh --planning 호출 → likely_ui 결과 표시.
+   "UI 변경 가능성: {Yes/No}" 1줄 출력 (사용자 인지 목적, 분기 결정 X).
+
+#### 복잡도 판단 기준
+
+| 복잡도 | 기준 | 에이전트 편성 |
+|--------|------|-------------|
+| 간단 | 1~2 파일, 단일 프로젝트 | Dev 1 → QA 1 |
+| 보통 | 3~7 파일, 단일 프로젝트 | Architect 1 → Dev 1 → QA 1 |
+| 복잡 | 8+ 파일 또는 멀티 프로젝트 | Architect N → Dev N → QA N → Fix N |
+
+인증/DB/결제/보안 관련 변경은 파일 수와 무관하게 한 단계 상향한다.
+
+### Phase 2: 설계 (Architect)
+
+**간단 복잡도는 이 단계를 건너뛴다.**
+
+Architect 에이전트를 spawn하여 CPS 설계를 수행한다.
+
+Architect 에이전트 지시 원칙:
+1. 프로젝트 코드를 직접 읽고 현재 상태를 파악한다
+2. CPS(Context→Problem→Solution) 구조로 설계서를 작성한다
+3. 설계 산출물에 다음을 포함한다:
+   - 페이지/컴포넌트 구조
+   - 디자인 토큰 (색상, 폰트, 간격 — 해당 시)
+   - 데이터 흐름 및 API 경계
+   - 기술 스택 및 구현 제약
+   - 구현 순서 및 우선순위
+   - 빌드/검증 명령
+
+멀티 프로젝트면 각 프로젝트별 Architect를 병렬 실행한다 (`run_in_background: true`).
+
+Architect 서브에이전트에 반드시 포함할 컨텍스트:
+
+```
+작업 디렉토리: {프로젝트_경로}
+작업 목표: {사용자 요청}
+역할: 구현하지 않는다. 설계서만 작성한다.
+산출물: CPS 설계서 (Context/Problem/Solution + 구현 체크리스트)
+```
+
+### --design-only 종료점
+
+`--design-only` 플래그가 있으면 Phase 2 완료 후 설계 결과를 사용자에게 보여주고 종료한다.
+Phase 3 이후는 실행하지 않는다.
+
+### 멀티 에이전트 조율 원칙
+
+복잡(8+파일) 이상에서 병렬 에이전트 투입 시 다음을 적용한다:
+
+#### 태스크 의존성 DAG
+
+스프린트 내 태스크 간 선후 관계를 명시하여 병렬 실행을 최적화한다:
+```
+[독립] A: DB 스키마  ─┐
+[독립] B: API 타입    ─┤── [의존] C: API 구현 ── [의존] D: 프론트엔드
+[독립] E: 테스트 셋업 ─┘
+```
+- 의존 관계가 없는 태스크는 병렬 에이전트로 동시 실행한다
+- 의존 태스크는 선행 태스크 완료 후 순차 실행한다
+
+#### 파일 잠금 힌트
+
+병렬 에이전트에게 "이 파일은 다른 에이전트가 수정 중"이라는 컨텍스트를 제공한다:
+```
+주의: 다음 파일은 다른 에이전트가 수정 중입니다. 읽기만 하세요:
+- src/types.ts (Agent A가 수정 중)
+- src/db/schema.ts (Agent B가 수정 중)
+```
+
+#### 전문 에이전트 > 범용 에이전트
+
+3개의 전문화된 에이전트가 1개의 범용 에이전트보다 일관되게 더 나은 결과를 낸다.
+에이전트 편성 시 역할별 전문 에이전트(architect, senior-dev, qa-engineer)를 투입한다.
+
+#### 중간 진행 점검 (mid-workflow check-in)
+
+병렬 sub-agent 실행 시 lead는 다음 시점에 진행 점검 `SendMessage`를 **1회** 권장한다 (Anthropic Managed Agents — Multiagent Orchestration 2026-05-06 패턴 흡수):
+
+- **진행률 50% 시점**: 총 N개 sub-agent 중 N/2가 idle/완료 보고를 보낸 시점.
+- **5분 이상 침묵**: 단일 sub-agent가 5분 이상 idle notification 없이 응답이 없을 때.
+- **의존성 변동**: 다른 에이전트의 산출물이 선행 가정과 다를 때 (예: 공유 스키마 변경).
+
+너무 잦은 점검은 sub-agent의 작업 흐름을 방해하므로 위 3 조건 외에는 발송하지 않는다. 점검 메시지는 짧게: "현재 진행 단계와 막힌 부분이 있다면 한 줄로 보고하라"로 충분. 점검 후 응답이 없으면 lead가 hang 가능성을 평가해 작업 분할 또는 회수를 결정한다. (참조: https://claude.com/blog/new-in-claude-managed-agents)
+
+### 구조화된 핸드오프 프로토콜
+
+에이전트 간 전달 시 구조화된 아티팩트를 사용하여 컨텍스트 손실을 방지한다. (Anthropic 3-Agent Harness 패턴 적용)
+
+| 전달 구간 | 아티팩트 형식 | 내용 |
+|-----------|-------------|------|
+| Architect → Generator | CPS 설계서 + 구현 체크리스트 | 기존 방식 유지 |
+| Generator → Evaluator | **구조화된 변경 요약** | 변경 파일, 의도, 주요 결정 |
+| Evaluator → Generator (Fix) | **구조화된 이슈 목록** | 파일:라인, 심각도, 수정 방향 |
+
+#### Generator → Evaluator 핸드오프 포맷
+
+Generator 완료 시 다음 정보를 Evaluator에게 전달한다:
+
+```
+## 변경 요약
+- 변경 파일: {파일 목록}
+- 변경 의도: {한줄 요약}
+- 주요 결정: {트레이드오프 선택 이유}
+- 알려진 제한: {미구현/의도적 생략 항목}
+- self_verify: (선택 — Sprint 1부터 권장)
+  - confident: {확신 영역 + 한줄 근거(테스트/로직 단순성 등)}
+  - uncertain: {불확실 영역 + 사유(경계값/에러 처리/동시성/외부 의존)}
+  - not_tested: {실행 검증 미수행 영역 + 사유}
+```
+
+> Evaluator는 코드 diff뿐 아니라 이 핸드오프 아티팩트를 참조하여, Generator의 의도와 실제 구현의 정합성을 검증한다.
+
+**self_verify 필드 원칙** (Sprint 1부터):
+- 선택 필드 — 없어도 기존 검증 동작 (하위호환).
+- confident에는 **"왜 확신하는지" 한 줄 근거**를 반드시 포함. 근거 없는 확신은 자기 과신으로 간주.
+- uncertain/not_tested가 **0건**이면 오히려 의심 시그널 — Generator에게 경계값·에러 처리·외부 의존을 다시 점검하도록 지시한다.
+- 근거: *LLM Evaluators Recognize and Favor Their Own Generations* (arXiv 2404.13076) — self-preference bias는 구조적으로 방어 필요.
+- Sprint 1에서는 **신호 수집만**. Layer 배분 최적화는 Sprint 2, 충돌 학습은 Sprint 3, Jury 참여는 Sprint 4.
+
+**Orchestrator 수신 시 관측 (Sprint 1 채택률 측정)**:
+- Generator 핸드오프 수신 직후 `self_verify` 필드 유무를 한 줄로 로그한다:
+  ```
+  [Handoff] self_verify: present  — confident={N}/uncertain={N}/not_tested={N}
+  [Handoff] self_verify: absent   — Generator에게 필드 포함 재요청 (Sprint 1은 재요청만, 차단 X)
+  ```
+- `absent`인 경우 Evaluator 전달 전 Generator에게 **한 번 재요청**한다 (루프 금지 — 2회차도 absent면 그대로 진행).
+- 이 관측 로그는 Sprint 2의 Layer 배분 최적화 근거 데이터로 활용된다.
+
+**Evaluator 전달 시 메타 필드 (absent 구분)**:
+재요청 시도 후에도 `self_verify`가 없으면 Evaluator에게 아래 메타 필드를 명시적으로 포함시킨다. Evaluator는 "원래 누락"과 "재요청도 실패한 누락"을 구분해 Sprint 1 관측 데이터 품질을 유지한다.
+```
+## self_verify_meta (Orchestrator가 Evaluator에게 전달)
+- status: {present | absent_initial | absent_after_retry}
+- retries: {0 | 1}
+```
+- `present`: Generator가 1차에 포함 → Evaluator는 필드 내용을 그대로 사용
+- `absent_initial`: 1차 누락 (재요청 전). 보통 Orchestrator가 재요청하여 이 상태로는 Evaluator에 도달하지 않음
+- `absent_after_retry`: 재요청도 실패. 채택률 통계에서 "강한 미채택 시그널"로 집계
+
+#### Evaluator → Generator (Fix) 핸드오프 포맷
+
+FAIL 판정 시 수정 지시를 구조화하여 전달한다:
+
+```
+## 수정 지시
+[1] {파일:라인} — {심각도} — {이슈} → {수정 방향}
+[2] ...
+수정 범위: 위 항목에만 한정. 다른 코드 수정 금지.
+```
+
+### Phase 3: 프롬프트 변환
+
+> **조건부 실행**: Phase 1의 Design 재사용 분기에서는 이 Phase 전체가 스킵된다. 아래 표의 "Architect 설계서" 출처는 그 경로에서 `docs/designs/{slug}.md`로 대체되어 Phase 4 Dev 프롬프트에 직접 주입된다.
+
+Architect의 설계서를 Dev 에이전트 프롬프트로 변환한다.
+이 단계가 품질의 핵심이다 — 설계서의 구체적 정보가 구현 지침으로 주입된다.
+
+Dev 프롬프트에 반드시 포함할 항목:
+
+| 항목 | 출처 |
+|------|------|
+| 프로젝트 경로 (절대 경로) | 요청 분석 |
+| 기술 스택 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| 파일/컴포넌트 구조 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| 디자인 토큰 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| 데이터 흐름 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| 구현 순서 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| 빌드 검증 명령 | Architect 설계서 (Design 재사용 시: `docs/designs/{slug}.md`) |
+| "구현만 해, 검증은 별도" 명시 | 항상 포함 |
+
+간단 복잡도는 Architect 없이 사용자 요청에서 직접 Dev 프롬프트를 생성한다.
+
+### Phase 4: 구현 (Generator)
+
+Dev 에이전트를 spawn한다 (`senior-dev` 타입).
+
+- `run_in_background: true`로 비동기 실행
+- 멀티 프로젝트면 프로젝트별 Dev를 병렬 실행 (각 프로젝트 독립)
+- Dev에게 "구현만 하라, 검증은 별도 수행한다"를 명시
+
+모든 Dev 에이전트 완료 대기 후 구현 결과를 수집한다.
+
+#### Checkpoint: Generate 완료
+
+구현 결과 요약을 사용자에게 보고한다:
+- 변경된 파일 목록
+- 주요 변경 내용 요약 (3줄 이내)
+
+`--skip-qa` 플래그가 있으면 Phase 5~6을 건너뛰고 Phase 7로 이동한다.
+
+### Phase 5: 검증 (Evaluator)
+
+QA 에이전트를 spawn한다 (`qa-engineer` 타입).
+
+QA 프롬프트에 반드시 포함할 항목:
+- 검증 대상 파일 목록
+- 설계서 기반 검증 기준 (있는 경우)
+- 빌드/테스트 명령
+
+`--strict` 플래그가 있으면 Full 검증(Layer 1~3)을 강제한다.
+기본은 Standard 검증이다.
+
+멀티 프로젝트면 프로젝트별 QA를 병렬 실행한다.
+
+#### 검증 항목
+
+| 항목 | 기본 | --strict |
+|------|------|---------|
+| 빌드 성공 | 필수 | 필수 |
+| TypeScript 타입 에러 | 필수 | 필수 |
+| 파일 구조 (설계서 대조) | 필수 | 필수 |
+| 실제 동작 (curl/playwright) | 생략 | 필수 |
+| 경계값 시나리오 | 생략 | 필수 |
+
+### Phase 5.5: UI 변경 감지 + 자동 검증 (G3 페어 게이트)
+
+Phase 5가 PASS면 다음을 수행한다.
+
+**Phase 5.5는 5.5a (코드 기반 ux-audit Lite, 기존)와 5.5b (시각 기반 visual-self-verify, 신규) 두 단계로 구성된다.**
+
+- 5.5a는 항상 수행 (UI 변경 감지 시) — 코드 분석으로 빠른 1차 게이트
+- 5.5b는 `docs/plans/{slug}-intent.json` 존재 시 추가 수행 — 시각 기반 G3 차단 게이트
+- intent.json 미존재 (사용자가 G1 스킵 또는 비-UI plan) → 5.5b 스킵
+
+### Phase 5.5a: UI 변경 감지 + ux-audit Lite (자동, 코드 기반)
+
+Phase 5가 PASS면 다음을 수행한다:
+
+1. `result = bash scripts/detect-ui-change.sh --post-impl`
+
+2. `result.is_ui == false` → 즉시 Phase 7으로 (메트릭 기록 없음)
+
+3. `result.cache_hit == true`:
+   - "[Nova] 이전 감사와 동일한 변경 — ux-audit Lite 생략" 1줄 출력
+   - `bash scripts/log-metric.sh --event ui_audit_triggered --cache_hit 1`
+   - Phase 7으로
+
+4. `--no-ux-audit` 플래그 OR (`nova-config.json` 존재 AND `.auto.uiAudit == false`):
+   - `bash scripts/log-metric.sh --event ui_audit_opt_out --reason flag` (또는 `--reason config`)
+   - Phase 7으로
+
+5. 사전 고지:
+   - `.nova/ui-state.json` 미존재 또는 `.first_ui_audit_shown == false`:
+     다음 자세한 안내 출력 (첫 트리거 템플릿):
+     ```
+     [Nova] UI 변경이 감지되었습니다. ux-audit Lite(3인 평가자)를 자동 실행합니다.
+     - 평가자: Newcomer · Accessibility · Cognitive Load
+     - 대상 파일: {result.files}
+     - 이 자동화를 끄려면: --no-ux-audit 플래그 또는 nova-config.json { "auto": { "uiAudit": false } }
+     ```
+     `.nova/ui-state.json` 갱신: `first_ui_audit_shown = true`
+   - 그 외: "[Nova] UI 변경 감지 → ux-audit Lite 병행" 1줄 출력
+
+6. **ux-audit Lite 실행** (Newcomer + Accessibility + Cognitive Load 3인, 5인 Full 아님):
+   - `target = result.files`
+   - ux-audit 스킬을 Lite 모드로 호출
+
+7. 완료 후 메트릭 기록 및 캐시 갱신:
+   ```
+   bash scripts/log-metric.sh --event ui_audit_completed \
+     --critical N --high N --medium N --low N
+   ```
+   `.nova/last-audit.json` 갱신: `hash, ts, result, files, stats`
+
+8. `result.critical >= 1` AND (`nova-config.json` 미존재 OR `.auto.uiAuditBlockOnCritical != false`):
+   - 커밋 차단 + 사용자에게 Critical 목록 보고
+   - 옵션 제시: 재시도 / `--no-ux-audit` / 수동 fix
+9. 그 외: Phase 5.5b 진입 (intent.json 존재 시) 또는 Phase 7으로
+
+### Phase 5.5b: G3 Visual Self-Verify (자동, 시각 기반)
+
+Phase 5.5a PASS 후 다음을 수행한다 (intent.json 존재 시만):
+
+1. `intent_path = docs/plans/{slug}-intent.json` 확인
+   - 미존재 → 즉시 Phase 7으로 (G1 스킵된 워크플로우)
+
+2. `vsv = bash scripts/visual-self-verify.sh --intent <intent_path> --output .nova/visual-audit/{ts}.json`
+
+3. `vsv.cache_hit == true`:
+   - "[Nova] 동일한 변경 — 시각 검증 캐시 hit (생략)" 1줄 출력
+   - `bash scripts/log-metric.sh --event visual_verify_cache_hit`
+   - Phase 7으로
+
+4. `vsv.skipped == true`:
+   - opt-out 메트릭 (스크립트가 자동 기록)
+   - Phase 7으로
+
+5. **Agent 서브에이전트 spawn (vision-capable Claude — Anthropic API 키 불필요)**:
+   ```
+   Agent({
+     description: "Visual Intent Verifier",
+     subagent_type: "general-purpose",
+     model: vsv.agent_model_hint == "opus" ? "opus" : undefined,
+     prompt: vsv.evaluator_prompt + (vsv.screenshot_paths 존재 시 첨부)
+   })
+   ```
+   - Agent는 verdict JSON 출력: `{verdict, overall_score, mismatches, strengths, rationale}`
+
+6. **차단 정책 적용**:
+   - `verdict == fail` → 커밋 차단 + 사용자에게 mismatches 보고. Phase 6 (Auto-Fix) 진입 가능
+   - `verdict == degraded` → 경고만, 차단 X. "[Nova] 시각 검증 폴백 — 사용자 수동 확인 권장" 안내
+   - `verdict == pass` → 캐시 갱신 (`.nova/last-visual-audit.json` — hash + verdict + ts), Phase 7으로
+
+7. 메트릭 기록:
+   ```
+   bash scripts/log-metric.sh --event visual_verify_completed \
+     --verdict <pass|fail|degraded> --critical N --high N --medium N --source <source>
+   ```
+
+### Phase 6: 수정 (Auto-Fix)
+
+QA 결과에서 FAIL/Critical/HIGH 이슈를 추출한다.
+
+이슈가 없으면 이 단계를 건너뛴다.
+
+Fix 에이전트를 spawn한다 (`senior-dev` 타입):
+- 수정 범위를 QA가 지적한 항목에만 한정한다 — 다른 코드는 건드리지 않는다
+- 새 서브에이전트를 spawn한다 (이전 Dev 컨텍스트 오염 방지)
+- 수정 완료 후 빌드를 확인한다
+
+Fix 완료 후 Phase 5(검증)를 재실행한다. 재시도는 최대 1회.
+2번째 FAIL 시 즉시 중단하고 사용자에게 에스컬레이션한다.
+
+Fix 에이전트에 반드시 포함할 컨텍스트:
+
+```
+작업 디렉토리: {프로젝트_경로}
+수정 대상: QA가 지적한 {N}건
+[1] {파일:라인} — {이슈 설명} → {수정 방향}
+[2] ...
+주의: 지적된 항목 외 다른 코드는 수정하지 않는다.
+```
+
+### Phase 7: 결과 보고
+
+전체 프로세스 결과를 요약하여 보고한다.
+
+```
+━━━ Nova Orchestrator — 완료 ━━━━━━━━━━━━━━━━━
+  요청: {원본 요청}
+  투입 에이전트: Architect {N} / Dev {N} / QA {N} / Fix {N}
+
+  ## 프로젝트별 결과
+  | 프로젝트 | Dev | QA | 판정 |
+  |----------|-----|-----|------|
+  | {경로} | 완료 | PASS | ✓ |
+
+  ## 수정 필요 항목
+  (CONDITIONAL 또는 FAIL 시 목록)
+
+  ## 다음 단계
+  - {배포 가능 / 수동 확인 필요 항목}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**에이전트 상태 추적**: Claude Code의 `TeammateIdle`/`TaskCompleted` 훅 이벤트가 가용하면, 에이전트 완료를 자동 감지하여 다음 의존 태스크를 트리거한다. 가용하지 않으면 폴링으로 대기한다.
+
+**CRITICAL: 팀원 종료 의무 (idle ≠ shutdown).** TeamCreate 또는 Agent(team_name=...)로 teammate를 spawn 했다면, Phase 7 결과 보고 직후 lead가 **각 teammate에게 명시적으로 `SendMessage({type:"shutdown_request"})` 발송**한다. teammate의 idle notification은 종료 신호가 **아니며**, lead가 shutdown_request를 보내고 teammate가 approve할 때까지 process가 살아 있어 tmux pane·세션 비용을 점유한다. 발송 직후 다음 단계로 진행하고 자동 idle/shutdown_response 알림으로 종료를 확인한다. 모든 teammate가 shutdown 응답한 뒤 필요 시 `TeamDelete`로 팀 디렉토리를 정리한다. (참조: MEMORY `feedback_shutdown_idle_agents.md`. v5.47.x 자기-발견 갭 — orchestrator/evolution skill에 본 의무 부재로 4 스캐너가 idle 점유한 사례)
+
+**CRITICAL: 결과 보고 직후, 반드시 NOVA-STATE.md를 갱신한다. 이 단계를 건너뛰지 마라.**
+
+NOVA-STATE.md가 있으면 Last Activity를 갱신한다:
+```
+- /nova:auto → {PASS/FAIL} — {프로젝트명} | {ISO 8601 타임스탬프}
+- /nova:auto → UI 감지 → ux-audit Lite PASS — Critical N / High N / Medium N / Low N | {ISO 8601 타임스탬프}
+```
+
+**시계열은 events.jsonl 단일 진실원 (v5.44.0+)**: NOVA-STATE.md의 Recent Activity / Recently Done 표에 행 추가 X. 활동 기록은 `hooks/record-event.sh`(자동 호출)가 `.nova/events.jsonl`에, v3 marker 영역은 Stop hook이 `scripts/registry-render-state.sh`로 자동 갱신. AI는 Current/Phase/Refs/Risks 본문 스냅샷만 손편집 — 트림 의무 없음. (상세: skills/context-chain/SKILL.md)
+
+### v3 work-item registry 갱신 (Sprint 2)
+
+Phase 7 결과 보고 직후, **orchestrator(메인 컨텍스트)가 직접 `registry-write.sh` 호출**한다. Evaluator sub-agent는 verdict만 stdout 출력 — orchestrator가 받아 처리:
+
+- **Evaluator PASS** → `evaluator-pass` 호출 (원자적 status=done + review_required=false + evidence)
+  ```bash
+  bash "$NOVA_PLUGIN_PATH/scripts/registry-write.sh" evaluator-pass "$WI_ID" \
+    --commit-sha="$(git rev-parse HEAD)" \
+    --test-output="<verification path>"
+  ```
+- **블로커 발견** → `transition <wi> blocked --blocked-reason="..."`
+- **Evaluator FAIL** → status 유지 (active). Refiner sub-agent 결과 받아 메인이 재시도. transition 호출 X.
+
+권한 경계 (Sprint 0 spec `docs/specs/registry-write-authority-v3.md`):
+- orchestrator skill 자체는 *조정자* — sub-agent들이 직접 registry-write 호출 금지
+- evaluator·qa-engineer·refiner sub-agent는 *판정·제안만*, registry 쓰기 절대 X
+- 메인(또는 orchestrator)이 verdict 받아 위 명령 1회 호출 (단일 쓰기 경로)
+
+## 플래그
+
+| 플래그 | 동작 |
+|--------|------|
+| (없음) | 전체 사이클 (설계→구현→검증→수정) |
+| `--design-only` | 설계까지만 (구현 전 확인용) |
+| `--skip-qa` | QA 생략 (빠른 프로토타이핑) |
+| `--strict` | QA를 Full 검증으로 강제 |
+| `--fresh` | 기존 Plan/Design 무시, 강제 fresh Architect (escape hatch) |
+| `--deep` | Plan 없을 때 deepplan 스킬(Explorer×3→Synth→Critic→Refiner) 호출 후 파이프라인 진입. 아키텍처 전환·대형 마이그레이션에 권장 |
+| `--fresh --deep` | 기존 Plan 무시 + deepplan으로 새 Plan 생성 후 파이프라인 진입 |
+
+## Input
+
+$ARGUMENTS

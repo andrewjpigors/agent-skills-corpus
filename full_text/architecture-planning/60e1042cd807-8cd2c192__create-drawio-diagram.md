@@ -1,0 +1,242 @@
+---
+name: create-drawio-diagram
+description: Create Draw.io diagrams from reusable architecture diagram templates and store editable `.drawio` files beside architecture documents. Use when the user asks for Draw.io, diagrams.net, editable architecture diagrams, or when an architecture workflow needs Draw.io versions of target architecture, solution architecture, data architecture, capability context, application component, conceptual data model, integration design, or integration flow diagrams.
+---
+
+# Create Draw.io Diagram
+
+## Quick Start
+
+Create editable Draw.io diagrams for architecture deliverables using the templates in `templates/` and the visual rules in `STYLE.md`.
+
+Use this skill when a generated architecture document needs diagrams that stakeholders can edit in Draw.io or diagrams.net. Store generated `.drawio` files in the same folder as the architecture document they support.
+
+## Diagram Templates
+
+Use these templates as starting points:
+
+- `templates/capability-overview.drawio` for actors, neighboring capabilities, and external dependencies
+- `templates/target-architecture-diagram.drawio` for a simple target architecture overview across capabilities, applications, data, integrations, and technology
+- `templates/solution-architecture-diagram.drawio` for a simple solution architecture overview across channels, components, integrations, data stores, and external systems
+- `templates/data-architecture-diagram.drawio` for a simple data architecture overview across source systems, canonical data objects, owners, consumers, integrations, and governance
+- `templates/data-flow.drawio` for data flow diagrams with process stages across the top, systems as horizontal lanes, and labeled data movements between lanes
+- `templates/application-component-view.drawio` for applications, services, components, platforms, and responsibilities
+- `templates/conceptual-data-model.drawio` for canonical data objects and relationships
+- `templates/integration-design.drawio` for component maps organized in vertical layers: Public Internet, Frontend, Engagement, Integration, and Enterprise Foundation (Backoffice)
+- `templates/integration-flow.drawio` for producers, consumers, interfaces, triggers, protocols, and sequence
+
+## Style Rules
+
+Use `STYLE.md` for colors, shape styles, connector styles, and layout rules.
+
+Do not introduce new colors unless the user explicitly asks for a palette change. Reuse the standard palette so diagrams stay consistent across solution architecture documents.
+
+## Light Theme Source Rules
+
+Create `.drawio` sources as light-theme diagrams from the start.
+
+- Every `mxGraphModel` must set `background="#fbfcfa"`. Do not leave the page background unset or transparent.
+- Every visible shape, layer band, connector, label, and application header must use explicit hex colors from `STYLE.md`.
+- Do not use Draw.io inherited or theme-dependent values such as `strokeColor=default`, `fontColor=default`, `labelBackgroundColor=default`, `currentColor`, CSS variables, or `light-dark(...)`.
+- Use dark text, normally `fontColor=#17201d`, on light fills. Use `fontColor=#5d6964` for connector labels unless a specific palette color communicates flow type.
+- Use `labelBackgroundColor=#fbfcfa` for connector labels so labels remain readable on light layer bands.
+- Treat dark-theme or theme-adaptive source styles as defects in the `.drawio` file. Fix the `.drawio` source before exporting SVG.
+
+## Workflow
+
+1. Confirm the diagram purpose and choose the closest template.
+2. Copy the template into the target architecture folder using a descriptive same-purpose filename, such as `capability-overview.drawio`.
+3. Replace placeholder labels with concrete architecture content from the source document, glossary, capability overview, or clarification session.
+4. Apply the exact standard colors and connector styles from `STYLE.md`. Do not use dark theme variants, approximate colors, or inherited editor defaults.
+5. Keep labels business-readable and concise. Use notes in the surrounding architecture document for detail that would clutter the diagram.
+6. Keep canonical data object names general. Do not use vendor object names, table names, endpoint resources, or internal system names in this public repository.
+7. Do not invent systems, relationships, protocols, owners, or data flows. Mark unknowns as assumptions or open questions in the architecture document.
+8. If an image export is needed, export the Draw.io diagram to a same-basename `.svg` using the SVG export rules below, then embed the SVG in the architecture document with a nearby link to the `.drawio` source.
+
+## Capability Context Layout
+
+When using `templates/capability-overview.drawio`, preserve the template topology. The diagram is a context view, not an inventory list.
+
+- Place actors, teams, and channels in the left zone.
+- Place the target capability in the center as the primary green node. The target capability node label must be only the capability name, such as `CRM`; do not list features, workspaces, screens, data products, roles, baselines, or responsibilities inside the target capability node.
+- Place systems or capabilities that deliver data to the target capability below the target capability.
+- Place systems or capabilities that get data from the target capability above the target capability.
+- Place external dependencies, third parties, regulatory constraints, and vendor dependencies in the right zone.
+- Connect each node to the target capability with a concise relationship label.
+- Use light palette colors from `STYLE.md`: actors yellow, target capability green, upstream/downstream systems blue, and external dependencies red.
+- When a node is backed by a named application, show only the application name in a separate 10 px high header box overlaid on the top edge of that node. Use the Application name header style from `STYLE.md`, make the header as wide as the component, align its top with the component top, and render it above the component body. Put capability names, component names, dependencies, and responsibilities in the node body. If the application name is unknown, omit the header.
+- Show each confirmed stakeholder, user group, actor, or channel as a separate actor node. Do not collapse stakeholders and users into one list box, and do not create a wrapper node titled `Stakeholders and users`.
+- Show components that provide data to the target capability as separate bottom nodes per main data object and/or contributing capability. When several data objects come from one application or source system, create one node per data object and repeat the application name in the node's application header. Do not collapse multiple main data objects into one provider box.
+- Show each confirmed produced outcome, downstream consumer, or related capability as a separate top consumer node. Do not collapse produced outcomes into one list box.
+- Do not stack every actor, system, platform, and dependency in one vertical column.
+- Do not convert the target capability into a system dependency. Keep it visually distinct.
+- Route actor connectors from the right side of actor nodes to the left side of the target capability, data-provider connectors from bottom nodes into the bottom of the target capability, consumer connectors from the top of the target capability to top nodes, and external dependency connectors from the right side of the target capability.
+- Use orthogonal connectors for capability context diagrams. Do not use diagonal straight-line connectors when an orthogonal route can keep labels and arrowheads clearer.
+- Attach arrows to the nearest relevant edge of each box using explicit ports. Do not let arrowheads float near a box or land inside another box.
+- Route connector waypoints through whitespace lanes between rows and columns. Connectors must not cross through node bodies, application headers, or node text.
+- Do not route multiple capability overview connectors through a shared bus line when their labels, arrowheads, or vertical segments would overlap. Use one staggered orthogonal lane per connector for actor, input-provider, outcome, and external-dependency relationships.
+- Keep repeated relationship labels on their own connector segments. If repeated labels such as `uses / governs`, `produces`, `provides input`, or `depends on` collide, stagger the connector lanes or shorten the labels before exporting.
+- Avoid repeated relationship labels that overlap. When many connectors share the same relationship such as `provides input` or `gets data`, label one clear lane or stagger labels in whitespace rather than labeling every parallel connector.
+- Leave generous vertical space between the top consumer row, the target capability, and the bottom data-provider row so connector labels do not sit on top of nodes or each other.
+- When there are multiple nodes in one zone, stagger their connector lanes so labels and arrowheads do not overlap. Use explicit `mxPoint` waypoints where automatic routing creates overlap.
+- If a zone has many items, widen the canvas and spread nodes across the zone before grouping. Group only when the source content does not provide enough detail to keep the nodes meaningful or the diagram would become unreadable even after widening.
+- If the source content does not identify a relationship direction, keep the node out of the diagram and record the gap as an assumption or open question in the document.
+
+## Capability Context Helper
+
+Use `scripts/write-capability-context-diagram.py` when a workflow needs to generate both an editable `.drawio` source and a same-basename `.svg` for a capability context diagram.
+
+```sh
+python3 skills/create-drawio-diagram/scripts/write-capability-context-diagram.py "Order Management" \
+  --output-dir capabilities/order-management \
+  --stakeholder "Customer service" \
+  --stakeholder "Operations" \
+  --input-provider $'ERP\nCustomer order\nCustomer account' \
+  --input-provider "Commerce platform: Cart checkout event" \
+  --outcome "Inventory Management" \
+  --constraint "Order status is fragmented across systems."
+```
+
+By default, the helper creates `capability-overview.drawio` and `capability-overview.svg` in the output directory. Use `--basename <name>` when a different same-basename pair is needed.
+
+For `--input-provider`, pass either a single application or source system name, an inline `Application: Data object` value, or a multiline block where the first line is the application/source system and each later line is a main data object or contributing capability. Multiline blocks generate one bottom node per later line.
+
+The helper also accepts compatibility aliases for upstream capability workflows:
+
+- `--existing-system` as an alias for `--input-provider`
+- `--related-capability` as an alias for `--outcome`
+- `--pain-point` as an alias for `--constraint`
+
+## Solution Architecture Layout
+
+When using `templates/solution-architecture-diagram.drawio`, preserve the layered architecture structure. The diagram is a solution overview for one application or capability implementation, not a detailed sequence diagram or interface catalog.
+
+- Place components inside the corresponding layer band, ordered from top to bottom: Public Internet, Frontend, Engagement Services, Integration, and Enterprise Foundation (Backoffice).
+- When the solution includes a Backend-for-Frontend component, place it in the Frontend layer directly below the frontend/channel component it supports. Align the frontend component and BFF on the same x-position and use a vertical connector between them whenever possible.
+- Do not place a Backend-for-Frontend component in Engagement Services or Integration. It remains a Frontend component even when it calls APIs, composes responses, or orchestrates channel-specific requests.
+- Treat the canvas as flexible. Increase `pageWidth`, `pageHeight`, and every layer-band width or height whenever the default template would force cramped components, overlapping connectors, clipped labels, or crowded layer bands.
+- Prefer widening or heightening the canvas and spreading components before shrinking boxes, shortening important labels, or stacking unrelated components.
+- Grow all layer bands to the same width when the diagram needs more horizontal space so the architecture layers remain visually aligned. Increase layer heights and move lower bands down when components, notes, or connector labels need more vertical space.
+- Leave enough whitespace between components for connector routing and labels. For labeled horizontal connectors, reserve at least 180 px between component edges; for labels longer than 24 characters, reserve at least 240 px or move detail into the document.
+- Use separate routing lanes for different relationships. Do not let connectors share the same segment when their labels, arrowheads, or vertical drops would overlap.
+- Route long cross-layer connectors through open whitespace lanes. Do not run connectors through layer labels, component bodies, application headers, or other connector labels.
+- For dense solution architecture diagrams, widen and heighten the canvas first, then increase layer heights, then move components farther apart. Do not accept an SVG where component labels, connector labels, or arrowheads overlap.
+- Keep the diagram readable at document scale. It is better to create a wider or taller same-basename SVG than to compress a complete solution into the default canvas.
+
+## Integration Design Layout
+
+When using `templates/integration-design.drawio`, preserve the vertical layer structure. The diagram is a layered component map for an integration design, not a sequence diagram, endpoint catalog, or source-to-destination column layout.
+
+- Place components inside the corresponding layer band, ordered from top to bottom: Public Internet, Frontend, Engagement Services, Integration, and Enterprise Foundation (Backoffice).
+- Use plain colored rectangles for layer bands, not Draw.io swimlanes. Keep layer labels left-aligned and top-aligned. Use the layer fill color with no stroke.
+- Treat the canvas as flexible. Increase `pageWidth`, `pageHeight`, and the layer-band rectangle sizes as needed so all components, routing lanes, connector labels, and notes fit cleanly.
+- Treat every layer band as flexible in width and height. Grow a layer wider for additional horizontal component lanes, and grow it taller for stacked components or extra connector routing space.
+- Leave clear top and bottom padding around components inside each layer band.
+- Align components toward the left side of the canvas by default. Start the first meaningful component column close to the layer content area, then place later components to the right as the integration progresses. Do not center the whole diagram when there is unused space on the left.
+- Use a consistent component grid across layers: align related components by x-position when they participate in the same flow, and align peer components on the same baseline inside a layer.
+- Prefer vertical flow columns for linear integrations across layers. When a component in one layer directly calls, publishes to, or consumes from a component in another layer, place the related components above and below each other on the same x-position where space allows.
+- Use horizontal placement primarily for peer components in the same layer, branching alternatives, fan-out/fan-in paths, or same-layer handoffs. Do not force a left-to-right stair-step layout when a top-to-bottom column would be clearer.
+- Keep components as the main diagram elements. Use the exact layer colors from `STYLE.md` to classify each component: Public Internet light red, Frontend light yellow, Engagement light green, Integration light grey, and Enterprise Foundation (Backoffice) light blue.
+- Show every confirmed component needed to understand how data or commands move from source to destination.
+- Show the integration path by connecting components across layers. Route connectors clearly between layers and between peer components when needed.
+- Use concise connector labels for trigger, protocol, contract, routing, transformation, retry, acknowledgement, or ownership details.
+- For cross-layer flows, connect components from bottom-to-top or top-to-bottom using straight vertical orthogonal connectors whenever possible. Use side connectors only when vertical routing would cross another component or label.
+- Route every connector around components, not through components. Use explicit orthogonal `mxPoint` waypoints whenever Draw.io automatic routing would cross a component, component header, layer label, or another connector label.
+- Put connector labels on open horizontal or vertical lane segments with clear whitespace. Do not place connector text on top of components, application headers, layer labels, arrowheads, or other connector labels.
+- Leave at least 160 px of horizontal space between two components connected by a labeled connector. If the connector label is longer than 24 characters, leave at least 220 px, shorten the label, or route the label onto a longer empty segment.
+- Use separate routing lanes for parallel or crossing flows. Stagger vertical lanes and horizontal lanes so no two connectors share the same segment when their labels or arrowheads would collide.
+- For dense integration diagrams, widen the canvas, increase layer widths and heights, or move components farther apart before exporting. Do not accept an SVG where connectors or connector labels overlap components.
+- Do not add separate data-contract, payload, message, or file boxes to integration design diagrams. Keep contract and payload details in connector labels when short, and put detailed contract information in the integration design document.
+- Do not add monitoring, reconciliation, run-status, failed-record, stale-index, alerting, dashboard, or support components to integration design diagrams. Capture observability, reconciliation, and support details in the integration design document instead.
+- Duplicate nodes inside a layer when the design has multiple components in that layer. Keep related components aligned so readers can trace each integration path through the layers.
+- If the source content does not identify a component layer, use the neutral component style and record the categorization as an assumption or open question in the integration design.
+- Do not add real-company system names, internal endpoints, topics, queues, payload fields, credentials, or proprietary integration details to this public repository.
+
+## Data Architecture Diagram Layout
+
+When using `templates/data-architecture-diagram.drawio`, preserve the layered architecture structure. The diagram is a data architecture design view for one canonical data object, not an integration sequence diagram.
+
+- Place components inside the corresponding layer band, ordered from top to bottom: Public Internet, Frontend, Engagement Services, Integration, and Enterprise Foundation (Backoffice).
+- Always place Backend-for-Frontend components in the Frontend layer. Do not place a BFF in the Integration layer, even when it calls APIs, composes requests, or shapes channel responses.
+- Use the exact layer colors from `STYLE.md`: Public Internet light red, Frontend light yellow, Engagement light green, Integration light grey, and Enterprise Foundation (Backoffice) light blue.
+- Place components horizontally when they are different peer components, alternate sources, alternate consumers, parallel integrations, or separate solution copies. Do not stack unrelated components vertically inside one layer.
+- Use vertical alignment only when components are part of the same direct end-to-end flow and the alignment makes the data path easier to trace.
+- Grow layer width for additional horizontal component placement before adding vertical stacks. Grow layer height only when there are multiple related rows or connector routing needs.
+- Keep Backend-for-Frontend components near the channel or frontend component they support, then route calls down to Engagement Services or Integration with orthogonal connectors.
+- Keep the canonical data object visually central when possible. Place sources to the left or below, consumers to the right or above, and governance or ownership notes in the traceability area.
+- Put interface names, events, files, APIs, batches, ownership, and traceability details in concise connector labels or in the surrounding document table. Do not turn the diagram into a dense interface catalog.
+- Do not add real-company system names, internal endpoints, topics, queues, payload fields, credentials, or proprietary integration details to this public repository.
+
+## Data Flow Layout
+
+When using `templates/data-flow.drawio`, preserve the horizontal swimlane structure. The diagram is an operational trace of one canonical data object, not a generic architecture context diagram.
+
+- Replace the title with `<Organization or domain> | Data Flow | <Data object>`.
+- Put the business journey, process stages, screens, or major events across the top from left to right.
+- Keep the default lane order from top to bottom: Customer; Channel, for example New Webshop; optionally one backend-for-frontend lane when a BFF participates in the flow; then one horizontal lane for each Engagement solution; one horizontal lane for each Integration component; and one horizontal lane for each Enterprise Foundation or MDM solution. Rename the channel and solution labels to the real non-confidential names for the target design, but preserve this order unless the user explicitly asks for a different stack.
+- Include the backend-for-frontend lane only when a BFF has a meaningful data-flow responsibility such as request composition, channel-specific orchestration, response shaping, or aggregation. Omit the BFF lane when the channel calls engagement solutions directly.
+- Do not group multiple solutions into one broad lane such as `Engagement solutions` or `Integration components`. Each named solution or component gets its own lane and its own horizontal divider.
+- Align each stage or event header with the vertical flow column it describes. Center the header above the boxes and arrows for that stage, and move the stage guide line to the same x-position.
+- Draw data movement as vertical or orthogonal arrows crossing lanes. Label each arrow with the specific data object, event, command, file, API call, batch, or transformation.
+- Use the template's connector colors consistently: blue for primary read, write, replication, or publication flows; green for enrichment, rules, calculation, validation, or decisioning flows; grey dashed lines for optional, planned, deprecated, or uncertain flows.
+- Show where the data object is created, updated, enriched, read, replicated, archived, deleted, or submitted.
+- Keep lane labels readable on the left and process-stage labels aligned across the top.
+- Expand the canvas horizontally and vertically before compressing the flow. Add width for more stages and add height for more solution lanes. The exported SVG must not have overlapping arrows, labels, lane headers, boxes, or process-stage labels.
+- Do not use real-company names, internal systems, proprietary event names, payload fields, endpoints, or confidential process details in this public repository.
+
+## Integration Flow Layout
+
+When using `templates/integration-flow.drawio`, preserve the horizontal swimlane structure from the data flow template. The diagram is an operational trace of one integration scenario or interface chain, not a component map, endpoint catalog, or full data architecture view.
+
+- Replace the title with `<Organization or domain> | Integration Flow | <Integration scenario or interface name>`.
+- Put the business trigger, request, orchestration, transformation, delivery, acknowledgement, error handling, and completion stages across the top from left to right.
+- Keep the default lane order from top to bottom: actor or producing party; channel or producer application; optionally one backend-for-frontend lane when a BFF participates; one horizontal lane for each producing or orchestrating application; one horizontal lane for each integration component; one horizontal lane for each consuming application, enterprise foundation solution, MDM solution, external partner, or data store involved in the integration. Rename lanes to the real non-confidential names for the target design, but preserve this direction of responsibility unless the user explicitly asks for a different stack.
+- Include only lanes that actively send, receive, transform, route, persist, acknowledge, or monitor the integration. Do not add passive systems that are only mentioned in background context.
+- Do not group multiple applications or middleware components into broad lanes such as `Source systems`, `Integration layer`, or `Consumers`. Each named participant gets its own lane and horizontal divider when it has a distinct integration responsibility.
+- Do not duplicate the same participant in the same lane just to show a later step in the same interaction. Keep one participant box where possible and draw an orthogonal arrow from the preceding step to that existing box, then onward to the next participant.
+- Duplicate a participant only when it represents a clearly separate occurrence in a different stage, branch, or independent interaction and a direct arrow would create crossings, unreadable backtracking, or an excessively long connector. If duplicated, use the exact same label and styling so readers understand it is the same participant appearing again for layout clarity.
+- Prefer continuous left-to-right and top-to-bottom arrows across stage columns over repeated component boxes. A reader should be able to follow the scenario by tracing arrows, not by guessing that repeated boxes are the same system.
+- Color each participant by its architecture layer, not by the direction of the flow.
+- Treat Backend-for-Frontend and BFF components as Frontend components. They must use the yellow Frontend component style (`fillColor=#fff3c4;strokeColor=#b7791f`) even when they call APIs, compose responses, or orchestrate channel requests.
+- Place a Backend-for-Frontend directly below the frontend/channel participant it supports, aligned on the same x-position, and connect them vertically where possible. Do not place the BFF as a peer beside the frontend component unless the flow has multiple frontend participants and vertical placement would make the path unreadable.
+- Treat API gateway, API management, mediation, routing, and integration-platform components as Integration components. Azure API Management, API gateway, ESB, iPaaS, queue broker, and event broker nodes must use the grey Integration component style (`fillColor=#edf2f0;strokeColor=#8a9992`).
+- Treat backoffice API providers, MDM APIs, host APIs, mainframe APIs, and enterprise system APIs as Enterprise Foundation components. IBMi APIs and similar foundation API provider nodes must use the blue Enterprise Foundation component style (`fillColor=#dae8fc;strokeColor=#315f8f`).
+- Use green Engagement Service component styling (`fillColor=#d9eadf;strokeColor=#0f766e`) only for business-facing engagement services or application capabilities, not for BFFs, API management, or foundation APIs.
+- Align each stage or event header with the vertical flow column it describes. Center the header above the messages, transformations, acknowledgements, or failure paths for that stage, and move the stage guide line to the same x-position.
+- Draw integration messages as vertical or orthogonal arrows crossing lanes. Label each arrow with the business event, command, query, API call, event publication, file transfer, batch run, acknowledgement, retry, or error notification.
+- Put protocol or pattern information in concise connector labels only when it changes the design, for example `REST command`, `event publish`, `batch file`, `webhook`, `async acknowledgement`, or `manual retry`.
+- Use the template's connector colors consistently: blue for primary commands, queries, event publications, file transfers, batches, reads, writes, and delivery flows; green for routing, transformation, validation, enrichment, policy checks, or decisioning flows; grey dashed lines for optional, planned, deprecated, fallback, manual, or uncertain flows.
+- Show direction and sequencing explicitly. If an acknowledgement, response, callback, retry, compensation, or dead-letter path materially affects ownership or operations, show it as a separate arrow instead of hiding it inside a label.
+- Show where the payload is created, transformed, validated, enriched, routed, persisted, acknowledged, retried, rejected, or handed over. Keep payload and contract names business-readable and general.
+- Keep interface details at the right level of abstraction. Use connector labels for interface names, canonical data objects, protocol or pattern, trigger, frequency, retry, idempotency, acknowledgement, and ownership when short. Put endpoint paths, fields, schemas, topic names, queue names, credentials, and detailed error codes in the supporting document, not in the diagram.
+- Keep lane labels readable on the left and stage labels aligned across the top.
+- Expand the canvas horizontally and vertically before compressing the flow. Add width for more stages and add height for more participants. The exported SVG must not have overlapping arrows, labels, lane headers, boxes, or process-stage labels.
+- Use explicit orthogonal waypoints when automatic routing would make arrows cross through participant boxes, lane labels, stage headers, arrowheads, or other connector labels.
+- Do not use real-company names, internal systems, proprietary event names, payload fields, endpoints, topics, queues, credentials, or confidential process details in this public repository.
+
+## SVG Export Rules
+
+Exported SVGs must preserve the exact colors from the `.drawio` source.
+
+- Export from the light-themed diagram using the diagram's explicit styles. Do not export from a dark-mode preview, themed preview, or editor mode that rewrites colors.
+- Keep the page background in the SVG. Exported SVGs must have a white or light page background from the source diagram, normally `#fbfcfa`. Do not export with transparent background.
+- Treat a dark, black, transparent, or theme-inverted SVG background as a failed export. Re-export from the light-themed `.drawio` source with an explicit page background before embedding or publishing.
+- Exported SVGs must use `color-scheme: light` only. Treat `color-scheme: light dark`, `color-scheme: dark`, missing explicit light color scheme, or `light-dark(...)` as failed exports. These Draw.io-generated CSS values can make Confluence, browsers, or dark-mode previews render the diagram with inverted/dark colors.
+- Before embedding or publishing, inspect the SVG text for `color-scheme` and `light-dark(`. If `color-scheme` is not explicitly light-only, or if `light-dark(` is present, first fix the `.drawio` source and re-export. Run `skills/create-drawio-diagram/scripts/sanitize-drawio-svg.py <diagram.svg>` only as a final compatibility guard for Draw.io exports that still emit theme-adaptive SVG CSS.
+- Do not post-process exported SVGs with CSS color filters, dark-mode transforms, image optimizers, or theme substitution.
+- Do not replace concrete hex colors with `currentColor`, CSS variables, inherited colors, or generated dark palette values.
+- Before embedding the SVG, inspect it visually against the `.drawio` source. If colors differ, regenerate the SVG before embedding it.
+- Before embedding the SVG, inspect the exported background. Regenerate the `.drawio` or export if the SVG background is not white/light.
+- Before embedding a capability overview SVG, inspect connector routing and labels. Regenerate the `.drawio` with staggered connector lanes or wider spacing if any connector, connector label, or arrowhead overlaps another connector, node, application header, or label.
+- Before embedding an integration design SVG, inspect connector routing and labels. Regenerate the `.drawio` with wider spacing or explicit waypoints if any connector or connector label overlaps a component, component header, layer label, arrowhead, or other label.
+- Before embedding an integration design SVG, inspect alignment and spacing. Regenerate the `.drawio` if the diagram has large unused left-side whitespace, components appear unnecessarily centered, labeled connectors have cramped horizontal space, or any connector crosses through a component.
+- Before embedding an integration flow SVG, inspect participant colors. Regenerate the `.drawio` if Backend-for-Frontend/BFF nodes are not yellow, API management or gateway nodes are not grey, or foundation API provider nodes such as IBMi APIs are not blue.
+
+## Output Rules
+
+- Store `.drawio` files beside the document they support.
+- Prefer one diagram per file.
+- Use stable filenames that match the architecture section, such as `application-component-view.drawio`.
+- Keep generated diagrams editable in Draw.io. Do not replace them with static-only SVGs unless the user explicitly asks for export-only output.
+- Keep exported SVG colors identical to their `.drawio` source colors.
+- Keep this public toolkit free of company-confidential information.

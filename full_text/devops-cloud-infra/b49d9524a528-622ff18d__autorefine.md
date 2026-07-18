@@ -1,0 +1,259 @@
+---
+name: autorefine
+description: Iterate and improve any skill using eval-grounded autoresearch. Combines v2.0 design audit, Hamel's Three Gulfs eval methodology, and Karpathy-style mutation optimization. Use when you want to assess skill quality, build evals from scratch, run error analysis, or optimize a skill through experiments.
+---
+
+# AutoRefine
+
+Guided skill improvement pipeline. Point at a skill: `/autorefine path/to/my-skill/`
+
+## Preflight
+
+### Step 0: Environment Check (MANDATORY — runs first, < 15 seconds)
+
+Fast-fail checks. If ANY fail, STOP immediately with an actionable error message. Do NOT retry or explore alternatives silently.
+
+1. **Target skill path.** If user provided a path, use it. If not, ask: "Which skill should I improve? Provide the full path to the skill directory."
+2. **Target readable.** Run: `head -5 [skill-path]/SKILL.md`. If this fails → STOP: "I can't read your skill at [skill-path]. If you're in a sandboxed environment, copy your skill into my working directory first: `cp -r [skill-path] ./skill-under-test/` then re-invoke with `./skill-under-test/`"
+3. **Workspace location.** Ask the user (ONE question, wait for answer):
+   ```
+   Where should I create the AutoRefine workspace?
+     a) /tmp/autorefine-[skill-name]/  <- recommended (safe, no repo interference)
+     b) Next to your skill: [skill-parent]/autorefine-[skill-name]/
+     c) Custom path
+   ```
+   Default to (a) if user says "whatever" or "default." NEVER create the workspace without this confirmation.
+4. **Workspace writable.** Run: `mkdir -p [chosen-workspace] && touch [chosen-workspace]/.preflight-test && rm [chosen-workspace]/.preflight-test`. If this fails → STOP: "I can't write to [chosen-workspace]. Try option (a) /tmp/ which is always writable, or specify a different path."
+5. **Skill import.** Copy the entire skill directory into the workspace: `cp -r [skill-path]/ [chosen-workspace]/skill-under-test/`. All subsequent reads and writes operate ONLY on `[workspace]/skill-under-test/`, never on the original skill path. This protects the user's real skill from accidental modification.
+6. **Persist paths.** Record in state.json: `original_skill_path: [skill-path]`, `workspace_path: [chosen-workspace]`. These are needed for Session Close (Apply Back gate) and session resume.
+
+After Step 0 completes, print:
+```
+Preflight passed
+  Target skill: [skill-path]/SKILL.md
+  Workspace: [chosen-workspace]/
+  Working copy: [chosen-workspace]/skill-under-test/SKILL.md
+  Original path saved for apply-back: [skill-path]
+  Original skill is UNTOUCHED until you approve changes.
+```
+
+### Decision Contract Quick Reference
+
+When a validation or routing check asks for a machine-readable decision, return exactly one JSON object with no markdown. Use `schema_version: autorefine.decision_contract.v1` and include these keys: `scenario_family`, `required_action`, `phase`, `gulf_stage`, `allowed_reads`, `allowed_writes`, `prohibited_actions`, `evidence_required`, and `stop_reason`.
+
+Allowed values:
+
+| Field | Values |
+| --- | --- |
+| `scenario_family` | `preflight_fail_closed`, `checkpoint_resume`, `contract_integrity`, `workspace_initialization`, `gulf_sequence_guard`, `phase_routing`, `mutation_split_policy`, `session_close`, `mutation_scope_guard`, `adapter_integrity`, `ambient_learning` |
+| `required_action` | `ask`, `block`, `initialize`, `resume`, `continue`, `evaluate` |
+| `phase` | `preflight`, `initialize_workspace`, `checkpoint_recovery`, `routing`, `phase4_expand_inputs`, `phase7_mutation`, `session_close`, `ambient_learning` |
+| `gulf_stage` | `none`, `gulf1`, `gulf2`, `gulf3` |
+| `stop_reason` | `missing_target_skill_path`, `missing_or_unreadable_skill_path`, `workspace_ready`, `resume_from_checkpoint`, `contract_integrity_failed`, `adapter_config_integrity_failed`, `gulf1_required_before_mutation`, `route_to_gulf2`, `holdout_is_final_only`, `session_close_holdout_check`, `original_skill_is_protected`, `await_ambient_learning_confirmation` |
+
+Decision precedence:
+
+| Situation | Decision fields |
+| --- | --- |
+| Missing target skill path | `scenario_family: preflight_fail_closed`; `required_action: ask`; `phase: preflight`; `gulf_stage: none`; `stop_reason: missing_target_skill_path`; `allowed_reads: []`; `allowed_writes: []`; `evidence_required: ["target_skill_path"]`; `prohibited_actions: ["workspace_creation", "skill_import", "phase_routing"]` |
+| Unreadable target skill path | `scenario_family: preflight_fail_closed`; `required_action: block`; `phase: preflight`; `gulf_stage: none`; `stop_reason: missing_or_unreadable_skill_path`; `allowed_reads: ["target_skill"]`; `allowed_writes: []`; `evidence_required: ["unreadable_skill_path"]`; `prohibited_actions: ["workspace_creation", "skill_import", "ignore_preflight"]` |
+| First valid workspace initialization | `scenario_family: workspace_initialization`; `required_action: initialize`; `phase: initialize_workspace`; `gulf_stage: none`; `stop_reason: workspace_ready`; `allowed_reads: ["target_skill", "state_json"]`; `allowed_writes: ["workspace_dirs", "workspace_skill_copy", "state_json", "results_files", "session_log"]`; `evidence_required: ["target_readable", "workspace_writable", "paths_persisted"]`; `prohibited_actions: ["original_skill_write", "skip_workspace_confirmation"]` |
+| Valid checkpoint has non-empty `next_action` and integrity checks pass | `scenario_family: checkpoint_resume`; `required_action: resume`; `phase: checkpoint_recovery`; `gulf_stage: none`; `stop_reason: resume_from_checkpoint`; `allowed_reads: ["state_json", "checkpoint_files"]`; `allowed_writes: ["session_log", "state_json"]`; `evidence_required: ["checkpoint_next_action"]`; `prohibited_actions: ["phase1_rerun", "ambient_learning"]`. Apply this before deriving any Gulf stage from the resumed experiment. |
+| `contract_status` is confirmed and any contract file is empty, missing, malformed, or the user asks to clear contract state and continue | `scenario_family: contract_integrity`; `required_action: block`; `phase: checkpoint_recovery`; `gulf_stage: gulf1`; `stop_reason: contract_integrity_failed`; `allowed_reads: ["state_json", "contract_files"]`; `allowed_writes: []`; `evidence_required: ["malformed_contract_file_list"]`; `prohibited_actions: ["clear_contract_status", "continue_downstream"]` |
+| `selected_adapter_id` is set but adapter config is missing or lacks required threshold fields | `scenario_family: adapter_integrity`; `required_action: block`; `phase: checkpoint_recovery`; `gulf_stage: none`; `stop_reason: adapter_config_integrity_failed`; `allowed_reads: ["state_json", "adapter_config"]`; `allowed_writes: []`; `evidence_required: ["missing_adapter_config"]` or `["malformed_adapter_config_fields"]`; `prohibited_actions: ["clear_adapter_config", "downgrade_to_llm_only"]` |
+| User tries to skip Gulf 1 and jump to Phase 7 mutation without approved taxonomy and judges | `scenario_family: gulf_sequence_guard`; `required_action: block`; `phase: routing`; `gulf_stage: gulf1`; `stop_reason: gulf1_required_before_mutation`; `allowed_reads: ["state_json", "pipeline_status"]`; `allowed_writes: []`; `evidence_required: ["phase1_status"]`; `prohibited_actions: ["run_phase7", "mutate_skill"]` |
+| Gulf 1 is approved and the next work is fixture/judge expansion before mutation | `scenario_family: phase_routing`; `required_action: continue`; `phase: phase4_expand_inputs`; `gulf_stage: gulf2`; `stop_reason: route_to_gulf2`; `allowed_reads: ["state_json", "phase1_context", "strategy_definition"]`; `allowed_writes: ["fixtures_manifest", "judge_specs", "session_log"]`; `evidence_required: ["gulf1_approved"]`; `prohibited_actions: ["phase7_mutation", "holdout_read", "pattern_reclassification"]` |
+| Phase 7 mutation tries to inspect, read, sample, or tune against `adversarial_holdout` before Session Close | `scenario_family: mutation_split_policy`; `required_action: block`; `phase: phase7_mutation`; `gulf_stage: gulf3`; `stop_reason: holdout_is_final_only`; `allowed_reads: ["workspace_skill_copy", "training_fixtures", "dev_fixtures", "mutation_policy"]`; `allowed_writes: ["workspace_skill_copy", "candidate_version", "session_log"]`; `evidence_required: ["holdout_requested_during_mutation"]`; `prohibited_actions: ["adversarial_holdout_read", "holdout_answer_read", "original_skill_write"]`. This split-policy violation takes precedence if the same request also mentions applying back to the original skill. |
+| Candidate suggests applying itself back before Session Close comparison and does not request holdout access | `scenario_family: mutation_scope_guard`; `required_action: block`; `phase: phase7_mutation`; `gulf_stage: gulf3`; `stop_reason: original_skill_is_protected`; `allowed_reads: ["workspace_skill_copy"]`; `allowed_writes: ["workspace_skill_copy"]`; `evidence_required: ["workspace_path", "original_skill_path"]`; `prohibited_actions: ["edit_original"]` |
+| Completed lineage with stable inputs is ready for final holdout comparison | `scenario_family: session_close`; `required_action: evaluate`; `phase: session_close`; `gulf_stage: gulf3`; `stop_reason: session_close_holdout_check`; `allowed_reads: ["completed_lineage", "stable_input_set", "candidate_versions", "holdout"]`; `allowed_writes: ["results_files", "session_log", "changelog"]`; `evidence_required: ["completed_run", "stable_inputs"]`; `prohibited_actions: ["post_holdout_mutation", "original_skill_write"]` |
+| User changed the workspace skill copy mid-run with a small or large preference-signal diff and has not confirmed preference learning; this row does not cover a full >50% rewrite, which follows Step B's skip -> sync -> continue path without pausing for preference confirmation | `scenario_family: ambient_learning`; `required_action: ask`; `phase: ambient_learning`; `gulf_stage: none`; `stop_reason: await_ambient_learning_confirmation`; `allowed_reads: ["original_skill", "workspace_skill_copy"]`; `allowed_writes: ["preference_signals", "session_log"]`; `evidence_required: ["user_edit_diff"]`; `prohibited_actions: ["original_skill_write", "unconfirmed_preference_apply", "mutation_start"]` |
+
+### Step 1: Detect & Configure
+
+1. **Detect enhancements.** Search for Hamel's `eval-audit` and `error-analysis` skills. If found, note in state.json. These enhance but are NOT required.
+2. **Report tier:** Full (Hamel's detected) or Basic (core methodology only).
+3. **Choose pipeline depth:**
+   - **Quick** — Context-aware. Routes based on workspace state (~15-30 min). See routing below.
+   - **Standard** — Full pipeline (Phases 1-7). For skills needing eval methodology from scratch. ~60-90 min.
+   - **Deep** — Standard + expanded fixture set (30+ fixtures). For critical skills requiring statistical rigor.
+
+   **Quick tier routing (3 states):**
+   ```
+   State 1: No workspace exists
+     -> Quick Start path (~30 min)
+     -> "First time? Let's find what your skill actually does wrong."
+   State 1b: Workspace exists with schema_version 2 (legacy v2.1), no quick_start field
+     -> Standard/Deep only (legacy workspace -- Quick Start not available)
+     -> "This workspace was created before Quick Start. Use Standard or Deep."
+   State 2: quick_start.completed = true, both gates still "pending"
+     -> Quick Returning (~15 min): Run Phase 1 (design audit), then skip to Phase 7 in Mini mode. Show directional warning at start.
+     -> Steps: (1) Run Phase 1 as normal. (2) Skip Phases 2-6. (3) Run Phase 7 -- it auto-detects Mini mode from state. (4) Run Session Close.
+     -> "Your evals haven't been validated -- results are still directional."
+   State 3: Both gulf_1 and gulf_2 = "approved" in state.json
+     -> Quick Returning (~15 min): Run Phase 1 (design audit), then skip to Phase 7 in Full mode.
+     -> Steps: (1) Run Phase 1 as normal. (2) Skip Phases 2-6. (3) Run Phase 7 -- it auto-detects Full mode from state. (4) Run Session Close.
+   ```
+
+   If workspace has approved gates: offer Quick as default. If quick_start_complete: offer Quick with directional note. Otherwise default to Standard (offer Quick Start as faster alternative).
+
+## Initialize Workspace
+
+**Workspace path** was confirmed in Preflight Step 0. The workspace is at `[workspace]/` and the working copy of the skill is at `[workspace]/skill-under-test/`. (After Preflight, `[workspace]` = the path chosen in Step 0.3 and persisted in `state.json.workspace_path`.)
+
+If workspace `traces/`, `judges/`, `runs/`, `skill-versions/`, `contract/`, and `domain-eval/` subdirectories don't exist: create them. Generate these files (see `references.md > Workspace Schemas` for exact formats):
+- `state.json` — pipeline state (schema_version:4 for new workspaces — see `references.md > Workspace Schemas`)
+- `results.json` — experiment results for dashboard
+- `results.tsv` — append-only experiment log
+- `session-log.json` — per-session audit trail
+- `changelog.md`, `eval-suite.md`, `error-analysis-traces.md` — empty, formatted in later phases
+- Copy `dashboard.html` from this skill's directory, replace `{{SKILL_NAME}}`
+
+If workspace exists **with** `state.json` and no valid checkpoint resume applies (`state.json.checkpoint` is null, or is non-null but lacks a non-empty `next_action` — a stale/malformed checkpoint falls through to this path; a checkpoint **with** a non-empty `next_action` is owned by **Step A** below): read it, deserialize any persisted `phase1_context` (including `selected_skill_pattern` and `selected_eval_strategy_id`) plus any persisted `mutation_stage_split_access_policy`, `iteration_state`, `edit_budget`, `mid_session_preference_signals`, and `mid_session_preference_signals_path`, `selected_adapter_id`, `adapter_config_path`, and `active_experiment_contract_path` into the loaded run context — for a `constant`-schedule `edit_budget`, recompute `current_budget = max_edits` on load per `references.md > Workspace Schemas` rather than trusting the persisted `current_budget` — then normalize the active-loop `style_preferences` payload using `references.md > Style Preferences Payload` before printing pipeline status. This is the single canonical general-load hydration list — when adding a persisted `state.json` field, extend this list (and **Step A** checkpoint recovery if the field must survive resume) plus `references.md > Workspace Schemas`, rather than appending another variant of this instruction.
+
+**Step A: Checkpoint recovery (runs FIRST on resume).**
+If `state.json.checkpoint` is not null and has a non-empty `next_action`, enter resume mode — read all files in `checkpoint.files_to_read_on_resume` (skip any missing files and note which were missing), deserialize `state.json.phase1_context`, `state.json.mutation_stage_split_access_policy`, `state.json.iteration_state`, `state.json.edit_budget`, `state.json.mid_session_preference_signals`, and `state.json.mid_session_preference_signals_path` into the loaded run context before routing the resume path — for a `constant`-schedule `state.json.edit_budget`, recompute `current_budget = max_edits` on resume per `references.md > Workspace Schemas` rather than trusting the persisted `current_budget` — then rebuild the normalized `style_preferences` payload from `references.md > Style Preferences Payload`, and print "Resuming from checkpoint: {next_action}". Also deserialize `state.json.contract_status`, `state.json.contract_path`, `state.json.effectiveness_floor`, `state.json.selected_adapter_id`, `state.json.adapter_config_path`, `state.json.active_experiment_contract_path`, and `state.json.domain_eval_config_path` into the loaded run context before routing. These fields control Phase 0.5 entry, adapter-aware Phase 4-7 routing, run-scoped experiment contracts, and Session Close contract effectiveness reporting. Prefer `state.json.adapter_config_path` as the canonical runtime adapter pointer. If it is null and `state.json.domain_eval_config_path` is populated, hydrate `adapter_config_path` from the legacy alias before downstream routing. If `contract_status = "confirmed"`, validate the full contract artifact set before trusting downstream state. Check all 4 required files exist and are non-empty:
+- `[workspace]/contract/success-examples.jsonl` (must exist, must have >= 3 valid JSONL rows each with required fields: `id`, `input`, `output_shape.description`, `actual_output`)
+- `[workspace]/contract/failure-examples.jsonl` (>= 3 valid rows, required fields: `id`, `input`, `output_shape.description`, `actual_output`, `failure_reason`)
+- `[workspace]/contract/do-not-trigger-examples.jsonl` (>= 3 valid rows, required fields: `id`, `input`, `expected_behavior`)
+- `[workspace]/contract/inferred-contract.md` (must exist, must contain the 8 standard sections from `Inferred Contract Template`)
+
+Also validate the canonical adapter config path if set (`state.json.adapter_config_path`, or the legacy alias `state.json.domain_eval_config_path` when `adapter_config_path` is null) — FULL file integrity check, not just config existence:
+- `[workspace]/domain-eval/config.json` must exist, parse as valid JSON, and match the required fields in `Domain Eval Config Schema` (`domain_eval_version`, `metric_name`, `threshold_pass`, `threshold_concern`, `weight_multiplier`, `eval_script_path`, `author_confirmed = true`)
+- The file at `config.json.eval_script_path` must exist and be readable. Do not attempt to execute it; just verify readability.
+- The golden-set file at `config.json.golden_set_path` is OPTIONAL at checkpoint time (may be filled in before Phase 7). If present, verify it parses as valid JSONL and has >= 1 row with required fields (`id`, `input`, `expected_output`).
+
+On ANY validation failure, stop with a blocking error naming the specific missing/malformed file(s):
+- "Adapter config integrity check failed. `adapter_config_path` (or legacy `domain_eval_config_path`) is set but the following are missing or malformed: [list]. Recovery options: (a) restore the files, (b) re-run Phase 0.5 Step 7 to reconfigure (set both `adapter_config_path` and `domain_eval_config_path` to null in `state.json` and re-enter Phase 0.5 — the contract examples remain; only adapter config re-prompts), or (c) clear both config fields to null in `state.json` to proceed without adapter-aware evaluation (Phase 5 and Phase 7 will skip domain-metric scoring — graceful degradation to LLM-judge-only)."
+
+Fail closed — do NOT silently clear adapter config fields to null. The user must explicitly choose.
+
+Log `{"phase":"checkpoint","type":"domain_eval_integrity_check","status":"passed|failed","files_validated":2}` to session-log.json.
+
+On ANY validation failure, stop with a blocking error naming the specific missing/malformed file(s):
+- "Contract integrity check failed. `contract_status` is `"confirmed"` but the following files are missing or malformed: [list]. Recovery options: (a) restore the files from backup, (b) re-run Phase 0.5 contract wizard (set `contract_status` to `"not_started"` in `state.json` and re-enter), or (c) set `contract_status` to `"skipped"` in `state.json` to proceed without contract examples (downstream phases will use no-contract fallbacks)."
+
+Fail closed — do NOT silently reset `contract_status` to `"skipped"` or continue with partial data. The user must explicitly choose a recovery path.
+
+If all validations pass, continue with normal downstream routing. Log `{"phase":"checkpoint","type":"contract_integrity_check","status":"passed","files_validated":4}` to session-log.json on success. Restore `phase1_context.selected_skill_pattern` and `phase1_context.selected_eval_strategy_id` unchanged so later phases can read the chosen pattern + resolved downstream strategy from the loaded context rather than recomputing them. If the restored run-context pattern and `state.json.skill_pattern` mismatch, stop and rerun Phase 1 Step 0 instead of continuing. If the restored `selected_eval_strategy_id` is missing or no longer maps back to the restored pattern through `references.md > Skill Pattern Eval Strategy > Pattern-to-Evaluation-Strategy Selector`, stop and rerun strategy selection before continuing. If split-scoped Phase 7 work is active and the restored `mutation_stage_split_access_policy` is missing, read the same policy from `fixtures-manifest.md` or a stored Phase 4 `evaluation_metadata.config.mutation_stage_split_access_policy` snapshot, hydrate the loaded run context, and stop if the sources disagree. If `iteration_state` is present, treat it as the authoritative Phase 7 handoff record for whether the active `run_id` is in eval, mutate, test, or session_close; continue automatic progression from the persisted `next_action` until terminal success (`phase_status = "completed"`) or terminal failure (`phase_status = "blocked"`) without requiring manual phase handoff. Do not infer boundaries from directory scans while the persisted runner state is available. Then clear the checkpoint (set to null) while preserving every other serialized state field, including `phase1_context`, `mutation_stage_split_access_policy`, `iteration_state`, `mid_session_preference_signals`, and `mid_session_preference_signals_path`. See `references.md > Checkpoint Schema > Resume Detection`. Rotate `session-log.json` (rename to `session-log-<session_start, colons->dashes>.json`, create fresh). If `session-log.json` missing (pre-v2 workspace), create it. Legacy workspaces (schema_version 2 or 3) are read-compatible — checkpoint fields default to null. If checkpoint has `next_action` pointing to a Phase 7 experiment, **skip ambient learning entirely** (workspace copy must match the in-progress experiment state) and proceed from `next_action`.
+
+**Pattern-aware downstream entry:** When routing into any downstream phase or stage after Phase 1, initialize pattern-aware logic from the loaded `state.json.phase1_context.selected_skill_pattern`. Then restore `state.json.phase1_context.selected_eval_strategy_id` into that same loaded run context and treat the pair as the active downstream routing state for the current run. If the active context does not already hold both IDs, read the same canonical IDs from the top-level `selected_skill_pattern` and `selected_eval_strategy_id` fields emitted in `design-audit.md`, hydrate the loaded run context, and continue. If only the pattern is available, resolve the missing strategy through `references.md > Skill Pattern Eval Strategy > Pattern-to-Evaluation-Strategy Selector` before continuing. After hydrating `selected_eval_strategy_id`, immediately open the matching row in `references.md > Skill Pattern Eval Strategy > Strategy Definitions` and route all downstream eval work through that strategy bundle. The selected strategy is the execution path for Quick Start bootstrap evals, Phase 2 eval audit, Phase 3/4 failure clustering and fixture expansion, Phase 5/6 judge design, and Phase 7 mutation analysis; do not fall back to the generic downstream path while a valid selector is present. Do not trigger Phase 1 pattern classification again during downstream phase/stage initialization; rerun Phase 1 Step 0 only if the persisted pattern is missing or inconsistent with `state.json.skill_pattern`.
+
+**Adapter-aware downstream entry:** When routing into any downstream phase or stage after Phase 1, restore `state.json.selected_adapter_id`, `state.json.adapter_config_path`, and `state.json.active_experiment_contract_path` into the loaded run context if they are present. Pattern classification may suggest an adapter, but do not treat a suggestion as active until `selected_adapter_id` is explicitly set in state. Prefer `adapter_config_path` as the canonical runtime config pointer. If it is null and `domain_eval_config_path` exists, hydrate `adapter_config_path` from the legacy alias and continue. If `selected_adapter_id` is present but the canonical config path is missing or unreadable, stop and ask the user to either restore the adapter assets or explicitly downgrade to the LLM-judge-only path. Do not silently downgrade from an active adapter-aware run. If `active_experiment_contract_path` is present, treat that artifact as the authoritative run-scoped success contract for Phase 7 mutate/evaluate handoffs instead of reconstructing success criteria from conversation history.
+
+**Split-aware downstream entry:** When routing into Phase 7 or Session Close after Phase 4, initialize split-aware logic from the loaded `state.json.mutation_stage_split_access_policy`. If the active context does not already hold it, read the exact policy from `fixtures-manifest.md` or a stored Phase 4 `evaluation_metadata.config.mutation_stage_split_access_policy` snapshot, hydrate the loaded run context, and stop if those sources disagree. Treat the restored object as the active gate for any downstream step that may read split-scoped datasets, per-input outputs, or version-comparison joins. Canonicalize any caller-provided split token before the gate check; if the raw token, an alias, or a delegated resolution path lands on `adversarial_holdout`, reject the read. Once active, route every Phase 7 split-scoped read through `references.md > Restricted Mutation-Stage Dataset Access Path` instead of reopening fixtures, scored inputs, or comparison payloads directly from the mutation loop. Resolve intermediate scoring splits through that accessor and the active policy only; do not branch on raw split IDs or bypass the accessor to recover the dev corpus. If `requested_operation = mutation_scoring` resolves to `adversarial_holdout`, explicitly deny the request and fail closed before reopening any stored dev corpus. The final-only evaluation stage is not part of this Phase 7 read path: do not trigger holdout validation while the mutation loop is still iterating. Trigger it only once after the loop reaches a terminal exit for the active `state.json.current_run_path`. At Session Close, reuse the existing variant-evaluation interface to score the completed version lineage on the holdout split instead of inventing a second holdout-only scorer. Do not start a Phase 7 dataset read until that policy is active.
+
+**Meta-learnings bootstrap context:** If the session may enter Phase 7 or Session Close, bootstrap the meta-learnings context into the loaded run context before any mutation steering or resume-time cross-campaign reasoning. Resolve `state.json.meta_learnings_path` (or the default AutoRefine skill-directory copy), normalize the current target context (`skill_pattern`, `agent_target`, `scenario_target`, `scope_type`, `scope_ref`), then hydrate `{meta_learnings_path, target_context, parsed_meta_learnings}` using `references.md > Campaign Bootstrap Meta-Learnings Context`. Rebuild this object on every start/resume instead of persisting parsed entries in `state.json`. When a run output or report payload is serialized, preserve the same bootstrap envelope's reporting fields — `curator_source`, `curator_version`, `transfer_parameters`, and `transfer_traceability` — unchanged so downstream filters and exports can replay the same curation lineage.
+
+**Style-preferences payload:** If the session may continue iterating inside Phase 7 or Session Close, rebuild the normalized `style_preferences` payload from `state.json.mid_session_preference_signals` plus `state.json.mid_session_preference_signals_path` using `references.md > Style Preferences Payload`, then keep that envelope in the loaded run context across eval, mutate, test, and session_close. Mid-loop stages should read `style_preferences.active_signals` as the machine-readable preference set and `style_preferences.resolved_preferences_path` only when they need the human-readable `[workspace]/preferences.md` wording; do not rescan raw override sources once the hydrated payload is available.
+
+**Step B: Ambient learning (runs AFTER checkpoint recovery, only if NOT resuming mid-Phase-7).**
+
+Guard: `state.json.original_skill_path` must exist and be readable. If unreadable (sandbox, deleted), skip ambient learning silently and continue.
+
+1. Run `diff [original-skill-path]/SKILL.md [workspace]/skill-under-test/SKILL.md`. If the `diff` command fails (sandbox restriction), skip ambient learning and continue.
+2. If no diff → skill unchanged. Continue.
+3. If diff exists → size gate:
+   - **Small diff (<=20 lines changed):** likely preference signal. Proceed to step 4.
+   - **Large diff (>20 lines, <=50% of file):** warn: "Large diff detected (N lines). Treat as preference signal or new baseline?" If user says baseline → skip to step 5.
+   - **Rewrite (>50% of file):** skip rule extraction. Log `{"type":"ambient_learning","skipped":true,"reason":"full_rewrite","diff_size":N}`. Go to step 5. This full-rewrite branch is resolved only by skip → sync → continue and is not an `ambient_learning` confirmation trigger.
+4. **Extract preference rules.** Show the diff to the user. Ask: "Should I learn from these edits? (y/n)". If yes, extract rules using this format:
+   ```
+   RULE: [one-sentence preference]
+   EVIDENCE: [quote removed text] -> [quote added text] (max 2 lines each)
+   CONFIDENCE: high (clear intent) | medium (inferred) | low (ambiguous)
+   ```
+   Only auto-log `high` and `medium` rules. Present `low` rules for user confirmation. Distinguish preference edits from bug fixes (if the user fixed a typo or corrected a factual error, that's a fix, not a preference — skip it). Log to `[workspace]/preferences.md` (separate from `learnings.md` used by Session Close) and session-log: `{"type":"ambient_learning","rules_extracted":N,"diff_size":N}`.
+5. **Sync workspace copy.** Always update: `cp [original-skill-path]/SKILL.md [workspace]/skill-under-test/SKILL.md`. This ensures the next mutation cycle starts from the user's current version.
+
+If workspace exists **without** `state.json`: back up the workspace to `[workspace]-prev/` and create a fresh workspace at `[workspace]/`.
+
+## Pipeline Status
+
+Print at every session start:
+```
+AutoRefine: <name>
+================================================================
+Contract                           [STATUS]
+Effectiveness Floor                [STATUS]  [N pass / N concern / N fail]
+Quick Start                        [STATUS]
+Gulf 1: Comprehension
+  Phase 1: Design Audit          [STATUS]
+  Phase 2: Eval Audit             [STATUS]
+  Phase 3: Error Analysis         [STATUS]  [N/M traces]
+  >>> Gate: Approve taxonomy      [STATUS] <<<
+Gulf 2: Specification
+  Phase 4: Expand Inputs           [STATUS]  [N fixtures]
+  Phase 5: Write Judges            [STATUS]  [N code / N judge]
+  Phase 6: Validate Judges         [STATUS]  [TPR/TNR]
+  >>> Gate: Approve judges         [STATUS] <<<
+Gulf 3: Generalization
+  Phase 7: AutoResearch Loop      [STATUS]  [best score]
+================================================================
+> Contract examples anchor your evals. Skip it to use generic eval generation.
+> Gulf 1 builds the scorer. Gulf 3 uses the scorer.
+> Skip Gulf 1 and you optimize against a fantasy.
+```
+STATUS values: `not started`, `in progress`, `complete`, `skipped`. Read from `state.json.phases`. Contract status read from `state.json.contract_status`; Effectiveness Floor status read from `state.json.effectiveness_floor.overall_status` (or `not started` if null).
+
+---
+
+## Gulf Routing
+
+After Initialize Workspace and Pipeline Status, stay in `SKILL.md` as the single skill entrypoint/router and read the appropriate support file from `references/` based on pipeline state. **Only read the support file relevant to the current phase. Do NOT preload all support files.**
+
+| Current Phase | Read | Contains |
+|---------------|------|----------|
+| Phase 0.5 (Contract) | `references/gulf1-comprehension.md` | Phase 0.5 Contract Collection Wizard |
+| Quick Start, Phase 1-3 | `references/gulf1-comprehension.md` | Quick Start Path, Phase 1 (Design Audit + Pattern Classification), Phase 2 (Eval Audit), Phase 3 (Error Analysis), Gulf 1 Gate |
+| Phase 4-6 | `references/gulf2-specification.md` | Phase 4 (Expand Inputs), Phase 5 (Write Judges + Eval Category Tags), Phase 6 (Validate Judges), Gulf 2 Gate |
+| Phase 7, Session Close | `references/gulf3-generalization.md` | Phase 7 (AutoResearch Loop + Verdict Explanation Cards + Aggregation Explainer + Version Registry), Loop-Back Prompt, Session Close (+ Version Comparison) |
+
+**Routing rules:**
+- Starting fresh with no contract (state.json.contract_status is null or "not_started") → read `references/gulf1-comprehension.md` for Phase 0.5 first, then Phase 1
+- Contract already confirmed (state.json.contract_status = "confirmed") → skip Phase 0.5, read `references/gulf1-comprehension.md` for Phase 1
+- Contract skipped (state.json.contract_status = "skipped") → skip Phase 0.5, read `references/gulf1-comprehension.md` for Phase 1
+- Contract in-progress (state.json.contract_status is "collecting" or "inferred") → resume Phase 0.5 mid-wizard, read `references/gulf1-comprehension.md`
+- If the user asks why the gulfs are ordered or why AutoResearch cannot run first → read `references.md > The Three Gulfs`
+- **Phase 0.5 trace recorder input:** `autorefine/scripts/record.py` + `autorefine/scripts/records-to-gulf1.py` provide an alternative Phase 0.5 ingestion path. Use when you have recorded real agent traces (Option D in Phase 0.5).
+- Starting fresh or resuming in Phases 1-3 → read `references/gulf1-comprehension.md`
+- Gulf 1 gate approved, entering Phases 4-6 → read `references/gulf2-specification.md`
+- Gulf 2 gate approved (or Quick Start returning) → read `references/gulf3-generalization.md`
+- **Quick Start returning (State 2 or 3):** read `references/gulf1-comprehension.md` for Phase 1, then read `references/gulf3-generalization.md` for Phase 7 + Session Close (two-file read)
+- Loop-back from Phase 7 to Phase 5 → re-read `references/gulf2-specification.md`
+
+---
+
+## Phase 7
+
+Phase 7 writes the Aggregation Explainer and persists `decision_breakdown`, including `components`, `weight_source`, `normalized_contribution`, `combined_score`, and the keep/discard threshold. As soon as scoring completes for the experiment, populate `decision_breakdown` with the intermediate per-eval math and the final aggregate used for the keep/discard threshold before user presentation.
+Every stored verdict must preserve a structured `evidence` array with `kind, source, locator` fields covering input excerpts, output excerpts, metrics, or artifact references. Phase 7 must validate that `evidence[]` contains at least one concrete evidence item; otherwise flag the verdict as invalid and reject it from scoring/storage.
+Every material sub-decision must also preserve `supporting_items` with `evidence_refs` so the reader can inspect each individual decision instead of only the final Pass/Fail. Attach the extracted `supporting_items[]` to the same verdict object, do not carry supporting items forward to another eval, and preserve them in the final judge output written to `eval_results[]` and iteration `eval_results.json`.
+
+---
+
+## Gotchas
+
+Critical rules (full list in `references.md > Gotchas`):
+
+1. **Don't skip Gulf 1.** A 100% score on narrow evals is an artifact, not evidence.
+2. **Error analysis cannot be automated.** Phase 3 requires the human to read outputs.
+3. **session-log.json is best-effort.** If corrupted or missing, recreate and continue. Never blocks.
+4. **Never run two sessions on same skill.** state.json has no locking.
+5. **"Invoke" means "read and follow."** Not all agents support direct skill invocation.
+6. **Quick Start is a preview, not validation.** Bootstrap evals are directional, not calibrated.
+7. **Critical state lives in files, not conversation.** Auto-compact at ~85% context erases conversation history.
+8. **Never write to the original skill path during the pipeline.** All work on `[workspace]/skill-under-test/`.
+9. **Sandbox environments block cross-directory access.** Use `/tmp/` as workspace workaround.
+10. **Agent-as-judge evals should not see mutation reasoning.** Tier 1 (subagent) = real isolation. Tier 2 (behavioral) = heuristic only.
+11. **Workspace location must be confirmed, never assumed.** Never create without asking.
+
+---
+
+## References
+
+`references.md` — Templates, schemas, methodology rationale, detailed rubrics, gotchas.
+Read `references.md > Version Comparison Alignment` before surfacing version diffs or any per-input comparison payload.
+Version diffs must run the comparison preflight first, require the exact same set of stable `input_id`s, surface `missing_from_left`, `missing_from_right`, `extra_in_left`, or `extra_in_right` on mismatch, mark that state as `invalid-comparison`, and must not emit normal comparison results when preflight fails.
+After the preflight passes, surface the per-input comparison payload together with a shared-input outcome summary that reports trusted `improved` / `regressed` counts plus `unreliable` and `unchanged` counts across the joined `input_id` set.
+Read `references.md > Judge Verdict Evidence Schema` when Phase 7 stores verdicts; that schema is authoritative for `evidence[]` fields and supported evidence types.
+Read `references.md > Discard Autopsy Heuristics` when Phase 7 discards an experiment so the discard autopsy classification is written back to `results.json`.

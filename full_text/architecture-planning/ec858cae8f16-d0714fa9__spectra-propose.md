@@ -1,0 +1,969 @@
+---
+name: spectra-propose
+description: "Create a change proposal with all required artifacts"
+effort: xhigh
+license: MIT
+compatibility: Requires spectra CLI.
+metadata:
+  author: spectra
+  version: "1.0"
+  generatedBy: "Spectra"
+---
+<!--
+🔒 LOCKED — managed by clade
+Source: plugins/hub-core/skills/spectra-propose/
+Edit at: $CLADE_HOME
+Local edits will be reverted by the next sync.
+-->
+
+
+Create a complete Spectra change proposal — from requirement to validated artifacts — in a single workflow.
+
+> **Ownership**（clade fork；cross-phase matrix in `rules/core/spectra-workflow.md`）：propose 負責 manual-review item data-readiness — sample key inline + **該 key 是否真的會在 target UI render**（Layer A `VERIFY_UI_SAMPLE_KEY_DISPLAY_CHECK` + reverse page-grep）。**不**負責 runtime 正確性 / 視覺 / 資料形狀（apply Step 6c/Layer B、Design Review/Layer C、verify、manual review 各自接棒）。
+
+**Input**: The argument after `/spectra-propose` is the requirement description. Examples:
+
+- `/spectra-propose add dark mode`
+- `/spectra-propose fix the login page crash`
+- `/spectra-propose improve search performance`
+
+If no argument is provided, the workflow will extract requirements from conversation context or ask.
+
+**Prerequisites**: This skill requires the `spectra` CLI. If any `spectra` command fails with "command not found" or similar, report the error and STOP.
+
+**Pre-flight: dirty main 不擋 propose**（clade fork addition；not in upstream spectra）
+
+Main worktree 的 staged / modified / untracked / unmerged **完全不影響**本 skill 啟動或執行。**NEVER**：
+
+- 反射性建議 user 先 `git commit` / `git stash` 再跑 propose
+- 用 `AskUserQuestion` 問 staged 內容代表什麼意圖
+- 跳過 Step 11 `wt-helper add` 想避開「dirty fork 風險」
+
+**理由**：Step 1–10 只寫 `openspec/changes/<change-name>/`（artifact creation，零 git 寫操作）→ 跟 user WIP 路徑完全不撞檔。Step 11 `wt-helper add "<change-name>"` 不帶 `--precheck-baseline` flag → 跳過整套 dirty baseline guard → 直接 fork 基於 main HEAD commit 的乾淨 worktree。Fork 後 main 的 WIP **全部留在 main worktree**（git worktree 本來就這樣），不被打擾。完整 rationale 與 anti-pattern 警示見 [[worktree-default]] §1「Pre-flight guard 不適用範圍：spectra-propose」。
+
+**唯一 path collision 例外**：若 user 的 staged / WIP **就在** `openspec/changes/<change-name>/` 子目錄裡（重跑同名 change 的場景），先 `git diff openspec/changes/<change-name>/` inspect、跟 user 對齊是否覆蓋。**這是 path collision，不是 main dirty 的一般情況。**
+
+**Steps**
+
+0. **Dispatch 路徑選擇（三選一選單）**
+
+   本 skill 的 draft 階段有三條可選路徑。**Step 0 開頭 MUST 用 AskUserQuestion 跳三選一選單**讓使用者選（除非使用者已明確指定路徑，見下方捷徑）：
+
+   - **A. Codex flow（預設 / 推薦，選單第一項）** — Codex GPT-5.6-sol max draft + 主線 Claude Opus 4.8 xhigh cross-check。draft + cross-check 比擇一穩，wall-clock 最短。
+   - **B. 雙段 codex pipeline**（Fable 暫不可用期間的 fallback）— Codex GPT-5.6-sol xhigh draft → Codex GPT-5.6-sol high review（fresh session、只出 findings、不改檔）→ 主線 Claude Opus 4.8 xhigh final check。比選項 A 多一道 codex 自我審查關卡，wall-clock 較長（多一層背景等待）。原設計為 Claude Fable 5 High draft（三模型交叉）；Fable 回歸後把 Phase B-0a draft 改回 `claude -p --model claude-fable-5`。
+   - **C. 純 Claude** — 主線 Claude Opus 4.8 直接走 Step 1~11（含 Step 8 補 7 步 Design Review check）。
+
+   選單寫法：option A label 標「(預設/推薦)」並排第一（使用者按 Enter 即走現狀）。
+
+   **明確指定捷徑（跳過選單，直接走對應選項）**：使用者訊息已明確指定路徑時**不問選單**：
+   - 「不要派 codex」「我要純 Claude propose」「直接你做」→ **選項 C**
+   - 「用 Fable」「走 Fable pipeline」「Fable 起草」「雙段 codex」「codex draft+review」→ **選項 B**（Fable 暫不可用，B 現走 codex draft → codex review → Opus final）
+   - 「用 codex」「現有流程」「照舊」→ **選項 A**
+
+   選定後依對應選項段落執行。**選項 A / B 在 Step 0 內完成整個 draft + check，本 session 不再執行 Step 1~11**；只有**選項 C** 才往下跑 Step 1~11。
+
+   ---
+
+   ### 選項 A：Codex flow（Codex draft + 主線 cross-check）
+
+   #### Phase 0a：派 Codex 在背景跑
+
+   依以下順序執行（每一步都是主線 Claude 自己做，不需使用者介入）：
+
+   1. **解析 change name + requirement**：從 argument / discuss artifacts / 對話脈絡萃取，導出 kebab-case `<change-name>` 與一句話 requirement
+   2. **Write prompt 檔到 `/tmp/codex-spectra-propose-<change-name>-prompt.md`**，內容固定包含：
+
+      ```
+      請以本 repo 的 spectra-propose 流程建立 change `<change-name>`。
+      Requirement：<一句話需求>
+
+      Plan-first（**MUST**，per `.claude/rules/agent-routing.md` Plan-first 條目）：
+      在動任何 Edit / Write / Bash 寫入動作之前，先在 stdout 最開頭輸出一段 `## Plan` section，包含：
+      - **要動的具體檔案**（每條一行的相對路徑，例如 `openspec/changes/<change-name>/proposal.md`、`openspec/changes/<change-name>/design.md`、`openspec/changes/<change-name>/tasks.md`、`openspec/changes/<change-name>/specs/<capability>/spec.md`）
+      - **每個檔案打算寫什麼**（一句話 — 例如 proposal.md 的章節列表、design.md 的決策骨架、tasks.md 預期 phase 數量與分層、specs 的 ADDED/MODIFIED/REMOVED 走向）
+      - **預期 phase 切分**（特別是 UI view phase vs 非 view phase 的邊界，呼應下方 Phase Purity 規則）
+      Plan 寫完後**立刻**繼續執行，**不要**停下來等確認。Plan 是事前公開思路給主線 Claude cross-check，不是 review gate。
+
+      讀取以下檔案理解流程後執行：
+      - .claude/skills/spectra-propose/SKILL.md（**只執行 Step 1 ~ 11**，**跳過** Step 0 — 已決定由你執行）
+      - .claude/rules/ux-completeness.md（必填區塊：Affected Entity Matrix / User Journeys / Implementation Risk Plan + Fixtures / Seed Plan + Design Review 7 步 template）
+      - .claude/rules/agent-routing.md
+      - 任何 discuss 階段已捕獲的 design.md / spec.md（位置：openspec/changes/<change-name>/，若已存在）
+
+      若 change 包含 UI scope 且 proposal 有 ## Affected Entity Matrix（= entity 動且有 UI 展示），tasks.md **必須**包含 `## N. Fixtures / Seed Plan` section（每個有 Surfaces 的 entity 一條 task，或 `**Existing seed sufficient**` 宣告 + 一行理由）。
+
+      **Phase Purity（UI view vs 非 view 必須切成獨立 phase）**：
+      若 change 同時涉及 UI view 層（`.vue` / `.tsx` / `.jsx` / `app/pages/` / `app/components/` / `pages/` / `components/` / `views/` / `layouts/` / `.css` / `.scss`）與**非 view 工作**（schema / migration / API server / store / hook / API client / type / util / 純 backend），tasks.md **必須**把這兩類切成不同的 `## N.` phase：
+      - 例：`## 1. Database Schema` + `## 2. API Endpoints` + `## 3. Pinia Store + Composables` + `## 4. UI View Implementation` + `## 5. Fixtures / Seed Plan` + `## 6. Design Review`
+      - **禁止**把 view 層改動（`.vue` / `app/pages/` 等）與非 view 工作混進同一 phase
+      - 理由：spectra-apply 會把 UI view phase 由主線 Claude Code 自己做、其他 phase 派給 codex；混雜 phase 會破壞 dispatch 規則
+      - frontend 但非 view 的（store / hook / API client / type / util / unit test）算非 view，可以與 backend 工作放同 phase 或自己一個 phase 都可
+
+      若 change 包含 UI scope（tasks 涉及 .vue / pages/ / components/ / layouts/），tasks.md **必須**包含完整 7 步 Design Review section（N.1~N.7）：
+        - N.1 檢查 PRODUCT.md / DESIGN.md
+        - N.2 /design improve + Fidelity Report
+        - N.3 修復 DRIFT loop
+        - N.4 按 canonical order 跑 targeted impeccable skills
+        - N.5 /impeccable audit Critical = 0
+        - N.6 review-screenshot 視覺 QA
+        - N.7 Fidelity 確認
+
+      **Manual Review Item Kind Marker（hard rule，所有 change）**：
+      `## 人工檢查` 區塊每條 checkbox 行 **MUST** 在 `#N` / `#N.M` 後緊接 leading kind marker：`[review:ui]` / `[discuss]` / `[verify:e2e]` / `[verify:api]` / `[verify:ui]`，或 verify multi-marker `[verify:<a>+<b>]` / `[verify:<a>+<b>+<c>]`（channels 僅限 `e2e` / `api` / `ui`）。
+
+      - `[review:ui]` — 需要使用者親自確認的 UI / UX 驗收。Claude 禁止代勾。
+      - `[discuss]` — Claude 主導的 evidence-based 討論（production 授權 / 商業判斷 / production 觀察 / 後端 evidence 查驗 / 合理性檢查）。spectra-archive Step 2.5 walkthrough 由 Claude 主動準備證據與使用者討論。
+      - `[verify:e2e]` — Playwright spec-based automated journey / persistence evidence。
+      - `[verify:api]` — curl / ofetch / fetch HTTP round-trip evidence。
+      - `[verify:ui]` — screenshot-review `mode: verify` final-state screenshot + DOM observation；使用者仍需 review GUI 確認。
+      - `[verify:api+ui]` / `[verify:e2e+ui]` 等 multi-marker — 同一 business assertion 需要多個 evidence channels。
+
+      **NEVER** author new `[verify:auto]` markers。若 draft 產生 `[verify:auto]`，主線 cross-check 必須 inline 替換成 explicit marker：pure API → `[verify:api]`；mutation + visual → `[verify:api+ui]`；persistence / full journey → `[verify:e2e]`。
+
+      **分類指引**：描述含 SSH / `docker exec` / `psql` / `\d <table>` / `SELECT ... FROM` / 受控 drift 製造 / migration 存在性驗證 / 合理性檢查等 evidence-collection pattern → `[discuss]`；若 `curl` / HTTP round-trip 可重現 → `[verify:api]`；mutation persistence / reload journey → `[verify:e2e]`；純 final-state 視覺 → `[verify:ui]`；mutation + visual → `[verify:api+ui]`；真的需要人 → `[review:ui]`。
+
+      **Backend-only Manual Review 規約**（適用 `## User Journeys` 為 `**No user-facing journey (backend-only)**` 的 change）：
+      tasks.md 的 `## 人工檢查` **只**允許 `[discuss]` kind 的代表性 use cases：(1) production 授權 (2) 商業判斷 (3) production 觀察，以及可由 HTTP 重現的 `[verify:api]` round-trip。**禁止**把 SSH / psql / `\d <table>` / `SELECT FROM` / `SET session_replication_role` / 受控 drift 製造 / migration 存在性驗證等 evidence collection 寫進 `## 人工檢查` — 這些 **MUST** 寫進新的 `## N. Backend Verification Evidence` section 由 apply 階段 Claude 自跑自貼。若三類與 `[verify:api]` 都沒有，`## 人工檢查` 寫成固定文字 `_本 change 為 backend-only，所有驗證由 apply 階段 Claude 自跑（見 `## N. Backend Verification Evidence`）；deploy 前無使用者人工檢查項目。_`。完整規約見 `.claude/rules/ux-completeness.md` 「必填 Backend-only Manual Review 規約」與 `.claude/rules/manual-review.md` 「Item Kind Marker」。
+
+      **Manual Review Items 強制段（user-facing change 適用）**：
+      凡 `## 人工檢查` items 涉及以下情境時，**MUST** 拆 `#N.M` scoped sub-items 並 inline 具體 sample identifier：
+
+      - NFC / 刷卡 / 員工卡 / 員工 UID / 卡片 UID
+      - staff login / user role / 多角色 authz
+      - 業務 entity 操作（具體 work_report id / equipment id / loan id / business key）
+      - 多步驟流程（流程含「→」「然後」「接著」「完成後」等過渡詞 ≥ 2 個串接）
+      - 實體裝置（kiosk / 平板 / 真機 / 印表機 / 條碼槍）
+
+      **MUST** 從 `docs/FIXTURES.md`（或 `supabase/seed.sql` / 對應 seed file）抓 stable sample identifier，並在 `## N. Fixtures / Seed Plan` task 確認該 sample 寫進 seed。
+
+      **反面範例（禁止）**：
+      - ❌ `刷卡 → 進入毛刺 → 操作完成 → 自動回 standby`（無 URL、無 UID、無 step）
+      - ❌ `使用者輸入某個 staff 卡號`（模糊指代）
+      - ❌ `進入報工頁面送出`（無具體 report id、無 button selector）
+
+      **正面範例（要求）**：
+      ```
+      - [ ] #N [review:ui] kiosk 毛刺流程 round-trip 驗證
+        - [ ] #N.1 開 http://localhost:8787/kiosk/workstation → 確認 standby 頁面
+        - [ ] #N.2 點「手動輸入」按鈕 → 輸入 flat_burr UID `047D6201CC2A81` → 點確認
+        - [ ] #N.3 點「手動輸入」→ 輸入 staff UID `04469C0FCB2A81` → 自動 navigate /kiosk/workstation/deburring?...
+        - [ ] #N.4 DevTools Application → Session Storage → 確認 key `kiosk:scan-token` 存在
+        - [ ] #N.5 選系列 HGH15C → 輸數量 1 → 送出 → 完成回饋畫面
+        - [ ] #N.6 等 3 秒 auto-return → URL = /kiosk/workstation → sessionStorage key 已消失
+      ```
+
+      **寫完 tasks.md 後 MUST 自查**：
+      ```bash
+      grep -nE '(刷卡|某張|某筆|任一|挑一筆|隨便|→.*→)' openspec/changes/<change-name>/tasks.md
+      ```
+      若有 hit 在 `## 人工檢查` 區塊 → 改寫成 scoped sub-items + inline sample。完整規約見 `.claude/rules/manual-review.md` 「`[review:ui]` 純功能驗證 step actionability」+「Pre-Review Data Readiness」。
+
+      **Artifact 語言遵循**：
+      開工前先 `grep -lE "繁體|繁中|不要使用簡體" CLAUDE.md .claude/rules/*.md 2>/dev/null`。若命中（consumer 規定繁體中文），**全部** artifact（proposal.md / design.md / tasks.md / spec.md）**MUST** 用繁體中文撰寫，**禁止**英文 artifact。code 識別字、技術名詞（如 `audit_signed_chain`、`business_keys_drift`）、SQL/code block 不譯。若 grep 未命中視為無語言規定。
+
+      完成標準：`spectra park <change-name>` 執行成功。
+      不要呼叫 /spectra-apply。產出後在 stdout 摘要 artifacts 列表 + `spectra validate` 結果。
+      ```
+   3. **背景啟動 codex exec**（**Bash** tool 加 `run_in_background=true`）：
+
+      ```bash
+      cd <consumer-repo-root> && codex exec \
+        --model gpt-5.6-sol \
+        --dangerously-bypass-approvals-and-sandbox \
+        --skip-git-repo-check \
+        -c model_reasoning_effort=max \
+        < /tmp/codex-spectra-propose-<change-name>-prompt.md 2>&1
+      ```
+
+   4. **立刻**簡短回報給使用者：「已派 Codex GPT-5.6-sol max 在背景 draft `/spectra-propose <change-name>`（bash job `<id>`），完成後主線會 cross-check 並補 Design Review template」
+   5. 啟動 **Codex Watch Protocol**（見 `.claude/rules/agent-routing.codex-watch-protocol.md` § 監看排程 A. 主線直接 Bash 派）— **notification-only**：派出後**不**下短輪詢，主線 idle 等 `<task-notification>`；只下**一個**安全網 fallback `ScheduleWakeup(1500, "codex spectra-propose <change-name> 安全網檢查 — 預期靠 task-notification 收尾")`（~25 分，防 hang-type 失敗；`fetch failed` / auth 等 exit-type 失敗 codex 會直接 exit → background bash 完成 → 通知**立刻**觸發，不需輪詢）。**NEVER** 用 `ScheduleWakeup(180)` 短輪詢 — 每 3 分鐘醒來重讀整段 context 正是 notification-only 要消除的負擔
+
+   #### Phase 0b：主線 Cross-Check（codex 完成後**立刻**執行）
+
+   收到 `<task-notification> status=completed` 時**立刻**依序執行：
+
+   1. **Read codex stdout** 摘要：BashOutput 讀完整 stdout，回報 artifacts list / `spectra validate` 結果
+
+   2. **若 codex 已 `spectra park <change-name>`**：先 `spectra unpark <change-name>` 才能繼續 cross-check
+
+   3. **跑 post-propose-check.sh**（檢查 User Journeys / Affected Entity Matrix / Implementation Risk Plan / Design Review 7 步）：
+
+      ```bash
+      bash scripts/spectra-advanced/post-propose-check.sh <change-name>
+      ```
+
+      若有 FINDINGS → 主線**自己**直接 Edit proposal.md / tasks.md 補齊（**不要**回 codex 修，太慢）
+
+   3a. **跑 post-propose-manual-review-check.sh**（檢查 ## 人工檢查 item step actionability，per Layer B of `manual-review.md` mechanical enforcement）：
+
+      ```bash
+      bash scripts/spectra-advanced/post-propose-manual-review-check.sh <change-name>
+      ```
+
+      Exit 2 = 有 findings（ABSTRACT_REFERENCE / CARD_WITHOUT_UID / UI_ITEM_NO_URL / MULTI_STEP_NOT_SCOPED 任一）→ 主線**自己**直接 Edit tasks.md 改寫 ## 人工檢查 items：拆 `#N.M` scoped sub-items、inline 具體 sample UID（從 `docs/FIXTURES.md` 抓）、加具體 URL、模糊驗收動詞改為 falsifiable observation。完整修正指引見 hook stdout + `.claude/rules/manual-review.md`「`[review:ui]` 純功能驗證 step actionability」。
+
+      Legitimate false positive（e.g., 真機掃 SMS 無 dev replay endpoint）→ 在該 item 加 `@no-manual-review-check[<reason>]` trailing marker。
+
+   4. **跑 design-inject.sh**（若 UI scope，提醒 7 步 template）：
+
+      ```bash
+      bash scripts/spectra-advanced/design-inject.sh <change-name>
+      ```
+
+   5. **若 Design Review section 缺或不完整 7 步 → 主線自己 Edit tasks.md 補齊**：
+
+      位置：tasks.md 最後一個功能區塊之後、`## 人工檢查` 之前。N = 上一個功能區塊的序號 + 1。
+
+      ```markdown
+      ## N. Design Review
+
+      - [ ] N.1 檢查 PRODUCT.md（必要）+ DESIGN.md（建議）；缺 PRODUCT.md 跑 /impeccable teach、缺 DESIGN.md 跑 /impeccable document
+      - [ ] N.2 執行 /design improve [affected pages/components]，產出 Design Fidelity Report
+      - [ ] N.3 修復所有 DRIFT 項目（Fidelity Score < 8/8 時必做，loop 直到 DRIFT = 0，max 2 輪）
+      - [ ] N.4 依 /design improve 計劃按 canonical order 執行 targeted impeccable skills（layout / typeset / clarify / harden / colorize 等實際所需項目）
+      - [ ] N.5 執行 /impeccable audit，確認 Critical = 0
+      - [ ] N.6 執行 review-screenshot，補 design-review.md / 視覺 QA 證據
+      - [ ] N.7 Fidelity 確認 — design-review.md 中無 DRIFT 項
+      ```
+
+      `[affected pages/components]` 替換為此 change 實際涉及的 UI 檔案/頁面。
+
+   5.5 **Manual Review Marker Hygiene Check**（所有 change，不限 backend-only）：
+
+      Read tasks.md `## 人工檢查` 區塊全部 checkbox，依以下 hygiene rules 檢查並修正。違規 → 主線**自己**直接 Edit tasks.md（**不**回 codex 修，太慢）。
+
+      **Rule 1：每條 item line MUST 有 leading marker**
+
+      - 每條 `- [ ] #N ...` / `- [ ] #N.M ...` line **MUST** 在 id 後緊接合法 marker：`[review:ui]` / `[discuss]` / `[verify:e2e]` / `[verify:api]` / `[verify:ui]` / verify multi-marker `[verify:<a>+<b>]` 或 `[verify:<a>+<b>+<c>]`
+      - Verify multi-marker channels 僅限 `e2e` / `api` / `ui`，canonical order 是 `e2e → api → ui`
+      - Multi-marker **MUST NOT** 與 `[review:ui]` / `[discuss]` 混用；`[verify:api+review:ui]` / `[verify:api+discuss]` 非法
+      - 缺 marker → 依下方 Rule 2 / Rule 3 / Rule 4 的內容分類補上正確 marker；**禁止**仰賴 Default Kind Derivation Rule（fallback 只給既有 in-flight legacy item 用，且 fallback 不涵蓋任何 `verify:*`）
+      - 新 item **MUST NOT** 使用 `[verify:auto]`；若 codex draft 含 `[verify:auto]`，主線 inline 替換成 explicit marker（pure API → `[verify:api]`；mutation + visual → `[verify:api+ui]`；persistence / full journey → `[verify:e2e]`）
+
+      **Rule 2：Evidence-collection items MUST 標 `[discuss]` 或 `[verify:api]`**
+
+      若 item description 含下列 evidence-collection 動詞 / 模式：
+
+      - `Apply ... migration`、`verify ... exists`
+      - `SSH`、`docker exec`、`psql`
+      - `\d <table>`、`SELECT ... FROM`
+      - `curl`、`Trigger ... cron`、`Run /_cron/`
+      - `SET session_replication_role`、`UPDATE ... WHERE`、受控 drift 製造
+      - 「合理性檢查」、「分布是否符合預期」等商業判斷類
+
+      行為：
+
+      - SSH / psql / `\d` / `SELECT` / 受控 drift / migration existence / 商業判斷 → `[discuss]`
+      - `curl` / HTTP endpoint round-trip 若可由 apply 主線重現 → `[verify:api]`
+      - 若該 item 標了 `[review:ui]`、`[verify:ui]`、或 deprecated `[verify:auto]` → flag misclassified，主線改為 `[discuss]` 或 `[verify:api]`（依是否可由 HTTP 重現）
+      - **若該 change 為 backend-only**（proposal 含 `**No user-facing journey (backend-only)**`）：
+        - SSH / psql / `\d` / `SELECT` / 受控 drift 製造 / migration 存在性驗證等**純技術 evidence**項目 **MUST** 從 `## 人工檢查` 搬到 `## N. Backend Verification Evidence` section（N = 最後一個功能區塊序號 + 1，位於最後功能區塊之後、`## 人工檢查` 之前）由 apply Claude 自跑自貼。`## 人工檢查` 只保留 production 授權 / 商業判斷 / production 觀察三類 `[discuss]` items，以及可由 HTTP 重現的 `[verify:api]` items
+        - 若 Backend Verification Evidence 已存在，append 而非新增
+        - 若移完後 `## 人工檢查` 為空 → 替換成固定文字：`_本 change 為 backend-only，所有驗證由 apply 階段 Claude 自跑（見 `## N. Backend Verification Evidence`）；deploy 前無使用者人工檢查項目。_`
+      - **若該 change 為 user-facing**：evidence-collection items 可留在 `## 人工檢查`，但**MUST** 標 `[discuss]` 或 `[verify:api]`；Claude 在 archive Step 2.5 walkthrough 主動準備 `[discuss]` evidence，apply Step 8a 主線自跑 `[verify:api]`
+
+      **Rule 3：Real user round-trip items 依 channel 分流**
+
+      若 item 描述含真實使用者 round-trip（具體 URL + 使用者動作 + 預期 server/UI 結果），依 evidence shape 標記：
+
+      - persistence / reload / full journey → `[verify:e2e]`
+      - HTTP status / backend contract → `[verify:api]`
+      - final-state visual only → `[verify:ui]`
+      - mutation response + visual state → `[verify:api+ui]`
+      - journey + extra screenshot evidence → `[verify:e2e+ui]`
+      - 真的需要人（見 Rule 4）→ `[review:ui]`
+
+      誤標 `[discuss]` → 主線改為適當 `verify:*` 或 `[review:ui]`。
+
+      **Rule 4：「真的需要人」白名單 — 落單者改 explicit verify channel**
+
+      `[review:ui]` 只給「agent 用 agent-browser 也跑不了」的項目。description 含下列任一關鍵字才 `[review:ui]`：
+
+      - 收 email / 收 webhook（agent inbox 不可達）
+      - 「視覺主觀」/「美感」/「a11y 主觀判斷」
+      - 「實體裝置」/「真機」/「手機」/「平板」/ 「kiosk QR」/「印表機」/「條碼槍」
+      - 「跨機器」/「跨 session」/ 生產環境授權後操作
+      - 「電話」/「SMS」等規格外的非 UI 環境
+
+      其餘真實使用者 round-trip → **MUST** 標 explicit verify channel：
+
+      - 純 final-state 視覺：`[verify:ui]`
+      - 權限拒絕 path / HTTP status：`[verify:api]`
+      - mutation + toast / banner / list refetch / badge / sort / count：`[verify:api+ui]`
+      - reload persistence / edge payload journey：`[verify:e2e]`
+
+      行為：
+
+      - 若 item 標了 `[review:ui]` 但描述符合 verify channel 條件（不在白名單） → flag misclassified，主線改為 explicit `verify:*`
+      - 若 item 標了 `verify:*` 但描述需收 email / 實體裝置 / 視覺主觀（在白名單）→ flag misclassified，主線改為 `[review:ui]`
+
+      反面範例：
+
+      ```markdown
+      ❌ - [ ] #1 [review:ui] admin /settings 改排程 09:00 → reload 仍 09:00
+         理由：reload persistence 應由 Playwright spec 驗；應該 [verify:e2e]
+
+      ✅ - [ ] #1 [verify:e2e] admin /settings 改排程 09:00 → 200 toast → reload 仍 09:00
+      ✅ - [ ] #1 [verify:api+ui] admin /settings 改排程 09:00 → PATCH 200 + 畫面顯示新值
+      ✅ - [ ] #2 [review:ui] cron 觸發 → 借用人 inbox 收到逾期通知 email
+      ✅ - [ ] #3 [discuss] production seed 授權與 cron 監控確認
+      ```
+
+      **Rule 5：`[review:ui]` step actionability — 流程式描述要拆**
+
+      對標 `[review:ui]` 的 line，檢查描述是否屬「流程式描述」（user 看完仍不知道從哪開始）。命中下列任一條件 → flag 為非 actionable，**MUST** 由主線直接 Edit tasks.md 改寫：
+
+      - **流程式串接**：parent line 含 ≥ 2 個串接動詞（「刷卡 → 進入 → 完成 → 回 standby」「掃 QR → 進入 → 提交」「掃條碼 → 入庫 → 列印標籤」等）但**未拆 `#N.M` sub-items**
+      - **缺具體 URL**：item 描述未出現任何 `/xxx` 路徑或具體頁面 anchor（只說「kiosk 頁」「dashboard」「設定頁」不算）
+      - **實體裝置動詞但缺替代輸入線索**：描述含「刷卡」「掃 QR」「掃條碼」「印表機」「真機」「平板」「kiosk」等實體裝置動詞，但未提及 dev override（UID input / simulate endpoint / paste payload / desktop responsive emulation 等）也未引用具體 sample（UID / payload / 條碼字串）
+      - **模糊驗收動詞**：描述含「正常」「正確」「能用」「順利」「OK」這類無 falsifiable observation 的字眼（無「200 toast `X`」「badge 變 Y」「URL 變 /Z」這類具體觀察）
+
+      行為：
+
+      - 主線直接 Edit tasks.md，依 `manual-review.md` 的「`[review:ui]` 純功能驗證 step actionability」拆 `#N.M` scoped sub-items：每條一個原子動作（開 URL → 輸入 Y / 點 Z → 確認具體觀察 W）
+      - 若改寫需要的 dev override / baseline 未就緒（grep consumer codebase 找不到 dev input route / simulate endpoint / seed sample），**MUST** 在 design.md「Open Questions」或 tasks.md TD-NNN 段登記 baseline 缺口，並在 item 行尾加 `@followup[TD-NNN]` marker
+      - 若 sample 在 seed 中尚未建，**MUST** 在 `## N. Fixtures / Seed Plan` 補對應 task；引用的 stable identifier（UID / business key）與 item 描述一字不差
+      - 完整規約見 `manual-review.md` 的「`[review:ui]` 純功能驗證 step actionability」
+
+      反面範例：
+
+      ```markdown
+      ❌ - [ ] #7 [review:ui] kiosk 平板實機驗證：刷卡 → 進入毛刺 → 操作完成 → 自動回 standby，且 token 已 consume
+         理由：流程式串接、無具體 URL、無 sample UID、無 dev 替代輸入路徑、模糊驗收（「操作完成」「token 已 consume」未指明在哪查、看到什麼）
+
+      ✅ - [ ] #7 [review:ui] kiosk 刷卡 round-trip（standby → 操作頁 → 完成 → 自動回 standby + token consume）
+           - [ ] #7.1 桌機開 /kiosk，確認 standby（時鐘 + 「請刷卡」提示）
+           - [ ] #7.2 右下 `Dev: card UID` input 輸入 `04A1B2C3`（admin 樣本卡）→ Enter
+           - [ ] #7.3 切到操作頁，header 顯示「測試 Admin」+ 操作選單
+           - [ ] #7.4 點「完成操作」→ 200 toast「操作已記錄」→ 2 秒內回 standby
+           - [ ] #7.5 開 /admin/kiosk-tokens?card_uid=04A1B2C3，row `status=consumed` 且 `consumed_at` 為剛剛時間
+      ```
+
+      完整規約見 `.claude/rules/manual-review.md`「Item Kind Marker」+「Kind 分類指引」+「`[review:ui]` 純功能驗證 step actionability」+ `.claude/rules/ux-completeness.md`「必填 Backend-only Manual Review 規約」。
+
+   5.6 **Artifact 語言遵循 check**：
+
+      ```bash
+      grep -lE "繁體|繁中|不要使用簡體" CLAUDE.md .claude/rules/*.md 2>/dev/null
+      ```
+
+      - **若 grep 命中**（consumer 規定繁體中文）：
+        1. Read proposal.md / design.md / tasks.md，heuristic 偵測：連續 3+ 行純 ASCII 句子且不在 ` ``` ` code block / table / inline code 內 → 視為英文段落
+        2. 主線**自己** Edit 翻成繁體中文，保留：
+           - SQL / code / shell command（` ``` ` block 內）
+           - Code 識別字、檔案路徑、技術名詞（如 `audit_signed_chain`、`business_keys_drift`、`PostgREST`）
+           - inline code（單 backtick 內的字串）
+        3. 標題用語對齊既有繁中規則檔（例如 `## Why` / `## What Changes` / `## Non-Goals` / `## Affected Entity Matrix` 等 OpenSpec / Spectra 制式英文標題**保留不譯**，body 內容才翻）
+      - **若無命中**：跳過此 step
+
+   6. **掃 design.md 的 Open Questions**（不論前面摘要多漂亮，這步**不能省略**）：
+      - Read `openspec/changes/<change-name>/design.md`
+      - grep 找 `## Open Questions`（或同義變體：`## Open Question`、`## 待決問題`、`## Unresolved Questions`）
+      - 若標題存在且區塊內容非空（不是 `(none)` / `N/A` / `無` / 只剩空 bullet / 只剩註解）：
+        - **立刻**用 **AskUserQuestion** 把每一題列給使用者（一次最多 5 題，超過分批問）
+        - **NEVER** 把「要不要回答 open questions」包成 A/B/C/D 選單裡的一個選項
+        - **NEVER** 自行假設答案、自行標 wontfix、或推給未來
+        - 拿到答案後 Edit design.md 把 `## Open Questions` 改為 `## Resolved Questions`，每題下補 `**Answer:** <使用者回答>`
+
+   7. **跑 `spectra analyze <change-name> --json`** 確認無 Critical/Warning（max 2 輪 fix loop，與 Step 9 邏輯相同）
+
+   8. **`spectra validate <change-name>`** 確認 artifacts 結構合法
+
+   9. **`spectra park <change-name>`** 結束流程
+
+   10. 回報使用者：artifacts list + cross-check 結果（補了什麼、Design Review 7 步 OK 與否、analyze/validate 結果）+ `/spectra-apply <change-name>` 提示
+
+   ---
+
+   ### 選項 B：雙段 codex pipeline（codex draft → codex review → 主線 final check）
+
+   > **NOTE（Fable 暫代）**：本選項原設計為 Claude Fable 5 High draft（三模型交叉）。Fable 暫不可用，draft 階段暫以 codex gpt-5.6-sol xhigh 代替；review 與 final check 不變。Fable 回歸後把 Phase B-0a 的 draft 命令改回 `claude -p --model claude-fable-5 --effort high`，並還原本段描述即可。
+
+   三段序列：Codex GPT-5.6-sol xhigh 在背景起草 → Codex GPT-5.6-sol high（fresh session）檢查出 findings → 主線 Claude Opus 4.8 xhigh 整合 findings 並完成全套 cross-check。三段皆背景派工 + notification-only watch（per `.claude/rules/agent-routing.codex-watch-protocol.md` § 監看排程 A）。draft 與 review 是兩個獨立 codex session（即使同 model，fresh context 仍能抓到 draft 時的遺漏）。
+
+   #### Phase B-0a：背景 codex draft
+
+   1. **解析 change name + requirement**（同 Phase 0a step 1）。
+   2. **Write prompt 檔到 `/tmp/codex-spectra-propose-<change-name>-draft-prompt.md`** — 內容**完全沿用 Phase 0a step 2 的 draft prompt 範本**（Plan-first / Phase Purity / Manual Review Kind Marker / Backend-only 規約 / `docs/FIXTURES.md` sample / 語言遵循 / `spectra park` 完成標準全部照搬）。檔名用 `-draft-prompt` 與 Phase B-0b 的 `-review-prompt` 區隔，避免兩個 codex job 混用 prompt。
+   3. **背景啟動 codex exec**（**Bash** tool 加 `run_in_background=true`）：
+
+      ```bash
+      cd <consumer-repo-root> && codex exec \
+        --model gpt-5.6-sol \
+        --dangerously-bypass-approvals-and-sandbox \
+        --skip-git-repo-check \
+        -c model_reasoning_effort=xhigh \
+        < /tmp/codex-spectra-propose-<change-name>-draft-prompt.md 2>&1
+      ```
+
+      預設 text 輸出，不加 `--output-format json`（主線讀 tail）。
+   4. **立刻**簡短回報：「已派 Codex GPT-5.6-sol xhigh 在背景 draft `<change-name>`（bash job `<id>`）；完成後派 codex review，再由主線 Opus final check」。
+   5. 啟動 **Watch Protocol**（同 Phase 0a step 5）— **notification-only**：`codex exec` 背景 job 屬「主線直接 Bash 派」路徑，主線 idle 等 `<task-notification>`，只下**一個**安全網 fallback `ScheduleWakeup(1500, "codex spectra-propose <change-name> draft 安全網檢查 — 預期靠 task-notification 收尾")`。**NEVER** 短輪詢。
+
+   #### Phase B-0b：codex draft 完成 → 派 codex review
+
+   收到 codex draft `<task-notification status=completed>` 時**立刻**：
+
+   1. **Read codex draft stdout** 摘要：BashOutput 讀完整 stdout，回報 artifacts list / `spectra validate` 結果。
+   2. **若 codex draft 已 `spectra park <change-name>`：先 `spectra unpark <change-name>`** — park 後 artifacts 只存 `.git/spectra-app/spectra.db` SQLite blob、不在 git tracked file，review codex 要讀必須先 unpark 回檔案系統（同 Phase 0b step 2 + park pitfall）。
+   3. **Write codex review prompt 到 `/tmp/codex-spectra-propose-<change-name>-review-prompt.md`**：
+
+      ```
+      請檢查（review）本 repo 已 draft 的 change `<change-name>`，**不要修改任何檔案**，只輸出 findings。
+      讀取 openspec/changes/<change-name>/ 下全部 artifacts（proposal.md / design.md / tasks.md / specs/**/spec.md），對照以下規約逐項查：
+      - .claude/rules/ux-completeness.md（Affected Entity Matrix / User Journeys / Implementation Risk Plan / Fixtures-Seed Plan / Design Review 7 步）
+      - .claude/rules/manual-review.md（## 人工檢查 Item Kind Marker、step actionability、[verify:auto] 禁用）
+      - .claude/rules/agent-routing.md（Phase Purity：UI view phase vs 非 view phase 是否切開）
+      輸出格式：findings list，每條一行 `[檔案] 問題 → 建議修法`。無問題的面向寫「OK」。**禁止** Edit / Write / 改檔，只輸出文字 findings。
+      ```
+   4. **背景啟動 codex exec**（**Bash** tool 加 `run_in_background=true`）：
+
+      ```bash
+      cd <consumer-repo-root> && codex exec \
+        --model gpt-5.6-sol \
+        --dangerously-bypass-approvals-and-sandbox \
+        --skip-git-repo-check \
+        -c model_reasoning_effort=high \
+        < /tmp/codex-spectra-propose-<change-name>-review-prompt.md 2>&1
+      ```
+
+   5. **立刻**回報：「codex draft 完成，已派 codex GPT-5.6-sol high review（bash job `<id>`）；完成後主線 Opus final check」+ 啟動 notification-only watch（同 Phase B-0a step 5）。
+
+   #### Phase B-0c：Codex 檢查完 → 主線 Opus final check
+
+   收到 codex `<task-notification status=completed>` 時**立刻**：
+
+   1. **Read codex findings**：BashOutput 讀 codex stdout，整理 findings 摘要。
+   2. **主線整合 findings + 跑完整 cross-check** — 執行 Phase 0b step 3 ~ 9 全套（`post-propose-check.sh` / `post-propose-manual-review-check.sh` / `design-inject.sh` / 補 Design Review 7 步 / Manual Review Marker Hygiene / `[verify:auto]`→explicit marker / Backend Verification Evidence 搬移 / Open Questions→AskUserQuestion / `spectra analyze` / `spectra validate` / `spectra park`），並把 codex findings 一併納入修補依據。
+   3. **主線自己 Edit 修**（**NEVER** 把修補丟回 codex，太慢、來回成本高）。
+   4. 回報使用者：artifacts list + codex draft 摘要 + **codex review findings 摘要** + 主線補了什麼（Design Review 7 步 OK 與否、analyze/validate 結果）+ `/spectra-apply <change-name>` 提示。
+
+   ---
+
+   ### 禁止事項（重點重申，A / B / C 通用）
+
+   - **NEVER** 跳過 Step 0 選單（除非使用者**明確**指定路徑 — 見上方 § 明確指定捷徑）。預設**MUST**跳三選一選單
+   - **NEVER** 派 draft（codex）後不跑 cross-check / final check（post-propose-check + design-inject + 主線補 Design Review 7 步 + spectra analyze）
+   - **NEVER** 把 cross-check / final check 的修補工作丟回 codex（太慢、來回成本高）— 主線**自己** Edit 修
+   - **NEVER** 沉默等使用者來問進度；通知一到自己讀檔 + 續跑後續 phase
+   - **NEVER** 派 draft（codex）而 prompt 漏掉 Plan-first 段落 — 必須在動筆前先輸出 `## Plan`（要動哪些檔 / 每檔寫什麼 / phase 切分），主線後續 check 才有對齊基準
+
+   **選項 B 專屬 NEVER**：
+
+   - **NEVER** 把 Phase B-0a 的 draft prompt（`-draft-prompt.md`）與 Phase B-0b 的 review prompt（`-review-prompt.md`）混用 — draft 會寫檔 + park，review 只出 findings、禁止改檔
+   - **NEVER** 在 Phase B-0b 派 codex review 前忘了 `spectra unpark`（park 後 artifacts 在 SQLite blob，codex 讀不到）
+   - **NEVER** 讓 codex review 階段改檔 — review prompt 必含「禁止 Edit / Write、只輸出 findings」；實際修補由主線 Phase B-0c 做
+
+   **選 A / B 時本 session 不再執行任何 Step 1 ~ 11**（避免雙重生產）— Step 0 結束本 skill。
+
+   ### 選項 C：純 Claude 路徑（使用者選 C 或明確要求時）
+
+   continue to Step 1 below.
+
+1. **Determine the requirement source**
+
+   a. **Argument provided** (e.g., "add dark mode") → use it as the requirement description, skip to deriving the change name below.
+
+   b. **Plan file available**:
+   - Check if the conversation context mentions a plan file path (plan mode system messages include the path like `~/.claude/plans/<name>.md`)
+   - If found, check if the file exists at `~/.claude/plans/`
+   - If a plan file is found, use the **AskUserQuestion tool** to ask:
+     - Option 1: Use the plan file
+     - Option 2: Use conversation context
+   - If conversation context has no relevant discussion, mention this when presenting the choice
+   - If the user picks the plan file → read it and extract:
+     - `plan_title` (H1 heading) → use as requirement description
+     - `plan_context` (Context section) → use as proposal Why/Motivation content
+     - `plan_stages` (numbered implementation stages) → use for artifact creation
+     - `plan_files` (all file paths mentioned) → use for Impact section
+   - If the user picks conversation context → fall through to (c)
+
+   c. **Conversation context** → attempt to extract requirements from conversation history
+   - If context is insufficient, use the **AskUserQuestion tool** to ask what they want to build
+
+   From the resolved description, derive a kebab-case change name (e.g., "add dark mode" → `add-dark-mode`).
+   Do not keep archive-style date prefixes in active change names. If the source name starts with `YYYY-MM-DD-`, strip that date prefix before running `spectra new change`; archived change names and directories are historical references, not active names to reuse.
+
+   **IMPORTANT**: Do NOT proceed without understanding what the user wants to build.
+
+2. **Classify the change type**
+
+   Based on the requirement, classify the change into one of three types:
+
+   | Type     | When to use                                                         |
+   | -------- | ------------------------------------------------------------------- |
+   | Feature  | New functionality, new capabilities                                 |
+   | Bug Fix  | Fixing existing behavior, resolving errors                          |
+   | Refactor | Architecture improvements, performance optimization, UI adjustments |
+
+   This determines the proposal template format in step 5.
+
+3. **Scan existing specs for relevance**
+
+   Before creating the change, check if any existing specs overlap:
+   1. Use the **Glob tool** to list all files matching `openspec/specs/*/spec.md`
+   2. Extract directory names as the spec identifier list
+   3. Compare against the user's description to identify related specs (max 5 candidates)
+   4. For each candidate (max 3), read the first 10 lines to retrieve the Purpose section
+   5. If related specs are found, display them as an informational summary
+
+   **IMPORTANT**:
+   - If related specs are found, display them but do NOT stop or ask for confirmation — continue to the next step
+   - If no related specs are found, silently proceed without mentioning the scan
+
+4. **Create the change directory**
+
+   ```bash
+   spectra new change "<name>" --agent claude
+   ```
+
+   If a change with that name already exists, suggest continuing the existing change instead of creating a new one.
+
+5. **Write the proposal**
+
+   **IMPORTANT — file path rules for the `## Impact` section:**
+   - All file paths SHALL be written relative to the project root (e.g., `src/lib/foo.ts`, `src-tauri/crates/core/src/bar.rs`, `docs/specs/specs/auth/spec.md`).
+   - Do NOT use relative fragments (e.g., `parser/mod.rs`, `core/mod.rs`) — preflight rejects them as non-anchored paths.
+   - Do NOT wrap shell commands in backticks inside artifact text (e.g., `` `git mv a.rs b.rs` ``) — preflight's backtick extractor will otherwise mis-parse the command as a file reference.
+   - When referring to a file without naming its concrete path, use descriptive prose (e.g., "Parser 入口檔") rather than a backticked path fragment.
+
+   Get instructions:
+
+   ```bash
+   spectra instructions proposal --change "<name>" --json
+   ```
+
+   Generate the proposal content based on change type (see formats below), then write it via CLI:
+
+   ```bash
+   spectra new artifact proposal --change "<name>" --stdin <<'ARTIFACT_EOF'
+   <proposal content>
+   ARTIFACT_EOF
+   ```
+
+   If the command fails with a validation error, fix the content and retry.
+
+   Use the following format based on change type:
+
+   ### Feature
+
+   ```markdown
+   ## Why
+
+   <!-- Why this functionality is needed -->
+
+   ## What Changes
+
+   <!-- What will be different -->
+
+   ## Non-Goals (optional)
+
+   <!-- Scope exclusions and rejected approaches. Required when design.md is skipped. -->
+
+   ## Capabilities
+
+   ### New Capabilities
+
+   - `<capability-name>`: <brief description>
+
+   ### Modified Capabilities
+
+   (none)
+
+   ## Impact
+
+   - Affected specs: <new or modified capabilities>
+   - Affected code:
+     - New: <paths to be created, relative to project root>
+     - Modified: <paths that already exist>
+     - Removed: <paths to be deleted>
+   ```
+
+   ### Bug Fix
+
+   ```markdown
+   ## Problem
+
+   <!-- Current broken behavior -->
+
+   ## Root Cause
+
+   <!-- Why it happens -->
+
+   ## Proposed Solution
+
+   <!-- How to fix -->
+
+   ## Non-Goals (optional)
+
+   <!-- Scope exclusions and rejected approaches. Required when design.md is skipped. -->
+
+   ## Success Criteria
+
+   <!-- Expected behavior after fix, verifiable conditions -->
+
+   ## Impact
+
+   - Affected code:
+     - Modified: <paths that already exist>
+     - New: <paths to be created, relative to project root>
+     - Removed: <paths to be deleted>
+   ```
+
+   ### Refactor / Enhancement
+
+   ```markdown
+   ## Summary
+
+   <!-- One sentence description -->
+
+   ## Motivation
+
+   <!-- Why this is needed -->
+
+   ## Proposed Solution
+
+   <!-- How to do it -->
+
+   ## Non-Goals (optional)
+
+   <!-- Scope exclusions and rejected approaches. Required when design.md is skipped. -->
+
+   ## Alternatives Considered (optional)
+
+   <!-- Other approaches considered and why not -->
+
+   ## Impact
+
+   - Affected specs: <affected capabilities>
+   - Affected code:
+     - Modified: <paths that already exist>
+     - New: <paths to be created, relative to project root>
+     - Removed: <paths to be deleted>
+   ```
+
+5.5. **UI/UX Spec Source** (UI scope only) <!-- clade fork addition；not in upstream spectra -->
+
+   **Trigger**: proposal `## Impact` 含 `.vue` / `pages/` / `components/` / `app/` 路徑，或 `## Affected Entity Matrix` 含 Surfaces 欄。非 UI / bug fix / pure backend → 跳過此步直接進 Step 6。
+
+   **目的**：在生成 design.md 前，先把 spec 級 UX 需求準備好，融入 design.md 的 UX section（不獨立檔案）。視覺細節（typography / color / motion / craft）禁止在此階段決策，等 apply craft 階段介入。
+
+   **三種情境**：
+
+   - **新 surface / 新 capability**（proposal 含 New Capability + 新增 `.vue`/`pages/` 路徑）→ 跑 `/impeccable teach` 產 Design Context（users / brand / aesthetic / a11y），結果暫存待 Step 7 融入 design.md
+   - **延伸既有 surface**（modified capability + 現有 page/component 變更）→ 從 `PRODUCT.md` / `DESIGN.md` / 既有 component 萃取 Design Context，引用既有 docs 路徑
+   - **bug fix / 純非 UI** → 不該到這步（trigger 不符），回 Step 6
+
+   **spec 級 reference**（必含於後續 design.md UX section）：
+
+   - `interaction-design.md` — 互動模式、state、affordance、error handling
+   - `ux-writing.md` — voice/tone、文案規則、error message 標準
+   - `responsive-design.md` — 斷點、觸控目標、breakpoint constraint
+   - `spatial-design.md`（部分）— 資訊架構、layout grid 大方向（不到 px）
+
+   **視覺細節**（**禁止**在 propose 階段決策；等 apply craft 階段）：
+
+   - `typography.md` / `color-and-contrast.md` / `motion-design.md` / `craft.md`
+
+   Step 7 生成 design.md 時將融入上述 Design Context + spec 級 reference 至 UX section。
+
+6. **Get the artifact build order**
+
+   ```bash
+   spectra status --change "<name>" --json
+   ```
+
+   Parse the JSON to get:
+   - `applyRequires`: array of artifact IDs needed before implementation
+   - `artifacts`: list of all artifacts with their status and dependencies
+
+7. **Create remaining artifacts in sequence**
+
+   Loop through artifacts in dependency order (skip proposal since it's already done):
+
+   a. **For each artifact that is `ready` (dependencies satisfied)**:
+   - **Check if the artifact is optional**: If the artifact is NOT in the dependency chain of any `applyRequires` artifact (i.e., removing it would not block reaching apply), it is optional. Get its instructions and read the `instruction` field. If the instruction contains conditional criteria (e.g., "create only if any apply"), evaluate whether any criteria apply to this change based on the proposal content. If none apply, skip the artifact and show: "⊘ Skipped <artifact-id> (not needed for this change)". Then continue to the next artifact.
+   - Get instructions:
+     ```bash
+     spectra instructions <artifact-id> --change "<name>" --json
+     ```
+   - The instructions JSON includes:
+     - `context`: Project background (constraints for you - do NOT include in output)
+     - `rules`: Artifact-specific rules (constraints for you - do NOT include in output)
+     - `template`: The structure to use for your output file
+     - `instruction`: Schema-specific guidance
+     - `outputPath`: Where to write the artifact
+     - `dependencies`: Completed artifacts to read for context
+     - `locale`: The language to write the artifact in (e.g., "Japanese (日本語)"). If present, you MUST write the artifact content in this language. Exception: spec files (specs/\*_/_.md) MUST always be written in English regardless of locale, because they use normative language (SHALL/MUST).
+   - Read any completed dependency files for context
+   - Generate the artifact content using `template` as the structure
+   - <!-- clade fork addition；not in upstream spectra -->
+     **UI scope supplement**: 若 Step 5.5 已產出 Design Context（artifact = `design`），於 design.md template 結構內補一個 `## UX Spec` section，包含：(1) Design Context（users / brand / aesthetic / a11y）；(2) spec 級 reference 對應的具體 UX 規格（interaction / ux-writing / responsive / spatial）；(3) 明確聲明「視覺細節（typography/color/motion）由 apply craft 階段決策，不在此規範」。spec 檔（specs/\*.md）永遠英文且只放 SHALL/MUST 規範語句，不在此補 UX context；tasks.md 不補（既有 Check 6 Design Review 7 步覆蓋 tasks 端）
+   - Apply `context` and `rules` as constraints - but do NOT copy them into the file
+   - Write the artifact via CLI (the CLI handles directory creation and format validation):
+
+     For **design** or **tasks**:
+
+     ```bash
+     spectra new artifact <artifact-id> --change "<name>" --stdin <<'ARTIFACT_EOF'
+     <content>
+     ARTIFACT_EOF
+     ```
+
+     For **specs** (one command per capability):
+
+     ```bash
+     spectra new artifact spec <capability-name> --change "<name>" --stdin <<'ARTIFACT_EOF'
+     <delta spec content>
+     ARTIFACT_EOF
+     ```
+
+     If the command fails with a validation error, fix the content and retry.
+
+   - Show brief progress: "✓ Created <artifact-id>"
+
+   b. **Continue until all `applyRequires` artifacts are complete**
+   - After creating each artifact, re-run `spectra status --change "<name>" --json`
+   - Check if every artifact ID in `applyRequires` has `status: "done"`
+   - Stop when all `applyRequires` artifacts are done
+
+   c. **If an artifact requires user input** (unclear context):
+   - Use **AskUserQuestion tool** to clarify
+   - Then continue with creation
+
+8. **Inline Self-Review** (before CLI analysis)
+
+   After creating all artifacts, scan them manually. Fix issues inline, then proceed to the CLI analyzer.
+
+   **Check 1: No Placeholders**
+
+   These patterns are artifact failures — fix each one before proceeding:
+   - "TBD", "TODO", "FIXME", "implement later", "details to follow"
+   - Vague instructions: "Add appropriate error handling", "Handle edge cases", "Write tests for the above"
+   - Delegation by reference: "Similar to Task N" without repeating specifics
+   - Steps describing WHAT without HOW: "Implement the authentication flow" (what flow? what steps?)
+   - Empty template sections left unfilled
+   - Weasel quantities: "some", "various", "several" when a specific number or list is needed
+
+   **Check 2: Internal Consistency**
+   - Does every capability in the proposal have a corresponding spec?
+   - Does the design reference only capabilities from the proposal?
+   - Do tasks cover all design decisions, and nothing outside proposal scope?
+   - Are file paths consistent across proposal Impact, design, and tasks?
+
+   **Check 3: Scope Check**
+   - More than 15 pending tasks → consider decomposing into multiple changes
+   - Any single task would take more than 1 hour → split it
+   - Touches more than 3 unrelated subsystems → consider splitting
+
+   **Check 4: Ambiguity Check**
+   - Are success/failure conditions testable and specific?
+   - Are boundary conditions defined (empty input, max limits, error cases)?
+   - Could "the system" refer to multiple components? Be explicit.
+
+   **Check 5: Durable Handoff Review** (run BEFORE the CLI analyzer)
+
+   This change has to survive being parked or handed to another agent. Reject and fix any of the following:
+   - **File-path-only tasks**: a task whose entire description is "edit file X" with no behavior, contract, or verification target. File paths are locator context — the task SHALL still describe what is observably true when complete.
+   - **Line-number-coupled instructions**: design or tasks content that points to "line 42" / "the function on lines 80-95" as the only way to identify the work. Source line numbers drift; name the function, command, struct, or behavior instead.
+   - **Vague acceptance criteria**: success conditions like "works correctly", "behaves as expected", "handles edge cases" without naming the observable behavior or the verification target (test name, CLI invocation, analyzer rule, manual assertion).
+   - **Missing scope boundaries on non-trivial work**: design lacking explicit "in scope" / "out of scope" lines for any change that touches more than one subsystem or introduces new behavior. Trivial artifact-only edits MAY skip this; runtime, build, or tooling effects MUST NOT.
+
+   Fix every failure inline using the existing context before running the CLI analyzer. If a failure cannot be fixed without new input from the user, surface it explicitly rather than papering over it.
+
+   **Check 6: Design Review 7-step template (UI scope only)**
+
+   If `tasks.md` references any `.vue` / `pages/` / `components/` / `layouts/` files:
+   - tasks.md **MUST** contain a `## N. Design Review` section before `## 人工檢查` (with N = last functional section number + 1)
+   - The section **MUST** have all 7 checkboxes (N.1 through N.7) covering: PRODUCT.md/DESIGN.md check, /design improve + Fidelity Report, DRIFT fix loop, canonical-order targeted impeccable skills, /impeccable audit Critical = 0, review-screenshot, Fidelity confirmation
+   - Verify by running `bash scripts/spectra-advanced/post-propose-check.sh <change-name>` and acting on its FINDINGS
+   - If anything is missing, fix tasks.md inline now — do NOT let an incomplete Design Review section through. Archive gate will block it later anyway.
+
+   **Check 7: Fixtures / Seed Plan (UI scope + Affected Entity Matrix)**
+
+   If `tasks.md` has UI scope **AND** `proposal.md` contains `## Affected Entity Matrix` (= entity-level changes that surface in UI):
+   - tasks.md **MUST** contain a `## N. Fixtures / Seed Plan` section before `## Design Review` (with N = last functional section number + 1)
+   - Either include at least one `- [ ]` task line per entity-with-Surfaces (entity name, minimum row count, target seed file path) **OR** an explicit `**Existing seed sufficient**` declaration with one-line justification
+   - Detected seed-file conventions (in order): `supabase/seed.sql` / `db/seed.sql` / `prisma/seed.ts` / `drizzle/seed.ts`
+   - Reason: UI pages displaying empty data on dev/staging make `review-screenshot` worthless. Fixtures are part of feature completeness, not a review-time afterthought.
+   - Verify by running `bash scripts/spectra-advanced/post-propose-check.sh <change-name>` and acting on Check 7 FINDINGS
+   - Full template + exemption rules see `ux-completeness.md` 「必填 Fixtures / Seed Plan」section
+
+   **Check 8: Phase Purity (UI view vs 非 view 必須切成獨立 phase)**
+
+   If `tasks.md` includes UI view scope (any task references `.vue` / `.tsx` / `.jsx` / `app/pages/` / `app/components/` / `pages/` / `components/` / `views/` / `layouts/` / `.css` / `.scss`):
+   - For each functional `## N. <title>` phase in tasks.md (excluding `## N. Design Review` and `## N. Fixtures / Seed Plan`):
+     - **MUST NOT** mix view-layer file references with non-view work (schema / migration / API server / store / hook / API client / type / util / 純 backend)
+     - 一個 phase 要嘛純 view 工作（component / page / view / layout / styling），要嘛純非 view 工作；混雜 phase 違規
+   - Verify by running `bash scripts/spectra-advanced/post-propose-check.sh <change-name>` and acting on Check 4c FINDINGS
+   - If a mixed phase is detected, **MUST** split inline now into independent phases — do NOT defer to ingest. spectra-apply Phase Dispatch 規則仰賴 phase purity；混雜 phase 在 apply 時會被擋下要求重 ingest，propose 階段就修掉成本最低
+   - Reason: spectra-apply 把 UI view phase 由主線 Claude Code 自己做、其他 phase 派給 codex GPT-5.5 high；phase 混雜會破壞 dispatch 邊界，要嘛讓 codex 碰 view 層、要嘛讓主線吞下原本可以 offload 的 mechanical 工作
+
+   **Check 9: Manual Review Marker Hygiene** (applies to **every** change, not only backend-only)
+
+   Verify all four rules from Step 5.5 Manual Review Marker Hygiene Check:
+
+   1. **Every `## 人工檢查` item line MUST carry a legal leading marker** (right after `#N` / `#N.M`, before the description): `[review:ui]` / `[discuss]` / `[verify:e2e]` / `[verify:api]` / `[verify:ui]` / verify multi-marker `[verify:<a>+<b>]` or `[verify:<a>+<b>+<c>]`. Default Kind Derivation Rule is a fallback for legacy in-flight items only — newly authored content **MUST** be explicit. Default fallback does NOT cover any `verify:*` channel.
+   2. **New `[verify:auto]` is forbidden**. If codex draft contains `[verify:auto]`, main thread **MUST** inline replace it: pure API → `[verify:api]`; mutation + visual → `[verify:api+ui]`; persistence / full journey → `[verify:e2e]`.
+   3. **Evidence-collection items MUST be marked `[discuss]` or `[verify:api]`**. SSH / `docker exec` / `psql` / `\d <table>` / `SELECT FROM` / controlled drift fabrication / migration existence verification / 商業判斷類「分布是否符合預期」→ `[discuss]`; reproducible HTTP / `curl` round-trip → `[verify:api]`.
+   4. **Real user round-trip items MUST use the strongest explicit channel**: persistence / reload / full journey → `[verify:e2e]`; HTTP status / backend contract → `[verify:api]`; final-state visual only → `[verify:ui]`; mutation + visual → `[verify:api+ui]`; human-only allowlist → `[review:ui]`.
+   5. **Multi-marker cannot mix verify channels with human/discuss kinds**. `[verify:api+ui]` is valid; `[verify:api+review:ui]` and `[verify:api+discuss]` are invalid.
+
+   When a violation is detected, the main thread Edit tasks.md inline (do NOT round-trip back to codex). For backend-only changes specifically:
+
+   - Pure technical evidence items (SSH / psql / `\d` / `SELECT` / drift fabrication / migration existence verify) **MUST** be moved out of `## 人工檢查` into `## N. Backend Verification Evidence` section (位置：最後一個功能區塊之後、`## 人工檢查` 之前；N = 上一個功能區塊序號 + 1) — apply Claude self-runs them and pastes evidence under each task.
+   - `## 人工檢查` retains only `[discuss]` items in three categories plus reproducible `[verify:api]` HTTP round-trips:
+     1. **Production 授權型** — deploy 前 final go/no-go ack、production-only 破壞性操作授權
+     2. **商業判斷型** — Claude 無法自動判斷「結果是否合理」的觀察項
+     3. **Production 觀察型** — deploy 後 N 小時 / N 天的 production-only soak window 觀察
+   - 若三類都沒有，`## 人工檢查` **MUST** 寫成固定文字（archive gate 視為合法）：
+     ```
+     _本 change 為 backend-only，所有驗證由 apply 階段 Claude 自跑（見 `## N. Backend Verification Evidence`）；deploy 前無使用者人工檢查項目。_
+     ```
+
+   For **user-facing** changes: evidence-collection items can stay in `## 人工檢查` but **MUST** be marked `[discuss]` or `[verify:api]` — Claude proactively prepares `[discuss]` evidence during spectra-archive Step 2.5, and main thread runs `[verify:api]` during spectra-apply Step 8a.
+
+   Reason: forcing users to SSH + psql + curl is not "manual review" — it's evidence collection Claude can automate or discuss. Forcing users to manually round-trip automatable flows is also wasted attention — apply Step 8a runs explicit verify channels. Real `[review:ui]` items are reserved for things genuinely requiring a human (email inbox, physical devices, subjective judgment). Mixing dilutes the user's attention.
+
+   Full 規約 (含 Item Kind Marker schema、verify channel cookbook、Backend Verification Evidence 模板、反面範例、違反回報格式) 見 `manual-review.md` 「Item Kind Marker」+ `vendor/snippets/verify-channels/README.md` + `ux-completeness.md` 「必填 Backend-only Manual Review 規約」
+
+   **Check 10: Artifact language convention**
+
+   ```bash
+   grep -lE "繁體|繁中|不要使用簡體" CLAUDE.md .claude/rules/*.md 2>/dev/null
+   ```
+
+   If the grep matches (consumer enforces 繁體中文):
+   - All artifacts (`proposal.md` / `design.md` / `tasks.md` / `specs/**/*.md`) **MUST** be written in 繁體中文.
+   - Code identifiers, file paths, technical names (e.g., `audit_signed_chain`, `business_keys_drift`, `PostgREST`), SQL blocks, shell commands, and inline `code` remain untranslated.
+   - OpenSpec / Spectra 制式英文標題（如 `## Why`、`## What Changes`、`## Non-Goals`、`## Affected Entity Matrix`、`## User Journeys`、`## Implementation Risk Plan`）保留英文，body 內容必須繁中。
+   - If codex draft produced English artifacts despite the convention, fix inline now — main thread Edit 翻譯，**不要**回 codex 重 draft.
+   - Reason: codex GPT-5.5 在 prompt 已有繁中指示時仍可能默認輸出英文；主線 cross-check 是最後一道翻譯把關。違反語言慣例會讓使用者在 review/manual-check 階段卡關。
+
+---
+
+## Rationalization Table
+
+| What You're Thinking                                          | What You Should Do                                                                    |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| "The requirements are clear enough, no need for discuss"      | Fine if true — but check you're not skipping because you're lazy                      |
+| "This artifact isn't needed for this change"                  | Check `applyRequires` — if it's in the dependency chain, create it                    |
+| "The spec doesn't need scenarios, the requirement is obvious" | Obvious to you now. Write scenarios for the implementer who doesn't have your context |
+| "I'll keep the design brief, code will be self-explanatory"   | Design exists so implementers don't reverse-engineer intent. Be specific              |
+| "This is a small change, skip the scope check"                | Small changes touching 5 subsystems aren't small. Check                               |
+| "The placeholder is fine for now, I'll fill it in later"      | There is no "later" — implementation is next. Fill it in now                          |
+
+---
+
+9. **Analyze-Fix Loop** (max 2 iterations)
+   1. Run `spectra analyze <change-name> --json`
+   2. Filter findings to **Critical and Warning only** (ignore Suggestion)
+   3. If no Critical/Warning findings → show "Artifacts look consistent ✓" and proceed
+   4. If Critical/Warning findings exist:
+      a. Show: "Found N issue(s), fixing... (attempt M/2)"
+      b. Fix each finding in the affected artifact
+      c. Re-run `spectra analyze <change-name> --json`
+      d. Repeat up to 2 total iterations
+   5. After 2 attempts, if findings remain:
+      - Show remaining findings as a summary
+      - Proceed normally (do NOT block)
+
+10. **Validation**
+
+    ```bash
+    spectra validate "<name>"
+    ```
+
+    If validation fails, fix errors and re-validate.
+
+11. **Park the change and end the workflow**
+
+    Show summary:
+    - Change name and location
+    - List of artifacts created
+    - Validation result
+
+    Then unconditionally execute:
+
+    ```bash
+    spectra park "<name>"
+    ```
+
+    **Pre-handoff: 自動準備 apply 用 worktree**（clade fork addition；not in upstream spectra）
+
+    Per [[worktree-default]] §1, spectra-apply 必須在 isolated session worktree 跑（會寫 tracked product code）。Propose 結束時主動建好對應 worktree，user 才能一鍵接續 apply，不必再手動 `/wt`。
+
+    ```bash
+    node scripts/wt-helper.mjs add "<change-name>"
+    ```
+
+    Helper 行為與失敗處理見 `plugins/hub-core/skills/wt/SKILL.md`。若 helper fail with `Worktree path already exists`（slug 已存在，例如同名 change 之前建過、user 重跑 propose）→ 沿用既有 worktree 即可，視為成功；用 `node scripts/wt-helper.mjs list --json` 抓既有 path。其他 helper 錯誤 → 報錯但**仍**繼續吐下方 handoff message，附上錯誤摘要讓 user 手動處理。
+
+    **Handoff message**：
+
+    Output a single status line:
+
+    ```
+    Change `<change-name>` parked. Apply worktree ready at `<worktree-absolute-path>`. Run `/spectra-apply <change-name>` from any session to begin — apply skill handles worktree dispatch internally.
+    ```
+
+    `<worktree-absolute-path>` 從 wt-helper 輸出抓。Auto-unpark 與 worktree dispatch 都由 `/spectra-apply` 內部處理；user 不需 `cd`，從 main 直接跑 `/spectra-apply` 即可。
+
+    **Post-park commit reminder**（clade fork addition；not in upstream spectra）
+
+    Park 之後 artifacts 只存在 `.git/spectra-app/spectra.db` SQLite blob（**不在 git tracked file**）。若後續 `/spectra-apply` 的 unpark 步驟在錯誤 cwd 跑（例如 Claude Code `Agent` tool dispatched subagent 的 ephemeral `.claude/worktrees/agent-*/`），unpark 寫的 artifacts 會落在 session-GC 路徑 → SQLite parked 條目同時被 unpark 刪除 → **artifacts 在 git / SQLite / 任何活著的 worktree 都不存在 = 永久遺失**（已在 co-purchase 撞過：99 tasks + 5 specs + proposal 蒸發，僅 design.md 從 git history 復原但缺最後 3 個決策）。完整 root cause 見 `docs/pitfalls/2026-05-22-agent-tool-subagent-worktree-bypass.md`。
+
+    Park 跑完並輸出 Handoff message 之後，**MUST** 用 **AskUserQuestion** 給 user 二擇一（這條問題是「commit-to-git for data-loss safety」，跟前段「do NOT call AskUserQuestion to ask whether to park or apply」是不同議題；本 AskUserQuestion 必跑）：
+
+    - **Option A — 立刻 commit artifacts 到 git（recommended）**：先 `spectra unpark "<change-name>"` 把 artifacts 還原到 disk，然後在 main worktree（**禁止**在 subagent / ephemeral worktree）用 `git commit --only -- <paths>` 落 commit：
+
+      ```bash
+      spectra unpark "<change-name>"
+      # MUST 用 git commit --only -- <paths>，per rules/core/commit.md § Ad-hoc commit hard rule
+      # NEVER 用 git add + git commit 兩段法（在 multi-session 共用 working tree 會吞別 session 已 staged 的內容；
+      # 見 docs/pitfalls/2026-05-24-consumer-ad-hoc-commit-eats-other-session-staged.md）
+      git commit --only -m "📝 docs(spectra): propose artifacts for <change-name>" -- openspec/changes/<change-name>/
+      ```
+
+      Commit 後 **MUST** verify scope：`git show --stat HEAD | tail -3` 確認 changed files 都在 `openspec/changes/<change-name>/` 路徑底下；若含其他路徑（代表撞 multi-session staged race 或 commit --only 沒生效）→ **STOP** + 走 [`rules/core/commit.md`](../../../../rules/core/commit.md) § Recovery from mixed commit。
+
+      Commit 之後 artifacts 落 git 永久保留；後續 `/spectra-apply` 從 main fork 的 worktree 看得到 artifacts，**不再依賴 SQLite blob**。Apply 完成 archive 階段會由 `/spectra-archive` 把 artifacts 搬進 `openspec/changes/archive/<date>-<change>/`。
+
+      Option description 必含風險揭露：`park 後 artifacts 只存 SQLite blob，後續 subagent dispatch 跑 unpark 寫進 ephemeral worktree → session GC → artifacts 永久遺失（co-purchase 已踩；見 pitfall）`。
+
+    - **Option B — 維持 parked（接受風險）**：保留 SQLite blob 狀態，artifacts 不寫 disk、不上 git。**僅當** user 明確知道下一步 `/spectra-apply` 不會經過 `Agent` tool dispatched subagent（例如直接在 main 跑 `/spectra-apply` 而非 `/wt` Form 3）才安全。
+
+      Option description 必含風險揭露：`若下一步 /spectra-apply 透過 Agent tool dispatch subagent（含 /wt Form 3）→ subagent cwd 是 .claude/worktrees/agent-*/，unpark 寫進去後 session GC = artifacts 永久遺失`。
+
+    User 選 Option A → 主線執行上述 unpark + commit 動作。User 選 Option B → 跳過 commit，**MUST** 額外輸出一行警告：`⚠ Parked artifacts only exist in SQLite blob; if /spectra-apply runs through Agent tool dispatch, artifacts may be lost. Consider committing now.`
+
+    若 **AskUserQuestion** tool 不可用 → 以純文字列出 A / B 兩選項 + 上述風險揭露，等 user 回答後執行對應動作。
+
+    **NEVER** 跳過此 AskUserQuestion（理由：本 prompt 不是「要不要 park / apply」的決策問題，是「park 之後 commit-to-git for data-loss safety」的問題；前段禁止的是前者）。
+
+    If you are currently in Codex Plan Mode, also remind the user to switch the session to normal mode before running `/spectra-apply`. This is only a reminder: do NOT try to use ExitPlanMode or EnterPlanMode, do NOT ask whether to switch modes, and do NOT invoke apply.
+
+    The propose workflow ENDS here. Do NOT invoke `/spectra-apply`. Do NOT call **AskUserQuestion** to ask whether to park or apply (the post-park commit reminder above is a separate data-safety question and **MUST** still be asked). This behavior is identical across Auto Mode, interactive mode, and any other agent mode — parking is unconditional and does not depend on `AskUserQuestion` availability or UI auto-accept settings.
+
+**Artifact Creation Guidelines**
+
+- Follow the `instruction` field from `spectra instructions` for each artifact type
+- Read dependency artifacts for context before creating new ones
+- Use `template` as the structure for your output file - fill in its sections
+- **IMPORTANT**: `context` and `rules` are constraints for YOU, not content for the file
+  - Do NOT copy `<context>`, `<rules>`, `<project_context>` blocks into the artifact
+  - These guide what you write, but should never appear in the output
+- **Parallel task markers (`[P]`)**: When creating the **tasks** artifact, first read `.spectra.yaml`. If `parallel_tasks: true` is set, add `[P]` markers to tasks that can be executed in parallel. Format: `- [ ] [P] Task description`. A task qualifies for `[P]` if it targets different files from other pending tasks AND has no dependency on incomplete tasks in the same group. When `parallel_tasks` is not enabled, do NOT add `[P]` markers.
+
+**Guardrails**
+
+- Create all artifacts needed for implementation. Optional artifacts (those not in the `applyRequires` dependency chain) may be skipped if their inclusion criteria don't apply.
+- Always read dependency artifacts before creating a new one
+- If context is critically unclear, ask the user - but prefer making reasonable decisions to keep momentum
+- If a change with that name already exists, suggest continuing that change instead
+- Verify each artifact file exists after writing before proceeding to next
+- **NEVER** write application code or implement features during this workflow
+- **NEVER** skip the artifact workflow to write code directly
+- **NEVER** reinterpret requirements by ignoring the proposal file
+- **NEVER** invoke `/spectra-apply` — this workflow ends after artifact creation. The user decides when to start implementation
+- If **AskUserQuestion tool** is not available, ask the same questions as plain text and wait for the user's response

@@ -1,0 +1,837 @@
+---
+name: event-machine
+description: Build, test, and debug event-driven state machines with EventMachine — a Laravel package for declarative workflows, parallel states, child machine delegation, event sourcing, and HTTP endpoint routing. Use when writing MachineDefinition config, ActionBehavior/GuardBehavior/CalculatorBehavior classes, TestMachine fluent assertions, Machine::test/startingAt/fake, parallel states, delegation with @done/@fail/@timeout, Scenarios (MachineScenario), timers (after/every), schedules, ContextManager, MachineInput/MachineOutput, endpoints, archival, or debugging state transition issues. Activates on tarfin-labs/event-machine imports, .tarfin-labs namespaces, "state machine", "MachineDefinition", "TestMachine", or when editing files that extend Machine/ActionBehavior/GuardBehavior.
+---
+
+# EventMachine — Laravel State Machines
+
+EventMachine is a PHP/Laravel package for event-driven state machines inspired by XState/SCXML. It models workflows as explicit states and transitions with automatic event sourcing, Laravel-native integration, parallel execution via queue dispatch, child machine delegation, declarative timers/schedules, and a fluent test API.
+
+**Always link to docs using `https://eventmachine.dev/...`** — never the github-pages URL.
+
+---
+
+## 0. How to Use This Skill
+
+This skill contains **the full EventMachine documentation** in `docs/` plus agent-specific cheat-sheets in `references/`. Sections 1-7 below are a starting point — every non-trivial task should include reading the relevant `docs/` file(s) before writing code.
+
+**Three levels of detail:**
+- **This file (SKILL.md)** — conventions, principles, gotchas, quick reference. Start here.
+- **`references/`** — distilled agent cheat-sheets by task type. Use for quick pattern lookup when writing code.
+- **`docs/`** — canonical, human-authored documentation. Read for deep understanding. Always authoritative.
+
+**Proactive doc-reading triggers** — before writing code, read based on your task:
+
+| Task | Read first |
+|------|-----------|
+| Write a scenario | `docs/advanced/scenarios.md` + `docs/advanced/scenario-plan.md` (Pitfalls section) |
+| Debug scenario not intercepting | `docs/advanced/scenario-runtime.md` (Debugging Scenarios + machine_events verification) |
+| Design state topology | `docs/best-practices/state-design.md` + `docs/building/defining-states.md` |
+| Add machine/job delegation | `docs/advanced/machine-delegation.md` + `docs/advanced/async-delegation.md` |
+| Add parallel states | `docs/advanced/parallel-states/index.md` + `docs/best-practices/parallel-patterns.md` |
+| Write tests | `docs/testing/overview.md` + `docs/testing/recipes.md` |
+| Debug transition issues | `docs/reference/execution-model.md` + `docs/testing/troubleshooting.md` |
+| Wire HTTP endpoints | `docs/laravel-integration/endpoints.md` |
+| Anything with @done/@fail/@timeout | `docs/advanced/machine-delegation.md` + `docs/advanced/typed-contracts.md` |
+
+Skip doc-reading only for mechanical changes (rename, typo, simple extraction).
+
+---
+
+## 1. Naming Conventions (MEMORIZE — agents break this most)
+
+| Element                 | Style                  | Pattern                              | Example                        |
+|-------------------------|------------------------|--------------------------------------|--------------------------------|
+| Event class             | PascalCase             | `{Subject}{PastVerb}Event`           | `OrderSubmittedEvent`          |
+| Event type              | SCREAMING_SNAKE_CASE   | `{SUBJECT}_{PAST_VERB}`              | `ORDER_SUBMITTED`              |
+| State (leaf)            | snake_case             | adjective / participle               | `awaiting_payment`             |
+| State (parent)          | snake_case             | noun (namespace)                     | `payment`                      |
+| Action class            | PascalCase             | `{Verb}{Object}Action`               | `SendNotificationAction`       |
+| Guard class             | PascalCase             | `{Is/Has/Can}{Condition}Guard`       | `IsPaymentValidGuard`          |
+| ValidationGuard class   | PascalCase             | `{Prefix}{Condition}ValidationGuard` | `IsAmountValidValidationGuard` |
+| Calculator class        | PascalCase             | `{Subject}{Noun}Calculator`          | `OrderTotalCalculator`         |
+| Output class            | PascalCase             | `{Subject}{Noun}Output`              | `InvoiceSummaryOutput`         |
+| Machine class           | PascalCase             | `{Domain}Machine`                    | `OrderWorkflowMachine`         |
+| Machine ID              | snake_case             | `{domain_name}`                      | `order_workflow`               |
+| Context class           | PascalCase             | `{Domain}Context`                    | `OrderWorkflowContext`         |
+| Inline behavior key     | camelCase+type suffix  | `{verb}{Obj}{Type}`                  | `sendEmailAction`              |
+| Timer / `then` event    | SCREAMING_SNAKE_CASE   | Same as event types                  | `ORDER_EXPIRED`                |
+| Context / payload keys  | camelCase              | `$descriptiveName`                   | `totalAmount`                  |
+| Config keys             | snake_case             | `{descriptive_name}`                 | `should_persist`               |
+
+### Critical naming rules
+
+1. **"is" test for states** — state name must fit "The {entity} is ___": `awaiting_payment` ✓, `submit` ✗.
+2. **State names never imperative** — `processing` not `process`, `submitted` not `submit`.
+3. **Avoid ambiguous bare nouns for leaf states** — `awaiting_payment` not just `payment`.
+4. **Events are past-tense facts, never commands** — `ORDER_SUBMITTED` not `SUBMIT_ORDER`.
+5. **No abbreviations in event types** — `ORDER_SUBMITTED` not `ORD_SUB`.
+6. **Events don't encode machine ownership** — describe what happened, not who owns it.
+7. **Payloads carry data** — don't inline amounts/actors into the event type string.
+8. **Guards use boolean prefixes** — `Is`, `Has`, `Can`, `Should`; no other prefixes.
+9. **Business data keys are camelCase** — `totalAmount`, `transactionId` (not `total_amount`).
+10. **Config keys are snake_case** — `should_persist`, `after` (lowercase key, NOT `shouldPersist`).
+
+Full naming guide: `docs/building/conventions.md` (1100+ lines of rationale and examples).
+
+---
+
+## 2. Best Practices (13 distilled principles — read before designing)
+
+All 13 pages live under `docs/best-practices/`. Top-level summary:
+
+| # | Topic | Principle |
+|---|-------|-----------|
+| 1 | State Design | Model conditions, not steps — avoid state explosion |
+| 2 | Event Design | Events are past-tense facts, not commands |
+| 3 | Transition Design | Self-transition to restart; targetless to update context |
+| 4 | Guard Design | Guards MUST be pure — no I/O, no context mutation |
+| 5 | Action Design | Actions are idempotent side effects; never throw to block; keep external I/O in delegations for scenario interception |
+| 6 | Context Design | Lean context; flags that change transitions belong in states |
+| 7 | Event Bubbling | Leaf-first handler resolution — first match wins |
+| 8 | Machine Decomposition | Split on own lifecycle, reuse, complexity, or independent failure |
+| 9 | Machine System Design | Commands flow down (input); states flow up (@done) |
+| 10 | Time-Based Patterns | Timers are event sources; intervals ≥ 1 min; idempotent actions |
+| 11 | Parallel Patterns | Region independence, separate context keys per region |
+| 12 | Testing Strategy | Four layers: unit → integration → E2E → LocalQA |
+| 13 | Naming & Style | See Section 1 above |
+
+### Five most-violated principles (expanded)
+
+**Guard purity.** Guards must be pure functions: same context + event → same boolean. No `now()`, no HTTP, no DB writes, no context mutation. EventMachine enforces this at runtime via context snapshot/restore across multi-branch transitions. If you need a computed value, use a Calculator — it runs BEFORE guards.
+
+**Do**:
+```php
+public function __invoke(OrderContext $context): bool {
+    return $context->total >= $this->minimum;
+}
+```
+**Don't**:
+```php
+public function __invoke(OrderContext $context): bool {
+    $context->set('checkedAt', now());       // mutation
+    return Http::get('/valid')->successful(); // I/O
+}
+```
+
+**Actions never throw to block transitions.** Actions run AFTER guards approve the transition. Throwing in an action does NOT roll back the state change; it leaves the machine in an inconsistent state. Use guards to block; use actions for idempotent side effects (DB writes with idempotency keys, queued notifications, external APIs).
+
+**Don't** (action-as-flow-control — leaves machine in inconsistent state):
+```php
+class ApplyCounterOfferAction extends ActionBehavior {
+    public function __invoke(OrderContext $context, OrderEvent $event): void {
+        if ($context->retailerId !== $event->payload['retailerId']) {
+            throw new UnauthorizedRetailerException(); // ← anti-pattern
+        }
+        $context->set('counterOffer', $event->payload['amount']);
+    }
+}
+```
+**Do** (guard blocks before transition; action only writes):
+```php
+class IsRetailerAuthorizedGuard extends GuardBehavior {
+    public function __invoke(OrderContext $context, OrderEvent $event): bool {
+        return $context->retailerId === $event->payload['retailerId'];
+    }
+}
+// In transition config:
+'COUNTER_OFFER' => [
+    'target'  => 'awaiting_approval',
+    'guards'  => IsRetailerAuthorizedGuard::class,
+    'actions' => ApplyCounterOfferAction::class,
+],
+```
+
+**Scenario impact:** actions with lazy I/O fallbacks ("if not in context, call API") fire during scenario runs — scenarios only intercept delegations, not actions. Keep external I/O in job/machine delegations; see `docs/best-practices/action-design.md` → "Scenario-Friendly Design".
+
+**Events are past-tense facts, not commands.** `ORDER_SUBMITTED`, not `SUBMIT_ORDER`. An event represents a state change that already happened. This disambiguates cross-machine communication — you always know who produced what.
+
+**Parallel regions MUST have separate context keys.** Two regions writing `status` → last-writer-wins silently. Design each region to own its keys: `paymentStatus`, `shippingStatus`. Regions coordinate via `raise()` / `sendTo()`, never via shared context.
+
+**State explosion is the #1 design smell.** If you have 3 booleans (`isPriority`, `isFragile`, `isGift`) don't make 8 states — keep them in context and let the `processing` state read them. States are for different behaviors; context is for data.
+
+### Four-layer testing strategy
+
+- **Unit** — `State::forTesting()` + `runWithState()` — one behavior, no machine, no DB
+- **Integration** — `Machine::test()` / `Machine::startingAt()` — flow through state transitions
+- **E2E** — real DB, real queue (SQLite/sync) — persistence + restoration round-trips
+- **LocalQA** — real MySQL + Redis + Horizon — async queues, parallel dispatch, timers under load (`tests/LocalQA/`, excluded from `composer test`)
+
+### Anti-patterns (agents from other frameworks try these)
+
+1. **Don't call `$machine->send()` inside an action** — use `raise()` for internal events, or return context changes. `send()` is the external API; actions are inside the macrostep.
+2. **Don't put external API calls in actions** — use a job delegation state with `@done`/`@fail`. Actions with I/O are invisible to scenarios and lack retry/timeout policies.
+3. **Don't manually construct `MachineEvent` instances** — use `send()` / `raise()`. The engine manages event sourcing, context diffs, and persistence.
+4. **Don't use nested `send()` from inside a transition** — use `@continue` in scenarios, or `raise()` for event chains within a macrostep.
+5. **Don't put transition logic in actions** — use guards to decide IF a transition fires, actions for side effects AFTER it fires.
+6. **Don't share context keys across parallel regions** — last-writer-wins silently. Each region owns its keys.
+7. **Don't use a self-loop to reset a timer** — self-loops preserve `state_entered_at` by design. To express "deadline resets on event X", model X as a transition through a transit state. See [Renewable Timers](docs/best-practices/time-based-patterns.md#renewable-timers-sliding-windows).
+8. **Don't model a read/status poll as a targetless event** — use [`reads`](docs/laravel-integration/reads.md). Read-as-event runs the full `send()`/`persist()` pipeline and appends rows on every poll, bloating `machine_events` until the persist placeholder ceiling wedges the machine. A read is a query, not an event.
+9. **Don't rebuild machine regions with `TestMachine::define(config: [...])` to start a test deep** — use `MyMachine::startingAt('parent.region.state')`. Hand-copied region configs silently rot when the real machine changes.
+10. **Don't assert full dotted state paths via `$machine->state()->matches('a.b.c')` + `assertTrue`** — use `->assertState('leaf_or_dotted')`; it self-documents failures and feeds path coverage.
+11. **`simulateChildDone()` validates `finalState` against the child definition** — a renamed/typo'd child final state now fails the parent's test (intended, bug-revealing). Leaf name or dotted id accepted; routing always sees the leaf.
+---
+
+## 3. Core Concepts
+
+### Vocabulary
+
+| Concept | One-liner |
+|---------|-----------|
+| **State** | Distinct phase; machine is in exactly one state (or one per parallel region) |
+| **Transition** | Source → target movement triggered by an event |
+| **Event** | Past-tense fact that triggers transitions: `{type, payload}` |
+| **Guard** | Pure boolean condition — transition fires only if true |
+| **Action** | Side effect during transition (entry/transition/exit) |
+| **Calculator** | Compute derived values BEFORE guards |
+| **Output** | Final computation when machine reaches a final state (`type: final`) |
+| **Context** | Immutable data traveling with the machine — the "memory" |
+
+### Machine lifecycle
+
+1. **Boot** — `Machine::create()` loads definition, initializes context, NO entry actions yet.
+2. **Start** — First interaction enters initial state, fires entry actions + `{machine}.start` internal event.
+3. **Event** — `send()` triggers pipeline per transition:
+   `calculators → guards → exit actions (old state) → transition actions → entry actions (new state) → @always chains → raised events`
+4. **Persist** — Every transition becomes a row in `machine_events`. Restore from any point via `root_event_id`: `OrderMachine::create(state: $rootEventId)`.
+
+### Event bubbling
+
+When an event arrives, engine walks from current leaf state up the hierarchy until it finds a handler. First match wins. Use this for global handlers (root-level `CANCEL`) — don't over-rely on it.
+
+### Context
+
+Context is machine memory: application-specific data (orderId, totalAmount). **Not** business data (don't dump customer profiles in). Two flavors:
+
+- **Untyped**: `config: ['context' => ['totalAmount' => 0]]` — key-value array
+- **Typed**: `class OrderContext extends ContextManager` with typed properties and Spatie Data validation
+
+Context mutation happens via Actions/Calculators. Guards see the current context but must NOT mutate it. Context travels to child machines via `MachineInput`.
+
+### `@always` transitions
+
+Transient transitions evaluated automatically on state entry. Use for "if-then routing": enter `deciding` → `@always` picks `approved` vs `rejected` based on guards. Chains execute until a non-`@always` state is reached.
+
+---
+
+## 4. Quick-Start Snippets
+
+### Closure vs class — when to choose which
+
+EventMachine accepts behaviors as **inline closures** (registered in `behavior.actions/guards/calculators/outputs`) or **classes** (extending `ActionBehavior`/`GuardBehavior`/etc.). Pick based on the work the behavior does, not the agent default.
+
+| Choose **closure** when | Choose **class** when |
+|-------------------------|----------------------|
+| Trivial wire-up: 1-5 lines, only reads/writes context, no I/O | Reusable across multiple machines or transitions |
+| No constructor dependencies | Needs constructor DI (services, repos) |
+| Used in exactly one place | Independently unit-tested |
+| No need for descriptive class names | Behavior-name should be a first-class concept |
+
+```php
+// Closure — preferred for trivial wire-up
+'behavior' => [
+    'actions' => [
+        'wirePricingContextAction' => fn(OrderContext $ctx, ChildMachineDoneEvent $event) => [
+            'baseRate'     => $event->output('baseInterestRate'),
+            'installments' => $event->output('installmentOptions'),
+        ],
+    ],
+],
+
+// Class — when the behavior is reusable, DI'd, or independently tested
+class ChargePaymentAction extends ActionBehavior {
+    public function __construct(private readonly PaymentGateway $gateway) {}
+    public function __invoke(OrderContext $context): void {
+        $result = $this->gateway->charge($context->orderId);
+        $context->set('chargeId', $result->id);
+    }
+}
+```
+
+**Don't reach for a DTO + OutputBehavior subclass + Action class to wire a few keys child→parent.** A closure on the child's final state `'output'` plus an inline `'wireXxxAction'` registered in `behavior.actions` is usually all you need. Save classes for behaviors that earn the boilerplate (DI, reuse, named contracts).
+
+Inline behavior keys still follow naming conventions (Section 1): `{verb}{Obj}{Type}` — `wirePricingContextAction`, `isAmountValidGuard`, `orderTotalCalculator`. The type suffix is mandatory.
+
+### Minimal machine definition (untyped context)
+
+```php
+use Tarfinlabs\EventMachine\Actor\Machine;
+use Tarfinlabs\EventMachine\Definition\MachineDefinition;
+
+class OrderMachine extends Machine
+{
+    public static function definition(): MachineDefinition
+    {
+        return MachineDefinition::define(
+            config: [
+                'id'      => 'order',
+                'initial' => 'pending',
+                'context' => ['orderId' => null, 'total' => 0],
+                'states'  => [
+                    'pending'    => ['on' => ['SUBMIT' => 'processing']],
+                    'processing' => [
+                        'entry' => ReserveInventoryAction::class,
+                        'on'    => ['COMPLETE' => 'completed', 'FAIL' => 'failed'],
+                    ],
+                    'completed'  => ['type' => 'final'],
+                    'failed'     => ['type' => 'final'],
+                ],
+            ],
+        );
+    }
+}
+```
+
+### Class-based Action (with DI)
+
+```php
+use Tarfinlabs\EventMachine\Behavior\ActionBehavior;
+use Tarfinlabs\EventMachine\ContextManager;
+
+class ReserveInventoryAction extends ActionBehavior
+{
+    public function __construct(
+        private readonly InventoryService $inventory,
+    ) {}
+
+    public function __invoke(ContextManager $context): void
+    {
+        $reserved = $this->inventory->reserve($context->get('orderId'));
+        $context->set('reservationId', $reserved->id);
+    }
+}
+```
+
+### Class-based Guard (pure)
+
+```php
+use Tarfinlabs\EventMachine\Behavior\GuardBehavior;
+use Tarfinlabs\EventMachine\ContextManager;
+
+class IsPaymentValidGuard extends GuardBehavior
+{
+    public function __invoke(ContextManager $context, int $min = 0): bool
+    {
+        return (int) $context->get('total') >= $min;
+    }
+}
+```
+
+### TestMachine fluent assertions
+
+```php
+OrderMachine::test(['orderId' => 'ORD-1', 'total' => 100])
+    ->assertState('pending')
+    ->send('SUBMIT')
+    ->assertState('processing')
+    ->assertBehaviorRan(ReserveInventoryAction::class)
+    ->assertContext('reservationId', 'RES-123')
+    ->send('COMPLETE')
+    ->assertState('completed')
+    ->assertFinished();
+```
+
+### Typed context (ContextManager subclass)
+
+```php
+use Tarfinlabs\EventMachine\ContextManager;
+use Spatie\LaravelData\Attributes\Validation\{Email, Min};
+
+class OrderContext extends ContextManager
+{
+    public function __construct(
+        public ?string $orderId = null,
+        #[Min(0)] public int $total = 0,
+        #[Email]  public ?string $customerEmail = null,
+    ) { parent::__construct(); }
+}
+```
+
+---
+
+## 5. Testing API Cheat-Sheet
+
+### Entry points
+
+- `MyMachine::test($context = [])` — Boot + return `TestMachine` for fluent chain
+- `MyMachine::testIsolated($context = [])` — Preset: `test()` + `fakingAllActions()` (NOTE: `fakingAllActions(except:)` afterwards throws `LogicException` — use the long form for `except:`)
+- `MyMachine::startingAt('nested.state')` — Skip setup, jump to a specific state. Skips the target's entry actions/job dispatch, but DRAINS `@always` transitions (region leaves inside parallel states included — siblings stay put) — the machine stabilizes like a real start, so auto-routing states are directly testable: `startingAt('deciding', context: [...])->assertState('rejected')`. Park at a transient state by pinning its guards: `guards: [IsEligibleGuard::class => false]`. Parallel states: all regions activate at their initial leaves; a leaf inside one region auto-initializes sibling regions (test parallel gating on the REAL definition — no region mirrors)
+- `MyMachine::assertTransitions([['from' => ..., 'event' => ..., 'to' => ...], ...])` — Table-driven edge coverage; fresh machine per row; `'to' => null, 'guarded' => true` for blocked edges
+- `YourContext::forTesting(['order' => $order])` — Build a typed context: auto-fills `Optional` properties, sets machine identity (`test-machine-id`); overrides win. Primary tool for typed-context construction.
+  - Needs app model factories on top? Layer them in a per-machine base TestCase `context()` factory — see `docs/testing/recipes.md` § "Base TestCase for Rich Typed Contexts". Never let `makeContext`/`buildContext` copies drift per file.
+- `State::forTesting($context)` — Build a state for unit-testing a single behavior
+- `MyBehavior::runWithState($state, $event)` — Invoke a behavior directly; unit-level. First arg accepts `State`, `ContextManager`, or a plain array (auto-wrapped)
+
+### Top assertions (expand via `docs/testing/overview.md`)
+
+- `assertState($stateName)` — Current state value matches
+- `assertInState($stateName)` — Like `assertState` but works across parallel regions
+- `assertContext($key, $value)` — Context key matches
+- `assertBehaviorRan(Class::class)` — Action/Calculator/Guard executed; also accepts an array of mixed FQCNs/inline keys
+- `assertGuarded($event)` — Transition blocked by a guard
+- `assertGuardedBy($event, GuardClass::class)` — Specific guard blocked it
+- `assertHasTimer($eventType)` — Timer registered for event
+- `assertFinished()` — Machine reached a final state
+- `assertRaised(ActionClass::class)` — Action raised an internal event (use `ActionClass::assertRaised()` for isolated). Returns a fluent object: `->withPayload(['key' => $v])->withoutPayloadKey('old')->validated()` (dot-notation keys, strict `===`)
+- `advanceTimers(Timer::days(7))` — Simulate time; fires due timers
+
+### Fakes
+
+- `faking([MyAction::class, MyGuard::class])` — Replace behaviors with inspectable spies
+- `spying([A::class, B::class])` — Batch-spy classes fluently (post-init: does NOT observe boot-time entry actions — use the pre-init `faking:` parameter for those)
+- `MyChildMachine::fake(output: new OrderOutput(...), finalState: 'completed')` — Stub child delegation
+- `MyChildMachine::assertInvoked()` / `assertInvokedWith([...])` — Verify child was called
+- `simulateChildDone/Fail/Timeout()` — Drive parent through delegation paths without running child. `finalState` is now validated against the child's FINAL states (leaf or dotted id accepted; the done event always carries the leaf)
+- `InteractsWithMachines` trait on TestCase — Auto-resets all fakes between tests
+- `CommunicationRecorder` — Inspect `sendTo()` / `raise()` calls without side effects
+
+### Four test layers (pick one per concern)
+
+```php
+// 1. Unit — one behavior, no machine
+$state = State::forTesting(['total' => 50]);
+expect(IsPaymentValidGuard::runWithState($state))->toBeFalse();
+
+// 2. Integration — full flow in memory
+OrderMachine::test(['total' => 100])->send('SUBMIT')->assertState('processing');
+
+// 3. E2E — real persistence + restore
+$m = OrderMachine::create();
+$m->send('SUBMIT');
+$restored = OrderMachine::create(state: $m->state->history->first()->root_event_id);
+expect($restored->state->matches('processing'))->toBeTrue();
+
+// 4. LocalQA — real MySQL + Redis + Horizon (tests/LocalQA/, excluded from composer test)
+```
+
+Test stubs live under `tests/Stubs/` — excellent reference for real patterns.
+
+---
+
+## 6. Laravel Integration
+
+### Attach to Eloquent models
+
+```php
+use Tarfinlabs\EventMachine\Traits\HasMachines;
+use Tarfinlabs\EventMachine\Casts\MachineCast;
+
+class Order extends Model
+{
+    use HasMachines;
+    protected $casts = [
+        'state_mre' => MachineCast::class . ':' . OrderMachine::class,
+    ];
+}
+
+$order->state_mre->send(['type' => 'SUBMIT']);
+```
+
+### HTTP endpoints (zero controllers)
+
+```php
+MachineDefinition::define(
+    config: [...],
+    endpoints: [
+        'SUBMIT',                                  // POST /submit
+        'APPROVE' => ['method' => 'PATCH', 'middleware' => ['auth:admin']],
+        'CANCEL'  => ['action' => CancelEndpointAction::class],
+    ],
+);
+
+// routes/console.php or web.php:
+MachineRouter::register(OrderMachine::class, [
+    'prefix' => 'orders', 'model' => Order::class,
+    'attribute' => 'order_mre', 'create' => true,
+    'modelFor' => ['SUBMIT', 'APPROVE', 'CANCEL'],
+]);
+```
+
+### Reads (read-only projections)
+
+`endpoints` are **commands** (send events, write history). `reads` are **queries** —
+zero-write, GET-only projections of a machine's current state. A read restores the machine and
+returns the standard envelope; it never constructs an event, never calls `send()`/`persist()`,
+never locks, never writes a row (for active machines — reading an *archived* machine triggers
+the transparent restore, which writes). **A read is NOT an event** — never model a status poll or
+"resume" fetch as a targetless event (that bloats `machine_events` and can wedge the machine).
+
+```php
+MachineRouter::register(OrderMachine::class, [
+    'prefix' => 'orders',
+    'reads'  => [
+        'status' => null,                               // GET orders/{machineId}/status
+        'resume' => ['output' => ResumeOutput::class],  // GET orders/{machineId}/resume (shaped)
+    ],
+]);
+```
+
+- Forms: `reads => true` (single default `status`) | associative map (key = URI suffix).
+- Always machineId-bound: `GET {prefix}/{machineId}/{uri}`.
+- Options: `uri`, `output`, `middleware`, `status`, `available_events` (`action`/`method`/unknown keys throw).
+- `output` shapes the response exactly like an endpoint's `output` (context-key list, OutputBehavior, or `null` fallback).
+
+Full reference: `docs/laravel-integration/reads.md`.
+
+### Artisan commands
+
+| Command | Purpose | When to use |
+|---------|---------|-------------|
+| `machine:validate` | Validate machine config | After editing machine definition — catches config errors before runtime |
+| `machine:paths` | Enumerate all paths (static analysis) | After writing a scenario — confirm override states are on reachable paths |
+| `machine:scenario-validate` | Validate scenario structure | After every scenario file change — catches source/event/target mismatches |
+| `machine:scenario` | Scaffold a new scenario | Starting a new scenario — generates plan from BFS path analysis |
+| `machine:coverage` | Path coverage report | Before adding transitions — verify no dead paths created |
+| `machine:xstate` | Export to XState v5 JSON (Stately Studio) | For team discussion — visualize state topology |
+| `machine:process-timers` | Sweep due `after`/`every` timers | Auto-registered — runs on schedule |
+| `machine:process-scheduled` | Fire scheduled events | Auto-registered — runs on schedule |
+| `machine:timer-status` | Show timer state per instance | Debugging timer issues — check fire counts and next-fire times |
+| `machine:archive-events` | Archive old events (`--dry-run`, `--sync`) | Maintenance — reduce `machine_events` table size |
+| `machine:archive-status` | Archive stats; `--restore=<rootEventId>` | After archiving — verify or restore specific machines |
+
+### Querying machines
+
+```php
+OrderMachine::query()
+    ->inState('awaiting_payment')
+    ->active()
+    ->enteredBefore(now()->subDays(7))
+    ->paginate(20);
+```
+
+---
+
+## 7. Delegation & Parallel States — Critical Gotchas
+
+### Sync vs async delegation — config matrix
+
+**The default is sync.** Most users assume async because existing examples include `'queue' =>`. Omit `queue` to run sync.
+
+| Config | Mode | When |
+|---|---|---|
+| `'machine' => X::class` | **sync** (in-process) | sync arithmetic, validation, transformation, fast lookups (<1s) |
+| `'machine' => X::class, 'queue' => 'name'` | **async** (queue dispatch) | external API, polling, retry, multi-step async (seconds-minutes) |
+| `'machine' => X::class, 'queue' => 'name'` + no `@done` | **fire-and-forget** | parent doesn't care about result; child runs independently |
+| `'machine' => X::class` + child uses `ShouldQueue` | **mixed (anti-pattern)** | ambiguous — avoid |
+
+```php
+'processing_payment' => [
+    'machine' => PaymentMachine::class,
+    'input'   => PaymentInput::class,   // typed & validated
+    'queue'   => 'payments',            // async (omit for sync)
+    '@done'    => ['target' => 'shipping',       'actions' => CapturePaymentAction::class],
+    '@fail'    => ['target' => 'payment_failed', 'actions' => HandleFailureAction::class],
+    '@timeout' => ['after' => 300, 'target' => 'payment_timed_out'],
+],
+```
+
+- **Sync** (no `queue`): parent blocks in-process until child hits final
+- **Async** (`queue: true`): parent transitions to delegation state, child runs on worker, `@done` fires on completion
+- **Fire-and-forget**: `queue` key present + NO `@done` — parent continues immediately, child runs independently
+
+::: tip Sync child machines
+Sync child machines that need to do work immediately must have `@always` transitions on their `idle`/`initial` state — `start()` enters the initial state but does NOT fire any event. See `docs/best-practices/sync-child-machines.md` for the canonical bootstrap pattern.
+:::
+
+### `@done` / `@fail` / `@timeout`
+
+- `@done` — child reached ANY final state (`type: final`)
+- `@done.{stateName}` — child reached specific final state (e.g., `@done.approved`)
+- `@fail` — child reached a failure state OR threw (requires `@fail` target)
+- `@timeout` — async child didn't complete within `after: N` seconds
+
+Actions on `@done` / `@fail` can type-hint `MachineOutput` / `MachineFailure` for typed injection from child's output.
+
+### Parallel regions
+
+```php
+'processing' => [
+    'type'   => 'parallel',
+    '@done'  => 'fulfilled',             // fires when ALL regions hit final
+    '@fail'  => 'failed',                // fires when ANY region fails
+    'states' => [
+        'payment'  => ['initial' => 'pending', 'states' => [...]],
+        'shipping' => ['initial' => 'preparing', 'states' => [...]],
+    ],
+],
+```
+
+Enable dispatch mode via `config/machine.php` → `parallel_dispatch.enabled => true`:
+- Each region's entry work runs as a separate `ParallelRegionJob`
+- True concurrency — two 5s + 2s regions finish in 5s (not 7s)
+- Last-writer-wins on context — **separate keys per region is mandatory**
+
+### `output` keyword — three semantics, one keyword
+
+The `'output'` key has **three different meanings** depending on where it appears. Confusing them is the #1 source of `InvalidOutputDefinitionException` errors.
+
+| Where it lives | What it does | Parallel-region restricted? |
+|----------------|--------------|----------------------------|
+| **(1) On a final state of THIS machine** | Defines what `$machine->output()` returns. Restricted on transient states (`@always`) and parallel region states. | ✓ Yes — only the parent parallel state itself can define output |
+| **(2) On a state with `'machine' =>`** (child machine invocation) | Filters / transforms the **child's** final context before injecting into `ChildMachineDoneEvent.output`. Operates on the child machine, not the parent state. | ✗ No — works fine inside parallel regions because it's about the child |
+| **(3) On an endpoint config** | Shapes the HTTP response (any state, not just final). | ✗ No |
+
+**Decision tree:**
+```
+Is this state a final state in MY machine?
+├── Yes → meaning (1). Defines what $machine->output() returns.
+│         Inside parallel region? → only the PARENT parallel state can define output.
+│         Use array filter for simple key picking, OutputBehavior class for computation.
+│
+Does this state have 'machine' => Child::class?
+├── Yes → meaning (2). Defines what the CHILD exposes to the parent.
+│         No parallel restriction. Lives on the parent state but operates on child context.
+│         Format: array filter | closure | OutputBehavior class | MachineOutput DTO.
+│
+Is this an endpoint config?
+└── Yes → meaning (3). Shapes HTTP response. Any state.
+```
+
+**Common mistake:** Adding `'output' => [...]` to a delegation state inside a parallel region, expecting child→parent context merge — but the parser sees it as meaning (1) and throws `InvalidOutputDefinitionException::parallelRegionState`. **Fix:** the child machine itself should declare `output` on its final state (meaning 2 from the child's perspective), and the parent state's `@done` action picks it up via typed `MachineOutput` injection or `ChildMachineDoneEvent::output()`.
+
+**Format choice (meanings 1, 2, and 3):**
+- Plain `['key1', 'key2']` array → context key filter (passes through `toResponseArray()` — note that ModelTransformer serializes Eloquent models to IDs).
+- Closure → custom shape, full control over types.
+- `OutputBehavior::class` → computed output with DI; can return array or `MachineOutput` instance.
+- `MachineOutput::class` → typed DTO with named properties auto-resolved from context.
+
+Full reference: `docs/behaviors/outputs.md`. Cheat-sheet: `references/output-keyword.md`.
+
+### Top 10 gotchas (delegation & parallel)
+
+1. **Guards must be pure** — enforced at runtime via context snapshot/restore across branches.
+2. **`dispatchToParent` is transient** — fire-and-forget job; parent may have already transitioned away → event silently dropped.
+3. **Region context keys must be disjoint** — `paymentStatus` + `shippingStatus`, never shared `status`.
+4. **Cross-region transitions rejected at define-time** — use `raise()` / `sendTo()` for coordination.
+5. **Invoke is deferred until after macrostep; dispatch until after persist** — entry actions + raised events process first; if they cause transition, invoke is skipped (SCXML invoker-05). Child/listener jobs are dispatched by `Machine::persist()`, never mid-transition — so `QUEUE_CONNECTION=sync` runs full delegation chains inline and correctly (no queue worker needed for e2e tests).
+6. **`MachineCurrentState` may lag under parallel dispatch** — assert via restored machine (`Machine::create(state: $rootEventId)`), not by reading the table.
+7. **Async forward-endpoint responses don't contain child state** — wait for child, then restore to verify.
+8. **`ValidationGuardBehavior` aborts the whole transition** (422 via endpoints). Plain `GuardBehavior` failure = graceful.
+9. **Job actors (`job` key) skip dispatch in test mode** — use `simulateChildDone()` to step.
+10. **Partial parallel failure: Region A context may be lost** (documented last-writer-wins) — don't assert on surviving region A's context changes when region B failed.
+
+### Scenario gotchas (read before writing any scenario)
+
+1. **Simulated `@fail` does NOT inject typed `MachineFailure`** — the engine synthesizes a generic `ChildMachineFailEvent`. If your `@fail` action type-hints a `MachineFailure` subclass → `TypeError`. Workaround: override the action with a context-write proxy (`StoreFailureAction::class => ['failureReason' => '...']`).
+2. **Overrides are not reachable if guards route around them** — scenarios override behaviors, not path selection. If cache/retry/mode guards take a different branch, the overridden state is never entered. Fix: override branch-controlling guards in the same plan entry.
+3. **Transition actions with I/O fallbacks run during scenarios** — scenarios intercept delegations (job/machine), NOT actions. Entry, exit, and transition actions execute with real side effects unless overridden. An action with a lazy "fallback to API" branch will hit production.
+4. **Missing `continuation()` = real dispatches after target** — if your scenario's target state has event handlers leading to delegations (retry buttons, resend actions), those delegations fire for real without continuation. This applies to both normal and forwarded endpoints. Red flags: target is an error/failed state with retry, or awaiting state with resend.
+5. **Verify interception via `machine_events` timestamps** — after running a scenario, query `child.*.start` / `child.*.done` for the `root_event_id`. Same-second = scenario intercepted. A gap = real delegation fired (silent bug).
+6. **Parallel `@continue` lives on leaf states, never on the parallel parent** — the route matcher is suffix-based, and a parallel parent path is always a *prefix* of active child routes. Declaring `@continue` on the parent silently does nothing in 9.10.0 and earlier; 9.10.1+ rejects it at `machine:scenario-validate` time. To fire the parent's transition event (typically a guarded "all regions ready" event), put its `@continue` on a leaf state inside one of the regions — usually the *final* state of one region. The player walks regions in round-robin order, so the other regions advance through their own `@continue`s first. See `docs/advanced/scenario-plan.md` → "Parallel @continue" for the worked pattern.
+7. **Choose inline outcome vs child scenario class deliberately for delegation states** — for `'machine:'` (and `'job:'`) states the plan can either declare an inline outcome (`['outcome' => '@done.X', 'output' => [...]]` — child never runs, fastest, no DB rows) or a child scenario class (`AtSomeStateScenario::class` — child runs with overrides, may pause). Pick the inline form when the child's logic is a black box for this scenario; pick the class form when the child's @always chain / guards / parallel regions are part of what you want to verify. **For `'queue:'` (async) parents the child scenario class form requires 9.10.3+** — earlier versions silently dropped the scenario at dispatch time and the worker booted the child with full I/O.
+
+Full details: `docs/advanced/scenario-plan.md` → "Pitfalls" section.
+
+### Error glossary (common errors → quick fix)
+
+| Error | Likely cause | Fix |
+|-------|-------------|-----|
+| `TypeError: Argument must be of type <MachineFailure>, null given` | Scenario `@fail` doesn't inject typed failure | Override the action with context-write proxy |
+| `ScenarioFailedException: Event mismatch` | Scenario slug attached to wrong endpoint | Check scenario's `$event` matches endpoint's registered event type |
+| `ScenarioFailedException: Source mismatch` | Machine not in expected source state | Check `$source` property vs current machine state |
+| `NoScenarioPathFoundException` | BFS can't reach target from source | Run `machine:paths` to find actual paths; add guard overrides for branching |
+| `ScenarioTargetMismatchException` | Machine didn't reach `$target` after execution | Check plan overrides force the intended path; override branch guards |
+| `MissingMachineContextException` | Required context key missing | Read the enriched hint in the error; add key via `$requiredContext` or input closure |
+| `MachineAlreadyRunningException` | Concurrent HTTP request to same machine | Normal under load — endpoints return 423 (POST) or 200 (GET) |
+| `MachineValidationException` (422) | `ValidationGuardBehavior` failed | Check validation rules; this is a user-input error, not a bug |
+| `MaxTransitionDepthExceededException` | Infinite `@always` or `raise()` chain | Check for circular guard logic; increase depth limit if legitimate |
+
+Full exception reference: `docs/reference/exceptions.md`
+
+### Action vs Listener — behavior vs observer
+
+This is the conceptual split that makes `@queue` work on listeners and structurally impossible on actions. Get it wrong and you'll keep wanting to invent a `'jobs'` slot or queue an entry action — neither one exists.
+
+| | Action | Listener |
+|---|---|---|
+| Role | **Behavior** — part of the transition | **Observer** — runs after the transition is committed |
+| Mutates context | Yes, that's the point | Allowed, but lossy when queued (last-writer-wins) |
+| Sequence-sensitive | Yes — later actions read earlier writes | No — each listener is independent |
+| Failure | Throws can abort the transition | Throws don't undo it; failed jobs land in `failed_jobs` |
+| Async-safe | **No** | **Yes** |
+
+Why a queued action is structurally unsafe: the worker would race with later inline actions on the same context, restore the *current* persisted state (not the dispatch-time state — possibly several transitions later), and any throw on the worker could not undo a transition already recorded. Listeners avoid all three because they observe a *committed* transition.
+
+### `@queue` works only in `listen` config
+
+`@queue` is a framework-reserved key inside listener tuples — `listen.entry`, `listen.exit`, `listen.transition`. Anywhere else (state `entry`/`exit` actions, transition `actions`, `guards`, `calculators`, output tuples) it throws `InvalidBehaviorDefinitionException` at definition time. Before 9.11.0 it was *silently dropped*, which made it look like the action was queued when it actually ran inline.
+
+| Where you see `@queue` | What it does |
+|---|---|
+| `listen.entry`/`exit`/`transition` tuple | ✓ Dispatches a `ListenerJob` to run on a worker |
+| State `entry` / `exit` action tuple | ✗ `InvalidBehaviorDefinitionException` |
+| Transition `actions` / `guards` / `calculators` tuple | ✗ `InvalidBehaviorDefinitionException` |
+| Output / endpoint output tuple | ✗ `InvalidBehaviorDefinitionException` |
+
+**Async work in entry actions — pick by what the machine has to do with the result:**
+
+| Option | When to use | Cost |
+|---|---|---|
+| **Job actor** (state's `job` key) | Outcome routes the next state via `@done` / `@fail`. | Needs its own state — the framework has to wait for the result. |
+| **Queued listener** (`listen.entry` + `@queue`) | Work runs after entry but doesn't drive a transition. Worker can write back to context. | One layer of indirection (ListenerJob → restore → run). Last-writer-wins on context. |
+| **Wrapper Action** (regular action that calls `dispatch()`) | Pure fire-and-forget — no machine state depends on the result. | One thin class. Cheapest and most common option. |
+
+::: tip Wrapper Action recipe — fire-and-forget without a separate state
+A user asking "can't I just put `MyJob::class` in `entry`?" wants this:
+
+```php
+final class DispatchPromissoryNoteAction extends ActionBehavior
+{
+    public function __invoke(ContextManager $context): void
+    {
+        dispatch(new CreateInstallmentPromissoryNoteJob(applicationId: $context->applicationId));
+    }
+}
+
+'approved' => [
+    'entry' => [..., DispatchPromissoryNoteAction::class, ...],
+],
+```
+
+Don't propose a new `'jobs'` slot — wrapper Actions express fire-and-forget more clearly, stay inside existing fake infrastructure (`Machine::fakingAllActions`, `Bus::fake()`), and don't blur the Action↔Listener semantic split.
+:::
+
+Full reference: `docs/building/defining-states.md` → "Listeners" (semantic split) and "Async Work in Entry Actions" (recipes).
+---
+
+## 8. Documentation Navigation
+
+This skill ships with the **complete VitePress documentation** at `docs/` (materialized at release time, symlinked during development). The sections above are a starting point — `docs/` is always the authoritative source.
+
+### Task-oriented guide (start here)
+
+| Task | Primary reads | Secondary reads | Key gotchas |
+|------|--------------|-----------------|-------------|
+| Write a new scenario | `scenarios.md`, `scenario-plan.md` | `testing/recipes.md` | Simulated @fail typed injection, path divergence, I/O actions |
+| Debug scenario not firing | `scenario-runtime.md` (Debugging) | `machine:paths` + `machine_events` query | See "Verifying scenario interception" |
+| Design new state topology | `best-practices/state-design.md`, `defining-states.md` | `hierarchical-states.md`, `parallel-states/index.md` | State explosion, transient naming |
+| Add delegation (machine/job) | `machine-delegation.md`, `async-delegation.md` | `job-actors.md`, `testing/delegation-testing.md` | @fail typed failure, region isolation |
+| Add parallel states | `parallel-states/index.md`, `parallel-patterns.md` | `parallel-states/parallel-dispatch.md` | Disjoint context keys, dispatch mode |
+| Write tests for existing machine | `testing/overview.md`, `testing/test-machine.md` | `constructor-di.md`, `fakeable-behaviors.md` | Faking at right layer |
+| Wire HTTP endpoints | `laravel-integration/endpoints.md` | `scenario-endpoints.md` | MachineAlreadyRunning handling |
+| Debug transition issues | `reference/execution-model.md` | `testing/troubleshooting.md` | Macrostep ordering, event bubbling |
+
+All paths relative to `docs/advanced/` unless otherwise specified.
+
+### File-by-file reference
+
+| Topic | File |
+|-------|------|
+| **Naming & style** (deep dive) | `docs/building/conventions.md` |
+| **Best practices** (13 pages) | `docs/best-practices/*.md` |
+| **First machine walkthrough** | `docs/getting-started/your-first-machine.md` |
+| **When NOT to use EventMachine** | `docs/getting-started/when-not-to-use.md` |
+| **Upgrading** | `docs/getting-started/upgrading.md` |
+| **States & transitions depth** | `docs/understanding/states-and-transitions.md` |
+| **Events depth** | `docs/understanding/events.md` |
+| **Context depth** | `docs/understanding/context.md` |
+| **Machine lifecycle** | `docs/understanding/machine-lifecycle.md` |
+| **Defining states** | `docs/building/defining-states.md` |
+| **Writing transitions** | `docs/building/writing-transitions.md` |
+| **Handling events** | `docs/building/handling-events.md` |
+| **Working with context** | `docs/building/working-with-context.md` |
+| **Machine configuration** | `docs/building/configuration.md` |
+| **Actions** | `docs/behaviors/actions.md` |
+| **Guards** | `docs/behaviors/guards.md` |
+| **Validation guards** | `docs/behaviors/validation-guards.md` |
+| **Calculators** | `docs/behaviors/calculators.md` |
+| **Events (as behaviors)** | `docs/behaviors/events.md` |
+| **Outputs** | `docs/behaviors/outputs.md` |
+| **Machine delegation** | `docs/advanced/machine-delegation.md` |
+| **Delegation patterns** | `docs/advanced/delegation-patterns.md` |
+| **Delegation data flow** | `docs/advanced/delegation-data-flow.md` |
+| **Async delegation** | `docs/advanced/async-delegation.md` |
+| **Job actors** | `docs/advanced/job-actors.md` |
+| **Parallel states overview** | `docs/advanced/parallel-states/index.md` |
+| **Parallel event handling** | `docs/advanced/parallel-states/event-handling.md` |
+| **Parallel dispatch** | `docs/advanced/parallel-states/parallel-dispatch.md` |
+| **Parallel persistence** | `docs/advanced/parallel-states/persistence.md` |
+| **Hierarchical states** | `docs/advanced/hierarchical-states.md` |
+| **Entry / exit actions** | `docs/advanced/entry-exit-actions.md` |
+| **Always transitions** | `docs/advanced/always-transitions.md` |
+| **Raised events** | `docs/advanced/raised-events.md` |
+| **`sendTo` / cross-machine** | `docs/advanced/sendto.md` |
+| **Time-based events** | `docs/advanced/time-based-events.md` |
+| **Scheduled events** | `docs/advanced/scheduled-events.md` |
+| **Typed contracts** | `docs/advanced/typed-contracts.md` |
+| **Dependency injection** | `docs/advanced/dependency-injection.md` |
+| **Custom context (typed)** | `docs/advanced/custom-context.md` |
+| **Scenarios overview** | `docs/advanced/scenarios.md` |
+| **Scenario commands** | `docs/advanced/scenario-commands.md` |
+| **Scenario behaviors** | `docs/advanced/scenario-behaviors.md` |
+| **Scenario runtime + debugging** | `docs/advanced/scenario-runtime.md` — includes 4-tier validation framework and `machine_events` interception verification |
+| **Scenario endpoints** | `docs/advanced/scenario-endpoints.md` |
+| **Scenario plan + pitfalls** | `docs/advanced/scenario-plan.md` — **read "Pitfalls" section before writing any scenario** |
+| **Laravel integration** | `docs/laravel-integration/overview.md` |
+| **Eloquent integration** | `docs/laravel-integration/eloquent-integration.md` |
+| **Persistence** | `docs/laravel-integration/persistence.md` |
+| **HTTP endpoints** | `docs/laravel-integration/endpoints.md` |
+| **Reads (read-only projections)** | `docs/laravel-integration/reads.md` |
+| **Available events (framework)** | `docs/laravel-integration/available-events.md` |
+| **Archival** | `docs/laravel-integration/archival.md` |
+| **Compression** | `docs/laravel-integration/compression.md` |
+| **Artisan commands** | `docs/laravel-integration/artisan-commands.md` |
+| **Testing overview** | `docs/testing/overview.md` |
+| **TestMachine API** | `docs/testing/test-machine.md` |
+| **Isolated (unit) tests** | `docs/testing/isolated-testing.md` |
+| **Transitions & paths** | `docs/testing/transitions-and-paths.md` |
+| **Fakeable behaviors** | `docs/testing/fakeable-behaviors.md` |
+| **Constructor DI in tests** | `docs/testing/constructor-di.md` |
+| **Delegation testing** | `docs/testing/delegation-testing.md` |
+| **Parallel testing** | `docs/testing/parallel-testing.md` |
+| **Time-based testing** | `docs/testing/time-based-testing.md` |
+| **Scheduled testing** | `docs/testing/scheduled-testing.md` |
+| **Persistence testing** | `docs/testing/persistence-testing.md` |
+| **Recipes** | `docs/testing/recipes.md` |
+| **LocalQA setup** | `docs/testing/localqa.md` |
+| **Testing troubleshooting** | `docs/testing/troubleshooting.md` |
+| **Execution model (internals)** | `docs/reference/execution-model.md` |
+| **Exceptions** | `docs/reference/exceptions.md` |
+
+### Agent cheat-sheets (`references/`)
+
+`docs/` is canonical documentation — read for understanding. `references/` contains **distilled agent-facing cheat-sheets** — read for quick pattern lookup when writing code. When in doubt, start with `references/INDEX.md`.
+
+| File | Use when | Docs equivalent (longer) |
+|------|----------|--------------------------|
+| `references/INDEX.md` | Routing to the right cheat-sheet or doc by task type | Section 8 tables above |
+| `references/anti-patterns.md` | About to write a known anti-pattern (action throws, guard I/O, shared parallel context, output boilerplate) — quick lookup of the alternative | `docs/best-practices/*.md` |
+| `references/output-keyword.md` | Confused by `InvalidOutputDefinitionException` or unsure which of the three `'output'` semantics applies | `docs/behaviors/outputs.md` + `docs/advanced/delegation-data-flow.md` |
+| `references/sync-vs-async-delegation.md` | Adding `'machine' =>` and unsure if it runs sync or async, or bootstrapping a sync child with `@always` on `idle` | `docs/advanced/machine-delegation.md` + `docs/best-practices/sync-child-machines.md` |
+| `references/testing.md` | Writing assertions, setting up fakes | `docs/testing/overview.md` + `test-machine.md` |
+| `references/delegation.md` | Adding sync/async delegation, @done/@fail/@timeout | `docs/advanced/machine-delegation.md` |
+| `references/parallel.md` | Designing parallel regions, dispatch config | `docs/advanced/parallel-states/index.md` |
+| `references/qa-setup.md` | Setting up LocalQA test environment | `docs/testing/localqa.md` |
+| `references/timers.md` | Designing timers, renewable-timer pattern, sliding windows | `docs/best-practices/time-based-patterns.md` + `docs/advanced/time-based-events.md` |
+| `references/scenarios.md` | Writing or debugging `MachineScenario` plans, choosing inline outcome vs child scenario class, async propagation in 9.10.3+ | `docs/advanced/scenarios.md` + `scenario-plan.md` + `scenario-runtime.md` |
+
+---
+
+## 9. Agent Workflow Checklist
+
+### Building / modifying a machine
+
+When a user asks you to build/modify an EventMachine workflow:
+
+1. **Read docs for your task type** — use the trigger table in Section 0 or the task-oriented guide in Section 8. Skip only for mechanical changes (rename, typo).
+2. **Follow naming conventions** (Section 1) — especially event types, states, and context keys.
+3. **Validate design against best-practices** (Section 2) — purity, past-tense events, region separation.
+4. **Pick closure or class by the work** — closure for trivial wire-up (1-5 lines, no DI, single use); class for reusable, DI'd, or independently tested behavior. See §4 for the decision matrix.
+5. **Write tests at the right layer** — unit for behaviors, integration for flows, E2E for persistence.
+6. **Run the quality gate** — `composer quality` (pint + rector + test). Never just `vendor/bin/pest`.
+7. **Use typed contracts** — `MachineInput`, `MachineOutput`, `MachineFailure` for delegation boundaries.
+8. **Never commit without explicit approval** — especially for tags/releases (no `v` prefix).
+
+### Writing a scenario
+
+When a user asks you to write or debug a scenario:
+
+1. **Read `docs/advanced/scenarios.md` + `docs/advanced/scenario-plan.md`** — especially the "Pitfalls" section.
+2. **Scaffold with `machine:scenario`** — accept the scaffolder's BFS path choices as a starting point.
+3. **Run `machine:paths <Machine>`** — confirm every override state in your plan appears on a reachable path from source to target.
+4. **Override branch-controlling guards** — if the path to your overridden state depends on cache/mode/retry guards, override them to force the intended branch.
+5. **Override actions with typed `MachineFailure` params** — if your scenario uses `@fail` and the `@fail` action type-hints a `MachineFailure` subclass, override the action with a context-write proxy.
+6. **Add `continuation()`** — if the target state has event handlers that lead to delegations (retry, resend, next-step), continuation is mandatory or those delegations fire for real.
+7. **Validate with `machine:scenario-validate`** — catches structural errors (source/event/target mismatch, unreachable paths).
+8. **Unit test with `ScenarioPlayer::execute()`** — catches typed injection failures and unexpected action side-effects before HTTP-level testing.
+9. **Verify interception via `machine_events`** — in integration tests, assert `child.*.start` / `child.*.done` are same-second (proves scenario intercepted, no real dispatch).

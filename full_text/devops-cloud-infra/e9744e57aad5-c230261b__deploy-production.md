@@ -1,0 +1,547 @@
+---
+name: deploy-production
+description: Production deployment guide for Renfield. Build box .159, Harbor registry, private k8s cluster. Triggers on "deploy", "Deployment", "production", "Produktion", "satellite deploy", "kubectl apply", "rsync", "registry.treehouse".
+disable-model-invocation: true
+---
+
+# Production Deployment
+
+## CRITICAL SAFETY
+
+- **Pi Zero 2 W SD cards are EXTREMELY fragile** — SIGKILL during restart can brick the device. Always ask before restarting satellite services. See `references/satellite-deploy.md`.
+- **Never force-push to main** and never bypass branch protection; main merges go through a PR (see `git-workflow` skill).
+- **CI is intentionally non-functional for this project** — run tests on the .159 build box, not in CI.
+- **ConfigMap-provided files are NOT in the image.** `mcp_servers.yaml`, `agent_roles.yaml`, `kg_scopes.yaml`, `mail_accounts.yaml` live only in the `renfield-mcp-config` ConfigMap. If the build-box working copy ever grows these as untracked files or directories at `src/backend/config/*`, the resulting image breaks the pod's subPath mount with `not a directory`. Keep `src/backend/.dockerignore` carving these paths out, and clean them on .159 if you see root-owned leftovers from kubelet bind-mount artefacts.
+- **`voice-server` is a separate image and a GPU deploy.** Changes under `voice-server/` need their own image build (see "Voice-server image" below) — the backend/frontend steps do NOT cover it. It runs on a GPU node; a NVIDIA driver/library mismatch there CrashLoops new pods. See that section.
+- **Config source of truth = git, NOT `kubectl patch`.** The `renfield-env` ConfigMap is defined in `k8s/configmap.yaml` (public). Sensitive per-instance values (mailbox JSON, weather location, twin endpoints/bindings) live in the **`renfield-env-private` Secret**, consumed via `envFrom: secretRef` on backend/document-worker/meeting-worker — real values gitignored (`k8s/renfield-env-private.secret.yaml`), only the redacted `.example.yaml` committed. **To flip a feature flag: edit `k8s/configmap.yaml`, commit, `kubectl apply -f k8s/configmap.yaml` (three-way merge adds/updates keys; patch-added keys survive), then `rollout restart` backend + workers.** Do NOT `kubectl patch` the live ConfigMap as the source of truth — that is how 42 flags silently drifted out of git (reconciled 2026-07-17). A drift audit: `diff <(kubectl -n renfield get cm renfield-env -o json | jq -r '.data|keys[]'|sort) <(grep -oE '^  [A-Z_0-9]+:' k8s/configmap.yaml|tr -d ' :'|sort)`.
+
+## Topology at a glance
+
+| Role | Where | Notes |
+|---|---|---|
+| Build box | `192.168.1.159` (`renfield.local` mDNS often flaky — use the IP) | Docker Compose up for dev/test only. Used for `docker build` + `docker push`. Runs the full backend/test stack so pytest is executed here. **Not production.** |
+| Container registry | `https://registry.treehouse.x-idra.de` | Harbor. Namespace paths used: `renfield/backend`, `renfield/frontend`, `renfield/voice-server`. `harbor-pull-secret` already exists in the `renfield` k8s namespace. |
+| Production | Private k8s cluster (kubectl context **`renfield-private`**) | GPU-accelerated LLM, Traefik ingress, Longhorn storage, MetalLB LB at `192.168.1.230`. Canonical doc: `docs/KUBERNETES_DEPLOYMENT.md`. |
+
+Single-VM `renfield.local` deployment on `/opt/renfield` is legacy / build-box only. Anything calling itself a "prod rsync" is referring to the build box, not production.
+
+## Release tag (audit trail)
+
+```bash
+# From the laptop, after the release commits are merged to main:
+git checkout main && git pull
+git tag -a vX.Y.Z -m "Release vX.Y.Z\n\n<release notes>"
+git push origin vX.Y.Z
+gh release create vX.Y.Z --title "vX.Y.Z — <one-line summary>" --notes "<body>"
+```
+
+`make release` exists but is interactive and only does the tag step. Manual `git tag` + `gh release create` lets you script the whole sequence.
+
+The `release.yml` workflow on tag-push **does not actually build images** (CI is non-functional for this project). Tag is for the audit trail and the git history; the real build happens on .159.
+
+## Build + push workflow (rsync-to-staging — preferred)
+
+> **Script:** `bin/deploy-production.sh` automates the mechanical backbone of
+> this skill — rsync contexts → build+push backend/frontend → (optional
+> `--migrate`) alembic job → `set image` + `rollout status` → smoke test →
+> prune. It has `--dry-run`, `--skip-backend`/`--skip-frontend`, and takes the
+> tags as args (backend date-tag, frontend semver). It deliberately does NOT
+> touch satellites (SD-card brick risk), voice-server/dlna/samsung images, or
+> invent tags. Example: `bin/deploy-production.sh --backend-tag 2026-06-25-satsec
+> --frontend-tag v2.15.29 --migrate`. The steps below remain the source of truth
+> and the fallback when something needs hand-holding (Harbor 504, a forked
+> alembic chain, a pinned-tag quirk).
+
+Images live in Harbor and are pulled by the cluster via `imagePullPolicy: Always` on the `:latest` tag (or pinned tags like `:vX.Y.Z`).
+
+Both Dockerfiles expect **their own directory as the build context** — not the repo root. `COPY requirements.txt constraints.txt ./` and `COPY wakeword-models /app/wakeword-models` resolve against context root, and those files live at `src/backend/*`, not at the repo root. The wakeword models live at `data/wakeword-models/` in the repo and must be rsynced INTO the backend build context as `wakeword-models/`.
+
+> **Why staging-dir, not `/opt/renfield`?** The `/opt/renfield` checkout on .159 is often on a feature/WIP branch with uncommitted changes. Building from there bakes the WIP into the image, OR (worse) clobbers the WIP if you do `git checkout`. The rsync-to-staging flow below isolates the build from the checkout.
+
+### Step 1 — From the laptop, rsync the build contexts
+
+```bash
+# Prep a fresh staging dir on .159 (use the version tag in the path so concurrent
+# releases don't trample each other and cleanup is unambiguous)
+ssh evdb@192.168.1.159 "rm -rf /tmp/renfield-build-vX.Y.Z; mkdir -p /tmp/renfield-build-vX.Y.Z/src/backend /tmp/renfield-build-vX.Y.Z/src/frontend"
+
+# Rsync src/backend (build context for the backend image)
+rsync -avz --delete \
+  --exclude='__pycache__' --exclude='.pytest_cache' --exclude='*.pyc' \
+  --exclude='.coverage' --exclude='htmlcov' \
+  --exclude='.env' --exclude='.env.local' --exclude='secrets/' \
+  --exclude='Users/' \
+  src/backend/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/src/backend/
+
+# Rsync src/frontend (build context for the frontend image)
+rsync -avz --delete \
+  --exclude='node_modules' --exclude='dist' --exclude='.vite' \
+  --exclude='.cache' --exclude='.env' --exclude='.env.local' \
+  src/frontend/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/src/frontend/
+
+# Rsync wakeword models INTO the backend build context (Dockerfile COPYs ./wakeword-models)
+rsync -avz \
+  data/wakeword-models/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/src/backend/wakeword-models/
+
+# Rsync the satellite source INTO the backend build context (Dockerfile COPYs ./satellite).
+# Bundled so the OTA update service can build /api/satellites/update-package AND so
+# get_latest_version reads __version__ from it (the advertised version can't drift from
+# the shipped package). Without this the OTA UI 503s — see references/satellite-deploy.md.
+# Exclude provisioning/ (gitignored ansible inventory with real household IPs — must not
+# be baked into the image) and tests/ — only renfield_satellite/ + requirements.txt +
+# setup.py are packaged by build_update_package anyway.
+rsync -avz --delete \
+  --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' \
+  --exclude='provisioning' --exclude='tests' \
+  src/satellite/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/src/backend/satellite/
+```
+
+#### Optional pre-step — sign the OTA release (security H6)
+
+If signed OTA is in use (the fleet has `release_pubkeys` pinned), sign the
+release BEFORE rsyncing the satellite source, on the **operator workstation**
+(the private Ed25519 key must NEVER touch .159 or the backend):
+
+```bash
+# Re-sign whenever the satellite source changed since the last release.
+python bin/sign_satellite_release.py --sign --key ~/.renfield/ota_release_key
+python bin/sign_satellite_release.py --verify --pubkey <hex>   # manifest == source + sig OK
+git add src/satellite/RELEASE_MANIFEST.json src/satellite/RELEASE_MANIFEST.json.sig
+```
+
+The committed `RELEASE_MANIFEST.json` + `.sig` ride along in the `src/satellite/`
+rsync above and get baked into the backend image; the backend forwards them, the
+satellite verifies before install. Skip this step while signed OTA is dark (no
+manifest committed → backend forwards `None` → satellites use checksum-only).
+First-time setup: `--gen-key`, then add the printed public-key hex to group_vars
+`satellite_release_pubkeys` and re-provision the fleet (`--tags config`).
+
+### Step 2 — On .159, build + push
+
+```bash
+ssh evdb@192.168.1.159
+
+# Login to Harbor (skip if your session is already authenticated)
+docker login registry.treehouse.x-idra.de
+
+# Backend (CPU image, ~3.5 GB — torch pinned to +cpu wheels via constraints.txt)
+# Build time (since the Dockerfile reorder — requirements.txt is COPY'd AFTER the
+# heavy torch/ML/audio layers):
+#   - Python source only: ~2-4 min (all deps layers cached)
+#   - requirements.txt change (incl. MCP-server github pin bump): ~3-5 min —
+#     rebuilds only Layers 4-5 (pypi + github); torch/ML/audio stay cached.
+#   - constraints.txt change OR Dockerfile deps-section edit: 10-20 min (full
+#     deps rebuild, the only case that re-pulls torch).
+cd /tmp/renfield-build-vX.Y.Z/src/backend
+docker build \
+  -t registry.treehouse.x-idra.de/renfield/backend:latest \
+  -t registry.treehouse.x-idra.de/renfield/backend:vX.Y.Z \
+  -f Dockerfile .
+docker push registry.treehouse.x-idra.de/renfield/backend:latest
+docker push registry.treehouse.x-idra.de/renfield/backend:vX.Y.Z
+
+# Frontend (Nginx serving React build, ~144 MB; ~2-3 min build + push)
+cd /tmp/renfield-build-vX.Y.Z/src/frontend
+docker build \
+  --build-arg VITE_FEATURE_VOICE_STREAM=true \
+  -t registry.treehouse.x-idra.de/renfield/frontend:latest \
+  -t registry.treehouse.x-idra.de/renfield/frontend:vX.Y.Z \
+  -f Dockerfile .
+docker push registry.treehouse.x-idra.de/renfield/frontend:latest
+docker push registry.treehouse.x-idra.de/renfield/frontend:vX.Y.Z
+```
+
+> **`--build-arg VITE_FEATURE_VOICE_STREAM=true`** enables the streaming
+> voice pipeline (Phase B, useVoiceStream hook → voice-server `/ws/voice`).
+> Without it the bundle is tree-shaken and falls back to the legacy
+> record-then-POST `/api/voice/stt` flow; the user has to wait until they
+> stop talking before any transcription happens. The flag was added by
+> default in the Reva build (`bin/build-frontend.sh`) on 2026-05-13 and
+> mirrored here for Renfield in the same rollout.
+
+> **No `--build-arg VITE_API_URL` required.** Since v2.4.4 the frontend defaults
+> to relative URLs in production builds (axios `baseURL=""` → same-origin). As
+> long as Traefik routes `/api/*` and `/ws` on the same host as the frontend
+> (which the `renfield-private` ingress does), the bundle works out of the
+> box. Pass `--build-arg VITE_API_URL=https://other.host` only for cross-origin
+> deployments. See `src/frontend/src/utils/env.ts`.
+
+### Step 3 — Cleanup + image retention (run EVERY deploy)
+
+```bash
+# Remove the staging dir once the cluster has rolled (or even before — the images are in Harbor)
+ssh evdb@192.168.1.159 "rm -rf /tmp/renfield-build-vX.Y.Z"
+```
+
+**Image retention — DO THIS EVERY DEPLOY or the box fills up.** Each deploy builds
+a new tagged `backend` image (~3.9 GB) and nothing removes the old tag, so they
+pile up fast (diagnosed 2026-06-05: ~25 backend tags = 47 GB images + 16 GB build
+cache + 4 GB stale volumes had the 97 GB box at 90%). **Rollback pulls from
+Harbor, not the local .159 daemon**, so local tags are pure convenience + layer
+cache — prune aggressively. Keep the few newest tags (so the ~2.5 GB shared deps
+layer survives for fast next builds) and drop the rest:
+
+```bash
+ssh evdb@192.168.1.159 '
+  # docker images lists newest-first by default -> keep the 3 newest tags per repo,
+  # remove the rest (untags; the shared deps layer survives via the kept tags).
+  for repo in backend frontend; do
+    docker images "registry.treehouse.x-idra.de/renfield/$repo" --format "{{.Repository}}:{{.Tag}}" \
+    | awk "NR>3" | xargs -r -n1 docker rmi 2>/dev/null || true
+  done
+  docker image prune -f                         # dangling layers
+  docker builder prune -f --keep-storage 10GB   # cap build cache (keeps recent -> fast rebuilds)
+  df -h / | tail -1'
+```
+
+If the box has already crept high (>80%), the one-shot deep reclaim is safe here
+(nothing prod-critical runs on .159): `docker image prune -a -f` +
+`docker builder prune -a -f` + `docker volume prune -a -f` (the last needs `-a` —
+plain `volume prune` skips *named* volumes). Reclaimed ~45 GB on 2026-06-05.
+Full rationale: `memory/reference_build_box_disk_wget_exit3.md`.
+
+Always build + push a pinned tag (`:vX.Y.Z`) alongside `:latest` — gives you an immutable rollback target (`kubectl set image deploy/backend backend=.../backend:vX.Y.Z`).
+
+**Why the image stays ~3.5 GB:** `src/backend/constraints.txt` pins `torch`/`torchaudio`/`torchvision` to the `+cpu` wheels so transitive deps (docling, easyocr, transformers) can't drag in the 2.7 GB CUDA runtime + 641 MB triton. Don't lift that constraint unless you've thought through the Harbor push timeout.
+
+### Voice-server image (build ONLY when `voice-server/` changed)
+
+`voice-server/` is a third image in the monorepo — the backend/frontend steps above do **not** cover it. Build it only when something under `voice-server/` changed. It has its own `v0.1.x` versioning, independent of the repo's `vX.Y.Z` (bump the patch digit: `v0.1.5` → `v0.1.6`).
+
+```bash
+# Rsync the voice-server build context — its own directory IS the context
+ssh evdb@192.168.1.159 "mkdir -p /tmp/renfield-build-vX.Y.Z/voice-server"
+rsync -avz --delete \
+  --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' --exclude='.env' \
+  voice-server/ evdb@192.168.1.159:/tmp/renfield-build-vX.Y.Z/voice-server/
+
+# Build + push on .159. Dockerfile is FROM nvidia/cuda:...-runtime but builds
+# fine on the CPU build box (no GPU needed to BUILD). Layers usually cache, so
+# only the changed app layer pushes — fast.
+ssh evdb@192.168.1.159
+R=registry.treehouse.x-idra.de/renfield/voice-server
+cd /tmp/renfield-build-vX.Y.Z/voice-server
+docker build -t $R:v0.1.N -t $R:latest -f Dockerfile .
+docker push $R:v0.1.N
+docker push $R:latest
+```
+
+Run its tests against the freshly built image — CI doesn't, and the .159 backend container can't import the voice-server deps:
+
+```bash
+docker run --rm -v /tmp/renfield-build-vX.Y.Z/voice-server:/work -w /work \
+  $R:v0.1.N sh -c 'python3 -m pip install -q pytest pytest-asyncio && python3 -m pytest tests/ -q'
+```
+
+**GPU-node driver drift (verified painful, v2.8.0 deploy 2026-05-22).** The `voice-server` Deployment runs on the `k8s-gpu-3` GPU node. If `apt` upgraded that node's NVIDIA driver libraries without a reboot, a *new* voice-server pod CrashLoops with `failed to initialize NVML: Driver/library version mismatch` — the *old* pod keeps running, only new pods fail, so it stays latent until the next voice-server rollout. Fix is a **node reboot**, not an image rollback (a fresh pod on the old image crashes identically). A live `modprobe -r nvidia*` reload fails — `nvidia_uvm` stays held even when `lsof /dev/nvidia*` is empty. Procedure: `kubectl cordon k8s-gpu-3` → delete the `frontend` pod so it reschedules off the node (keeps the UI up) → `ssh ... sudo reboot` → wait for `Ready` → `kubectl uncordon` → `kubectl rollout restart deploy/voice-server`. Confirm `dkms status` has the nvidia module built for the kernel the node will boot into first (a pending kernel update can switch it).
+
+### Samsung-mcp image (build ONLY when `../renfield-mcp-samsung/` changed)
+
+Like dlna-mcp, `samsung-mcp` is a SEPARATE small image built from the Dockerfile
+in the **`renfield-mcp-samsung` repo** (sibling of the renfield repo) — NOT the
+backend image. The backend reaches it over streamable-http only (never imports
+the package), so a Samsung change needs no backend rebuild. It runs on
+`hostNetwork` (SSDP discovery + Wake-on-LAN broadcast + websocket/UPnP to the
+TV) with a small RWO PVC (`samsung-mcp-state`) at `/state` holding the one-time
+pairing token. Own `v0.1.x` versioning, independent of the repo's `vX.Y.Z`.
+
+```bash
+# Rsync the samsung build context (its own repo dir IS the context)
+ssh evdb@192.168.1.159 "mkdir -p /tmp/renfield-samsung-build"
+rsync -avz --delete \
+  --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' \
+  --exclude='.venv' --exclude='token.json' --exclude='.git' \
+  ../renfield-mcp-samsung/ evdb@192.168.1.159:/tmp/renfield-samsung-build/
+
+# Build + push on .159 (pure-python / manylinux wheels — no toolchain needed)
+ssh evdb@192.168.1.159
+R=registry.treehouse.x-idra.de/renfield/samsung-mcp
+cd /tmp/renfield-samsung-build
+docker build -t $R:v0.1.N -t $R:latest -f Dockerfile .
+docker push $R:v0.1.N
+docker push $R:latest
+
+# First-ever deploy: apply the manifest (kustomization already includes it):
+kubectl -n renfield apply -f k8s/samsung-mcp.yaml
+# Thereafter, pinned-tag rollout (set image, like dlna-mcp/voice-server):
+kubectl -n renfield set image deploy/samsung-mcp \
+  samsung-mcp=registry.treehouse.x-idra.de/renfield/samsung-mcp:v0.1.N
+kubectl -n renfield rollout status deploy/samsung-mcp --timeout=600s
+```
+
+**One-time TV pairing (after first deploy).** Websocket keys/apps/power-off need
+a one-time "Allow Renfield?" approval on the TV (WoL power-on + DLNA media/volume
+do NOT). Enable on the TV: **Settings → General → External Device Manager →
+Device Connect Manager → Access Notification On**, then trigger any websocket
+tool (e.g. `tv_key`) while the TV is on the Smart Hub home screen and approve the
+popup. The token persists to the `samsung-mcp-state` PVC and survives restarts.
+Set `SAMSUNG_MCP_ENABLED=true` (+ optional `SAMSUNG_TV_HOST` to pin a TV) for the
+backend to register the server.
+
+### Harbor 504 / "Client Closed Request" on the 2.66 GB pip-install layer
+
+When `requirements.txt` changes (so the deps layer cache misses), Docker tries to upload a single 2.66 GB layer to Harbor. The ingress proxy in front of Harbor has been observed timing out on this with `received unexpected HTTP status: 504 Gateway Timeout` or `unknown: Client Closed Request`. The error reproduces on the same layer ID across multiple retries (verified during the v2.3.0 deploy 2026-05-01 — 4 attempts, same `ed85...` layer, same error).
+
+Mitigations to try, in order:
+
+1. **Wait + retry.** Harbor's proxy might be load-shedding. A few minutes can clear it.
+2. **Push the layer first, then the manifest.** `docker push --quiet` cuts logging overhead. If Docker is wasting time on output buffering during the layer upload, the timeout window shrinks.
+3. **Split the requirements install** — and stage the heavy packages OUTSIDE `/opt/venv` so the split survives the multi-stage `COPY`. Splitting the pip install into multiple RUN steps in the builder stage is **not enough** by itself: the runtime stage's `COPY --from=builder /opt/venv /opt/venv` collapses every site-packages file from every prior RUN into one giant layer at push time. The fix (landed in PR #512, v2.3.0) is to (a) split pip install into 5 RUN steps, AND (b) `mv` the heavy packages (torch, transformers, easyocr, docling*, speechbrain, cv2, ctranslate2, librosa) into `/opt/staging/{torch,ml,audio}/` after the installs, then `COPY --from=builder /opt/staging/torch/. /opt/venv/lib/python3.11/site-packages/` (one COPY per staging dir) before the catch-all `COPY --from=builder /opt/venv /opt/venv`. Result: 722 MB / 205 MB / 63 MB / 1.66 GB instead of one 2.65 GB layer — each pushed independently.
+4. **Investigate the Harbor proxy config.** The ingress in front of `registry.treehouse.x-idra.de` likely has `client_max_body_size` and read/write timeouts set conservatively. Bumping `proxy_read_timeout`, `proxy_send_timeout`, `client_body_timeout`, and `proxy_request_buffering off` on the Harbor proxy fixes this for all Renfield builds. (Requires admin access to the Harbor host.)
+
+When you hit this in the future: don't keep retrying blindly past 3 attempts — the layer ID failing is fixed, so the proxy/Harbor side is the issue. Stop the push, document which release tag couldn't ship, and surface to the operator.
+
+## Cluster rollout
+
+```bash
+kubectl config use-context renfield-private
+
+# Backend image powers `backend` + `document-worker` (NOT dlna-mcp anymore —
+# see below). Roll both on a backend change. frontend is its own image.
+kubectl -n renfield rollout restart deploy/backend deploy/document-worker deploy/frontend
+
+# dlna-mcp is now a SEPARATE small image (registry/renfield/dlna-mcp, built from
+# the Dockerfile in the renfield-mcp-dlna repo — like voice-server). It does NOT
+# run the backend image. Roll it ONLY when the dlna image changed:
+#   build+push registry/renfield/dlna-mcp:v0.1.N on .159, then:
+#   kubectl -n renfield set image deploy/dlna-mcp dlna-mcp=registry.treehouse.x-idra.de/renfield/dlna-mcp:v0.1.N
+# (The backend reaches dlna-mcp over HTTP only — it never imports the package —
+# so a dlna change does NOT need a backend rebuild, and vice versa.)
+
+# Or pin an explicit tag (force-pulls even if :latest is cached on the node)
+kubectl -n renfield set image deploy/backend \
+  backend=registry.treehouse.x-idra.de/renfield/backend:vX.Y.Z
+
+# Wait for each rollout
+kubectl -n renfield rollout status deploy/backend --timeout=600s
+kubectl -n renfield rollout status deploy/dlna-mcp --timeout=600s
+kubectl -n renfield rollout status deploy/document-worker --timeout=600s
+kubectl -n renfield rollout status deploy/frontend --timeout=600s
+
+# voice-server is a SEPARATE, fifth deploy — roll it ONLY when its image
+# changed (see "Voice-server image"). It runs a pinned tag, so set image:
+kubectl -n renfield set image deploy/voice-server \
+  voice-server=registry.treehouse.x-idra.de/renfield/voice-server:v0.1.N
+kubectl -n renfield rollout status deploy/voice-server --timeout=600s
+```
+
+> **Pinned deploys — `rollout restart` is a no-op for them.** In the live
+> cluster `frontend` and `voice-server` often run pinned tags (`:vX.Y.Z` /
+> `:v0.1.N`) even though the committed `k8s/*.yaml` manifests say `:latest`.
+> For a pinned deploy, `rollout restart` re-pulls the *same* tag — it does
+> NOT pick up new code. Always `kubectl set image` for those two. Check live
+> state first: `kubectl -n renfield get deploy -o
+> custom-columns=D:.metadata.name,IMG:.spec.template.spec.containers[0].image`.
+
+> **Image-pull timing.** First pull of a 3.5 GB backend image takes 2-5 minutes per node.
+> Subsequent rollouts on the same node hit the local cache and start in seconds.
+> The pod sits in `PodInitializing` while the image transfers — that's not a stall.
+
+### Verify all pods picked up the new image
+
+```bash
+# Image digests should match what `docker push` returned for :vX.Y.Z
+kubectl -n renfield get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[*].imageID}{"\n"}{end}' | grep -E "backend|frontend"
+```
+
+If a pod shows a stale digest, it's a `imagePullPolicy` issue. Force the pull with the explicit tag:
+
+```bash
+kubectl -n renfield set image deploy/<name> <container>=registry.treehouse.x-idra.de/renfield/backend:vX.Y.Z
+kubectl -n renfield rollout status deploy/<name>
+```
+
+### Smoke test
+
+```bash
+kubectl -n renfield exec deploy/backend -c backend -- curl -sS http://localhost:8000/health
+# Expect: {"status":"ok"}
+```
+
+### Migrations
+
+**Before authoring a new migration**, query the live DB for the current single head. File naming and visual chain inspection don't catch silent collisions — Renfield's `versions/` directory has 50+ files with overlapping naming schemes:
+
+```bash
+kubectl -n renfield exec deploy/backend -c backend -- alembic heads
+kubectl -n renfield exec deploy/backend -c backend -- alembic current
+```
+
+Both should return the same single revision in a healthy chain. Use that string verbatim as `down_revision` in the new migration file. If `heads` returns multiple revisions the chain is already forked — stop and fix it before adding more. (Verified painful 2026-05-02: a chain collision blocked the v2.4.2 deploy with `Multiple head revisions are present` until a fix-forward PR re-pointed the migration.)
+
+**Applying migrations during deploy:**
+
+```bash
+kubectl -n renfield apply -f k8s/alembic-upgrade-job.yaml
+kubectl -n renfield wait --for=condition=Complete job/alembic-upgrade --timeout=300s
+kubectl -n renfield logs job/alembic-upgrade
+kubectl -n renfield delete job alembic-upgrade
+```
+
+The job uses the same backend image; if you just pushed a new image, run migrations **before** the deployment restart so the new code doesn't hit an old schema. The Job's `backoffLimit: 2` means 3 attempts max — failures are usually a chain conflict (see check above) or a missed env var, not a transient retry-able problem.
+
+### Standing up a NEW instance (auth-on / separate namespace)
+
+The household runs `AUTH_ENABLED=false`, so its deploy path never exercises the auth-on boot guards. A **new isolated instance** (a business/multi-user clone in its own namespace, `RENFIELD_ENV=production` + `AUTH_ENABLED=true`) hits three traps the household hides — all learned standing up `renfield-xidra` (2026-07-11):
+
+1. **`SECRET_KEY` in every backend-image workload.** The v2.20.0 boot guard (`fail_closed_on_insecure_jwt_key`) validates `SECRET_KEY` at `Settings()` init — which fires for **any** process that imports the config, not just the API: the `document-worker` and the `alembic-upgrade` Job included. `k8s/backend.yaml` injects it; `k8s/document-worker.yaml` and `k8s/alembic-upgrade-job.yaml` now do too (`optional: true` — inject-if-present, so auth-off installs are unaffected). If you add a new backend-image Job/CronJob, inject `secret-key` from `renfield-secrets` or it crashes with *"SECRET_KEY is insecure: still the placeholder default"*.
+
+2. **A fresh DB self-bootstraps — do NOT run the `alembic-upgrade` Job on an empty DB.** `init_db()` (backend startup) runs `Base.metadata.create_all` + stamps alembic HEAD; the 41-migration history is *skipped*. Running `alembic upgrade head` from empty instead fails on `room_output_devices` (FK → `rooms`, which no migration creates — it's `create_all`-only). Just deploy the backend; it builds the schema itself. The migration Job is for **existing** DBs applying **new** migrations only (see its header).
+
+3. **`AUTH_ENABLED` + `WS_AUTH_ENABLED` flip together, strong key first.** `assert_auth_config_consistency` rejects a partial combo; provision a `secret-key` ≥32 random chars **before** arming `RENFIELD_ENV=production`.
+
+(Cross-namespace: the shared GPU/model tier — ollama/searxng — must be FQDN-qualified in the ConfigMap AND in the `wait-for-deps` init container, which wgets a bare `ollama:11434` that would resolve to the wrong namespace.)
+
+### Federation identity (persisted key) — required before any instance pairs
+
+The federation Ed25519 identity key defaults to `/app/secrets/federation_identity_key`, which is **ephemeral container storage** — it regenerates on every restart, so the pubkey changes and any peer pairing breaks on the next deploy. `k8s/backend.yaml` mounts an **optional** `federation-identity` Secret there (`subPath`, RO). Provision it **once per namespace** before pairing, via the committed script (NOT a hand `kubectl create secret --from-file`, which appends a newline → 33 bytes → boot failure):
+
+```bash
+bin/provision_federation_identity.py -n renfield          # generate + create the Secret (create-if-absent)
+bin/provision_federation_identity.py -n renfield --verify # confirm 32 bytes + print pubkey
+kubectl -n renfield rollout restart deploy/backend        # load the persisted key
+```
+
+Then set `FEDERATION_REQUIRE_PERSISTENT_IDENTITY=true` on any instance that pairs, so a missing/mis-provisioned key **fails boot loudly** (`enforce_persistent_identity`) instead of silently breaking pairings a deploy later. **Rotation (`--force`) is destructive** — it re-pairs everyone for that instance (same class as `SECRET_KEY`↔IRKs). The xidra private manifest needs the same mount. Design: `docs/design/federation-identity-mapping.md` §8.
+
+### ConfigMap changes
+
+When `config/mcp_servers.yaml` / `config/agent_roles.yaml` / `config/kg_scopes.yaml` / `config/mail_accounts.*.yaml` change in the repo, rewrite the `renfield-mcp-config` ConfigMap **before** the rolling restart — otherwise pods get stuck in `ContainerCreating` on a missing subPath:
+
+```bash
+kubectl -n renfield create configmap renfield-mcp-config \
+  --from-file=config/mcp_servers.yaml \
+  --from-file=config/agent_roles.yaml \
+  --from-file=config/kg_scopes.yaml \
+  --from-file=mail_accounts.yaml=config/mail_accounts.default.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n renfield rollout restart deploy/backend
+```
+
+### Smoke test
+
+```bash
+curl -sk https://renfield.local/health   # {"status":"ok"}
+curl -sI http://renfield.local/          # 308 → https
+```
+
+### Frontend PWA cache propagation (why a deploy may not reach the browser)
+
+The frontend is a **vite-plugin-pwa** PWA (`registerType: 'autoUpdate'`, Workbox
+`sw.js`/`registerSW.js`). The browser caches the service worker, and the SW
+precaches the app shell — so a freshly-deployed frontend can stay **invisible**
+until the SW re-fetches and detects a new build. The propagation rule lives in
+`src/frontend/nginx.conf` and is **load-bearing**:
+
+- **Content-hashed bundles** (`index-<hash>.js`, `workbox-<hash>.js`, css, fonts,
+  `.onnx`, `.wasm`) → `Cache-Control: public, immutable` 1y is **correct** (a new
+  deploy = a new filename, so the old immutable cache is simply never requested).
+- **Stable-named files MUST be `no-cache`**: `sw.js`, `registerSW.js`,
+  `index.html`, `manifest.webmanifest`. If the generic `\.(js|...)$` immutable
+  block matches `sw.js`/`registerSW.js`, the browser caches the SW for a year,
+  never re-fetches it, never detects the deploy, and serves the **stale shell**
+  across reloads — the regression fixed in #786 (frontend v2.15.11, 2026-06-15):
+  the command-palette/follow-up/provenance features were literally absent from
+  the served `index-<hash>.js` bundle until a manual SW unregister.
+- The `sw.js`/`registerSW.js` `no-cache` `location` must be declared **BEFORE**
+  the generic `.js` block — nginx picks the **first** matching regex location.
+- **nginx `add_header` inheritance trap:** once a `location` declares its own
+  `add_header`, it **stops inheriting** the server-level headers. So any location
+  that sets a `Cache-Control` header silently **drops** the security headers
+  (`X-Frame-Options`/`X-Content-Type-Options`/`X-XSS-Protection`) for that
+  response — re-declare them in every such location. Always `nginx -t` the config
+  (run it in a `nginx:1.28-alpine` container) before building the image.
+- **Baseline CSP ships Report-Only first (`Content-Security-Policy-Report-Only`).**
+  The policy lives in the same `nginx.conf` (`map $host $csp`, re-declared per
+  `location` — same inheritance trap above). It is intentionally Report-Only so a
+  wrong directive **reports** to the browser console instead of breaking the PWA.
+  **Do NOT flip the header name to enforcing `Content-Security-Policy` blind** —
+  gate the flip on a clean browser-verification pass with DevTools console open:
+  exercise wakeword (the `'wasm-unsafe-eval'` onnxruntime path), voice, chat-WS,
+  TTS, and an SW update, and confirm **zero CSP violation reports**. The two
+  fragile directives to watch: the inline theme-script `sha256` hash (Vite's
+  html-minify can alter the bytes at build → recompute from the built
+  `dist/index.html` or fall back to `'unsafe-inline'` on `script-src`) and
+  `'wasm-unsafe-eval'` (absent → wakeword WASM compile is reported/blocked).
+  **A THIRD fragile surface, learned painfully (2026-06-16):** the wake-word
+  **AudioWorklet** is loaded from a `blob:` URL (`new Blob → createObjectURL →
+  audioWorklet.addModule`) and is governed by **`script-src`, NOT `worker-src`** —
+  so `script-src` needs **`blob:`** or wake word dies with `AbortError: Unable to
+  load a worklet's module`. This is a DISTINCT surface from the onnxruntime WASM
+  (`'wasm-unsafe-eval'`); verifying "WASM loaded" does NOT cover it. Always trigger
+  wake-word **enable** (the `addModule`), not just page load, when validating CSP —
+  Chrome reports a worklet CSP rejection as an `AbortError`, not always a clean
+  `securitypolicyviolation` event, so a violation-listener check can miss it.
+- **A header-only change (CSP etc.) does NOT propagate to existing PWA clients on its own.**
+  The SW precaches `index.html` (`globPatterns` includes `html`) **with its response headers**
+  (the CSP is captured at fetch time). A change touching only `nginx.conf` leaves every *built*
+  file byte-identical → the workbox precache manifest and `sw.js` are unchanged → `autoUpdate`
+  never fires → existing clients keep serving the **stale-CSP precached shell** (a fresh `nginx`
+  curl shows the new header, but the browser enforces the cached one — wake word stayed broken
+  after the blob-worklet CSP fix until this was understood). **Fix: pair any served-header change
+  with a frontend build bump** — bump `__BUILD_STAMP__` in `src/frontend/src/main.tsx` (its whole
+  purpose). That changes the JS bundle hash → rewrites index.html's `<script src>` → index.html's
+  revision changes → the SW re-precaches it (re-fetching the current header) and `autoUpdate`
+  propagates on the next visit. Verify the served `/assets/index-<hash>.js` filename actually
+  CHANGED after the build.
+
+Verify the live headers from inside the cluster (renfield.local mDNS is flaky
+from the laptop):
+
+```bash
+kubectl -n renfield exec deploy/backend -c backend -- curl -sI http://frontend/sw.js
+# Expect: Cache-Control: no-cache, no-store, must-revalidate
+kubectl -n renfield exec deploy/backend -c backend -- curl -sI http://frontend/index.html
+# Expect: Cache-Control: no-cache, must-revalidate  + X-Frame-Options present
+kubectl -n renfield exec deploy/backend -c backend -- curl -sI http://frontend/assets/index-<hash>.js
+# Expect: Cache-Control: public, immutable
+```
+
+Propagation after a fix: existing clients self-heal on the browser's mandatory
+~24h SW byte-check (or a manual refresh); `autoUpdate` injects
+`skipWaiting`+`clientsClaim`, so a newly-detected SW activates on the next reload.
+An nginx-only change needs no backend rebuild — roll `deploy/frontend` only.
+
+## End-to-end checklist (run through this every release)
+
+1. ✅ Merge release commits into `main` (PR review done).
+2. ✅ Tag `vX.Y.Z` locally + push tag + create GitHub release.
+3. ✅ rsync `src/backend`, `src/frontend`, `data/wakeword-models`, `src/satellite` to `/tmp/renfield-build-vX.Y.Z` on .159 (the model dir lands INSIDE the backend build context as `wakeword-models/`; the satellite source as `satellite/` — bundled for the OTA update package).
+4. ✅ Verify staging — `Dockerfile`, `.dockerignore`, `wakeword-models/` (~9 files), `satellite/renfield_satellite/__init__.py` all present; `config/mcp_servers.yaml` etc. NOT present (else the configmap mount breaks).
+5. ✅ Build backend (long if requirements.txt changed) and frontend (fast); build voice-server ONLY if `voice-server/` changed (its own `v0.1.x` tag).
+6. ✅ Push `:latest` + the pinned tag for each image built — verify each `digest:` line in the push output.
+7. ✅ Roll out: `rollout restart` backend, dlna-mcp, document-worker; `kubectl set image` for frontend (and voice-server if rebuilt) — both run pinned tags, so `rollout restart` is a no-op for them.
+8. ✅ `kubectl rollout status` per rolled deploy with 600s timeout.
+9. ✅ Verify image digests across the rolled deploys match what was pushed.
+10. ✅ Backend health smoke (`curl -sS http://localhost:8000/health` inside the pod).
+11. ✅ Browser smoke for migrated pages / new features.
+11b. ✅ If the frontend image changed: verify PWA cache headers (`sw.js`/`registerSW.js`/`index.html` `no-cache`, hashed bundles `immutable`) so the deploy actually reaches the browser — see "Frontend PWA cache propagation".
+12. ✅ Cleanup `/tmp/renfield-build-vX.Y.Z` on .159.
+13. ✅ **Image retention on .159** — prune old backend/frontend tags (keep newest 3) + cap build cache (Step 3). Skipping this is what fills the build box to 90%.
+
+## Build-box testing (not production)
+
+The .159 build box runs the full Docker Compose stack for integration testing. It's where pytest lives because CI doesn't run.
+
+```bash
+# Rsync the working copy to the build box (exclude secrets + scratch)
+rsync -avz --exclude='.env' --exclude='secrets/' --exclude='.git' \
+  --exclude='node_modules' --exclude='__pycache__' --exclude='tasks/' \
+  /Users/evdb/projects.ai/renfield/ 192.168.1.159:/opt/renfield/
+
+# Run the suite inside the backend container
+#   Source mount:  /opt/renfield/src/backend → /app
+#   Tests mount:   /opt/renfield/tests       → /tests
+ssh 192.168.1.159 "docker exec renfield-backend python -m pytest /tests/backend/... -q"
+```
+
+For a narrow-scope rsync of a few files, per-file `rsync` calls matching the repo layout are usually faster than a full tree sync. See `memory/reference_test_runner_159.md` for the full test-runner workflow including the "filter by subsystem + compare against pre-change tip via `git stash`" pattern used to distinguish regressions from the ~161 pre-existing failures.
+
+**Do NOT** treat the build-box Compose stack as production. It runs without GPU, has no Harbor pull credentials plumbed in, and is routinely reset during testing.
+
+## See also
+
+- `docs/KUBERNETES_DEPLOYMENT.md` — canonical manifest + cluster-inventory reference
+- `references/secrets.md` — Docker secrets + Harbor pull secret
+- `references/docker-variants.md` — Compose variants (dev vs. build-box vs. retired prod compose)
+- `references/satellite-deploy.md` — Satellite safety & provisioning (Ansible playbook, SD-card brick risk, 4-mic HAT gotchas)

@@ -1,0 +1,497 @@
+---
+name: update-deps
+description: Autonomous Dependabot, auto-discover outdated packages, audit overrides, apply migrations for major bumps, resolve conflicts, run quality gate. Trigger when the user clicks the statusline `Run /update-deps` indicator or asks "update dependencies", "bump deps", "run dependabot".
+---
+
+Superpowered Dependabot. Auto-discover all outdated packages, preview them grouped by severity so you can snooze any you are not ready for, audit overrides, apply codebase migrations for major bumps, resolve dependency conflicts, and run the quality gate. In CI it runs unattended (no preview); interactively it shows the preview first. On a `main`/`master` run it opens the PR and merges it once checks are green, then cleans up locally; on any other branch it pushes and leaves the PR to you.
+
+## Pre-flight: Worktree check
+
+This wrapper writes a new `pnpm-lock.yaml` and opens a PR, both belong on the main checkout, not a per-SPEC worktree branch. If invoked from a linked worktree, reject hard with a message that surfaces the cached state from main so the user knows whether action is even pending.
+
+Detection (run this first, before anything else):
+
+```bash
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null)"
+if [ -n "$common_dir" ]; then
+  case "$common_dir" in
+    /*) absolute_common_dir="$common_dir" ;;
+    *)  absolute_common_dir="$(pwd)/$common_dir" ;;
+  esac
+  main_root="$(cd "$(dirname "$absolute_common_dir")" 2>/dev/null && pwd)"
+  current_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$main_root" ] && [ -n "$current_root" ] && [ "$main_root" != "$current_root" ]; then
+    cached_line="Cached state unavailable on main; symlinks may be broken, run \`.gaia/cli/gaia setup link-worktree\` to repair."
+    cache_file="$main_root/.gaia/local/cache/shared/update-check.json"
+    if [ -f "$cache_file" ] && command -v jq >/dev/null 2>&1; then
+      outdated_count="$(jq -r '.outdatedCount // 0' "$cache_file" 2>/dev/null)"
+      checked_at="$(jq -r '.checkedAt // 0' "$cache_file" 2>/dev/null)"
+      if [ -n "$outdated_count" ] && [ -n "$checked_at" ] && [ "$checked_at" != "0" ]; then
+        now=$(date +%s)
+        age=$((now - checked_at))
+        # Format age as <Nm ago> / <Nh ago> / <Nd ago>.
+        ago_unit="s"; ago_value="$age"
+        if [ "$age" -ge 86400 ]; then ago_unit="d"; ago_value=$((age / 86400));
+        elif [ "$age" -ge 3600 ]; then ago_unit="h"; ago_value=$((age / 3600));
+        elif [ "$age" -ge 60 ]; then ago_unit="m"; ago_value=$((age / 60));
+        fi
+        cached_line="Cached on main: $outdated_count packages outdated (last checked ${ago_value}${ago_unit} ago)."
+      fi
+    fi
+    cat <<EOF
+/update-deps must run from the main checkout, not a worktree.
+
+Worktree:       $current_root
+Main checkout:  $main_root
+
+$cached_line
+
+Run \`cd $main_root\` then re-invoke /update-deps.
+EOF
+    exit 1
+  fi
+fi
+```
+
+If the detection does not fire, fall through to the existing `## Pre-flight: Branch check` section.
+
+## Pre-flight: Branch check
+
+```bash
+git branch --show-current
+```
+
+If the current branch is `main` or `master` **and not running in CI**, set a flag (`SHOULD_CREATE_BRANCH=true`) but **do not create the branch yet**, branch creation is deferred until after Phase 1 confirms there are packages to update. Creating a branch when there is nothing to update pollutes the branch list.
+
+In CI (`CI=true`, set by GitHub Actions, GitLab CI, CircleCI, and most CI providers), skip branch creation, the workflow owns branch management and pre-creates the appropriate branch before this skill runs.
+
+Otherwise set `SHOULD_CREATE_BRANCH=false` and proceed on the current branch.
+
+## Composition: --scope &lt;group-name&gt;
+
+When invoked with `--scope <group-name>` (e.g. `/update-deps --scope react-router`):
+
+- Skip Phase 0 (override audit), out of scope for a single-group run.
+- Skip the discovery + preview phase, no preview runs in `--scope`; the
+  group's members are known from the companion-group table.
+- Skip wave classification, the run is implicitly a single group; treat it
+  as Wave A if all members are minor/patch, else Wave B.
+- Wave A / Wave B still apply, scoped to the named group's members
+  in root `package.json`.
+- Quality gate, return value, and final report still run.
+
+Used by the GAIA CI update-deps workflow's wave-B matrix shards to fan
+out one PR per major-bump group.
+
+## Companion groups (reference)
+
+The fixed table mapping each package to its group. `gaia update-deps run`
+resolves grouping internally and is the source of
+truth at runtime; every emitted entry already carries its resolved `group`.
+**When any member of a group is outdated, all members present in `package.json`
+update together**, so a group moves as one unit (and snoozes as one unit).
+
+| Group             | Members                                                                                                                                                                      |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `react-router`    | `react-router`, `@react-router/dev`, `@react-router/node`, `@react-router/serve`, `@react-router/fs-routes`, `@react-router/remix-routes-option-adapter`                     |
+| `react`           | `react`, `react-dom`, `@types/react`, `@types/react-dom`                                                                                                                     |
+| `tailwindcss`     | `tailwindcss`, `@tailwindcss/vite`, `@tailwindcss/forms`, `@tailwindcss/typography`, `prettier-plugin-tailwindcss`                                                           |
+| `storybook`       | `storybook`, `@storybook/*`, `eslint-plugin-storybook`, `msw-storybook-addon`, `storybook-react-i18next`, `@vueless/storybook-dark-mode`                                     |
+| `vitest`          | `vitest`, `@vitest/coverage-v8`, `@vitest/ui`, `@vitest/eslint-plugin`                                                                                                       |
+| `playwright`      | `@playwright/test`, `@playwright-testing-library/test`                                                                                                                       |
+| `eslint`          | `eslint`, `@eslint/js`, `@eslint/compat`, `eslint-config-*`, `eslint-plugin-*` (9.x cap applies)                                                                             |
+| `testing-library` | `@testing-library/dom`, `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event`                                                                 |
+| `typescript`      | `typescript`, `@types/node`                                                                                                                                                  |
+| `i18next`         | `i18next`, `react-i18next`, `remix-i18next`, `i18next-browser-languagedetector`                                                                                              |
+| `msw`             | `msw`, `msw-storybook-addon`                                                                                                                                                 |
+| `vite`            | `vite`, `@vitejs/plugin-react`                                                                                                                                               |
+| `zod-conform`     | `zod`, `@conform-to/react`, `@conform-to/zod`                                                                                                                                |
+| `fontawesome`     | `@fortawesome/*`                                                                                                                                                             |
+| `stylelint`       | `stylelint`, `stylelint-config-*`, `stylelint-order`                                                                                                                         |
+| `prettier`        | `prettier`, `eslint-config-prettier`, `eslint-plugin-prettier`                                                                                                               |
+| `husky`           | `husky`, `lint-staged`                                                                                                                                                       |
+
+Packages not matched form singleton groups.
+
+## Phase 1: Discover, preview, decide (orchestrator)
+
+Discover deterministically via the CLI primitive, the single source of truth for
+grouping, the ESLint 9.x cap, the `gaia.updateDepsHold` config hold, and the
+release-age cooldown (all already applied):
+
+```bash
+updates_json="$(mktemp)"
+.gaia/cli/gaia update-deps run --emit-updates "$updates_json"
+```
+
+Read the payload. If `total_count` is `0`, print `All packages are up to date.`
+and exit (no branch, no changes). Each `wave_a[]` and `wave_b[].packages[]` entry
+carries `bucket` (`patch` | `minor` | `major` | `nonsemver`), `current`, `latest`,
+`group`, `is_pinned`, and `kind`. `total_count` is the genuine-upgrade count;
+`actionable_count` is for the statusline only (it already subtracts local
+snoozes), ignore it here.
+
+`snoozed[]` lists the groups the human deferred earlier that still match the
+currently-offered targets. Each entry carries `group`, `targets`, `snoozed_at`,
+and `resurfaces_at` (ISO stamp when the snooze lapses). Build `snoozedGroups`,
+the set of their `group` ids, this is what you mark and default-skip below. It
+is empty in CI and whenever no active snooze matches the current offer.
+
+`skipped[]` entries with `reason: "held"` are packages capped by the committed
+`gaia.updateDepsHold` map in package.json (a durable version ceiling, distinct
+from a snooze: it holds in CI too and never lapses until the maintainer lifts
+it). They are already excluded from both waves, never installed, so nothing to
+apply. Surface them once (see Preview) so the maintainer remembers a hold is
+active.
+
+A hold caps only the package it names; a coupled sibling in the same companion
+group (e.g. `@vitejs/plugin-react` beside a held `vite`) still updates on its own
+line. If a sibling release's peer range demands a version above the ceiling, hold
+the sibling too by adding it to the map. The quality gate catches a peer conflict
+before merge regardless.
+
+**In CI (`CI=true`) or with `--scope <group>`, skip the preview and decision
+entirely.** The apply set is the full payload (CI) or the named group
+(`--scope`); jump straight to the apply phases with an empty skip set and no
+ledger write.
+
+### Preview
+
+Group the entries for display into four sections in this order: **Major**,
+**Non-semver**, **Minor**, **Patch**. A companion group (any `group` not prefixed
+`singleton:`) renders as ONE block under the section of its most-severe member
+(severity major > nonsemver > minor > patch) and is a single choice that updates
+together. Render each row as `name  current → next`; for a companion group, list
+its members under one labelled block (e.g. "react-router group, updates
+together").
+
+Mark every group in `snoozedGroups` with a trailing `[snoozed until <date>]`
+(the entry's `resurfaces_at`, rendered as a plain date). Snoozed groups are
+**default-skipped**: they are excluded from the default apply set, so a group the
+human already deferred is not silently re-applied each run. The human can still
+choose to refresh them.
+
+If `skipped[]` has any `reason: "held"` entries, print one line above the
+sections listing them, e.g. `Held by config (not offered): vite (current
+8.0.16, ceiling 8.0)`. This is informational, held packages are never part of
+any apply set; the line just keeps the active holds visible.
+
+If `update_deps.mode` in `.gaia/automation.json` is `ci`, first print one line:
+`CI owns updates; snoozing here only quiets your local statusline.`
+
+Then ask with `AskUserQuestion` (single-select). **When `snoozedGroups` is
+non-empty**, offer these options in this order:
+
+- **Update the rest** (default, first option): apply every group EXCEPT the
+  snoozed ones; leave the snoozes intact.
+- **Choose what to skip**: the human names further package or group names to
+  skip; the snoozed groups stay skipped too.
+- **Update everything incl. snoozed**: apply every group AND clear the snoozes.
+- **Cancel**: exit now, no branch, no changes, no ledger write.
+
+**When `snoozedGroups` is empty**, offer the original three:
+
+- **Update all** (default, first option): apply every group.
+- **Choose what to skip**: the human names the package or group names to skip;
+  everything else applies.
+- **Cancel**: exit now, no branch, no changes, no ledger write.
+
+### Decision
+
+The **skip set** is `snoozedGroups` plus whatever the human names; the **apply
+set** is every remaining group. The ledger is full-replace, so any `decline
+--skip` call must name every group that should stay snoozed (the pre-existing
+snoozes AND any newly named), or the omitted ones are dropped from the ledger.
+
+- **Update the rest** (snoozed groups present) → apply set = payload minus
+  `snoozedGroups`. Leave the ledger untouched (the snoozes already match the
+  current targets), no `decline` call. **If the apply set is empty** (every
+  outstanding group is snoozed), print
+  `Snoozed N group(s); nothing else to update.` and exit (no branch).
+- **Update all** (no snoozed groups) → clear any prior snoozes, apply
+  everything:
+  ```bash
+  .gaia/cli/gaia update-deps decline --clear
+  ```
+  Apply set = the full payload.
+- **Update everything incl. snoozed** → same action as Update all: clear the
+  snoozes (`decline --clear`) and apply the full payload.
+- **Choose what to skip** → collect the names, union with `snoozedGroups`, then
+  record the whole skip set:
+  ```bash
+  .gaia/cli/gaia update-deps decline --source "$updates_json" --skip "<snoozed…,named…>"
+  ```
+  Each name expands to its whole companion group (a partial group cannot be
+  skipped); an unknown name errors so you can re-ask. Apply set = the payload
+  minus the skip set. Echo the resulting apply set back for confirmation.
+  **If the apply set is now empty** (everything is skipped), print
+  `Snoozed N group(s); nothing else to update.` and exit (no branch).
+- **Cancel** → stop here.
+
+The snooze ledger (`.gaia/local/declined-updates.json`) is local-only and
+gitignored: it suppresses the statusline nudge and default-skips the group in
+this preview until a newer version ships or 14 days pass. It never HARD-gates a
+run, the human can always choose to refresh a snoozed group, and CI ignores it
+entirely (CI is the freshness backstop and keeps opening PRs).
+
+Carry the **apply set** (filtered `wave_a` and `wave_b`) into the phases below.
+
+## Override audit + Wave A: Haiku agent
+
+Spawn a **Haiku agent** (`model: "haiku"`) to run the override audit and the
+Wave A batch install on the **apply set** computed above. Pass it these
+instructions verbatim, substituting the apply set's Wave A entries into the
+Wave A input:
+
+---
+
+### Phase 0: Override audit
+
+Each key in the top-level `overrides:` map in `pnpm-workspace.yaml` exists for one of two reasons: to resolve a **peer-dependency conflict**, or to enforce a **security floor** (pin a transitive dependency at or above a patched version to clear a known advisory). The two are detected by different tests, and an override is obsolete only when removing it regresses **neither**. A peer-dep test alone is blind to security-floor pins (a CVE pin never produces a peer-dep error), so it would wrongly delete every one of them. (pnpm 11 reads overrides here; the `package.json` `pnpm.overrides` field is no longer honored.)
+
+**Capture the advisory baseline first**, with every override still in place:
+
+```bash
+pnpm audit --json 2>/dev/null | jq -r '.advisories // {} | keys[]?' | sort -u > /tmp/audit-baseline.txt
+```
+
+Each `.advisories` key is one advisory ID; this file is the set of advisories the current overrides tolerate. (If a future pnpm emits the `vulnerabilities` shape instead of `advisories`, read whichever key is present, the goal is a stable ID set to diff against.)
+
+Then, for each override key, one at a time, leaving every other `pnpm-workspace.yaml` setting untouched:
+
+1. Temporarily remove that single key from the `overrides:` map.
+2. Run `pnpm dedupe`. A bare `pnpm install`, even `pnpm install --force`, short-circuits with "Already up to date" when only the `overrides:` map changed and leaves the lockfile untouched, so the toggle would not re-resolve and the test below would read the stale tree; `pnpm dedupe` performs a full install that re-resolves and applies the override change. See `wiki/dependencies/pnpm-overrides.md`. If it exits non-zero, restore the key, note as **retained (install error)**, and move to the next key, do not diagnose the failure or run the tests below for this key.
+3. **Peer-dep test:** run `pnpm ls 2>&1` and scan for peer-dep errors.
+4. **Security-floor test:** run `pnpm audit --json` and extract its advisory IDs the same way. Any ID present now but absent from `/tmp/audit-baseline.txt` means removing this override reintroduced a known vulnerability.
+
+   ```bash
+   pnpm audit --json 2>/dev/null | jq -r '.advisories // {} | keys[]?' | sort -u > /tmp/audit-now.txt
+   comm -13 /tmp/audit-baseline.txt /tmp/audit-now.txt   # IDs this removal introduced
+   ```
+
+5. Decide:
+   - Peer-dep errors **or** any newly introduced advisory → the override is load-bearing. Restore the key. Note as **retained** (record which test failed, and the advisory ID + package if it was the security-floor test).
+   - Neither regressed → the override is obsolete. Leave it removed. Note as **removed**.
+
+Always `pnpm dedupe` after each toggle, never a bare `pnpm install`, which cannot apply an overrides-only change. The security-floor test is **severity-agnostic on purpose**: an override is a deliberate maintainer artifact, so any advisory it was silencing, at any severity, is reason to keep it. This is intentionally stricter than the high/critical surfacing floor in `.claude/rules/dep-audit.md`: deciding whether to *delete a maintainer's pin* warrants more caution than deciding whether to *surface* an advisory for review. A maintainer who wants a pin gone removes it by hand.
+
+**After the toggle loop, assert the lockfile matches config.** Once every retained key is restored, the lockfile's top-level `overrides:` block must list exactly the keys present in the `overrides:` map in `pnpm-workspace.yaml`. Compare the two; on any drift (a config key missing from the lockfile block, or vice versa) the floor is unapplied, so run `pnpm dedupe` once more and re-run the quality gate. This assertion is the guarantee that the audit never leaves a stale, silently-disabled security floor. Note the tradeoff: `pnpm dedupe` re-optimizes the whole tree, so a single toggle can yield a wider lockfile diff than the one key it touched (it may also drop now-redundant transitives). That broader diff is expected, and correct, the alternative is an unapplied override.
+
+### Wave A input
+
+You are given the **Wave A apply set**: the `wave_a` entries from the
+orchestrator's discovery, minus any group the human chose to skip. Each entry
+carries `name`, `current`, `latest`, `is_pinned`, and `kind` (`minor` or
+`patch`). Do **not** run `pnpm outdated` or re-discover, the ESLint 9.x cap, the
+release-age cooldown, and companion-group expansion are already applied. If the
+Wave A apply set is empty, skip straight to the quality gate (Wave B groups, if
+any, are handled by the orchestrator).
+
+### Wave A (batch minor/patch)
+
+1. Build install args. For each entry: if `is_pinned` use the exact target, else use `^<latest>`. Example: `pnpm add foo@1.2.3 bar@^4.5.0 ...`.
+2. Run the single `pnpm add` command.
+3. Run `pnpm ls 2>&1`. Scan for peer-dep errors.
+4. On error: try one targeted fix in the `overrides:` map in `pnpm-workspace.yaml` (e.g. add a `parent>child` pin), then `pnpm dedupe` to apply it, a bare `pnpm install` won't re-resolve an overrides-only change.
+5. If still failing: revert the offending packages (`pnpm add <pkg>@<previous>`) and log them as **skipped** with the reason.
+6. Run the quality gate (below). If it fails, revert the entire Wave A batch.
+
+### Quality gate
+
+```bash
+pnpm typecheck
+pnpm lint
+pnpm test --run
+pnpm pw
+pnpm build
+```
+
+### Return value
+
+Report back to the orchestrator with:
+
+- Override audit results (removed / retained)
+- Wave A results (updated packages, any skipped)
+- Quality gate results
+
+---
+
+## Branch creation (after discovery)
+
+Phase 1 already exited if nothing was outstanding or the human cancelled or
+skipped everything, so reaching here means the apply set is non-empty. After the
+Haiku agent returns:
+
+- Updates were confirmed. **Immediately bust the update-check cache** so the statusline reflects the post-update state on the next session regardless of whether this run completes. Use the Write tool to overwrite `.gaia/local/cache/shared/update-check.json`, preserving `gaiaCurrent`, `gaiaLatest`, `gaiaHasUpdate`, and `serenaLangDrift` from the existing cache (read it first), but setting `outdatedCount` to `0` and `checkedAt` to the current Unix timestamp. If `serenaLangDrift` is absent from the existing cache, omit it (the next refresher recomputes it). If the cache file does not exist, skip this step. (Snoozed groups are already excluded by the ledger on the next real check.)
+
+- If `SHOULD_CREATE_BRANCH=true`, create the branch now and **remember that you created it** (this determines publish behavior in Phase 8):
+
+```bash
+git checkout -b chore/update-deps-$(date +%Y-%m-%d-%H-%M)
+# CREATED_NEW_BRANCH=true, used in Phase 8
+```
+
+Otherwise (`SHOULD_CREATE_BRANCH=false`), proceed on the current branch and **remember that you did NOT create a new branch**.
+
+## Phase 5: Wave B (per-group major bumps)
+
+Use the **Wave B groups from the apply set** (the payload's `wave_b` minus any
+group the human skipped). If there are none, skip to Phase 6.
+
+For each Wave B group, classify complexity and assign a model:
+
+**Opus** (`model: "opus"`): `react-router`, `react`, `typescript`, `storybook`
+
+**Sonnet** (`model: "sonnet"`): `eslint`, all other groups
+
+Spawn one agent per group (or sequentially if resource-constrained), passing it these instructions:
+
+---
+
+### Wave B group instructions
+
+You are upgrading the `{GROUP}` dependency group from `{FROM}` to `{TO}`.
+
+**Scope.** Operate on the **root pnpm project only**.
+
+- Run every `pnpm` command from the project root. Never `cd` into subdirectories or use `-C <path>`.
+- For code edits and grep-style searches, scan only `app/`, `test/`, and root config files (`*.config.*`, `tsconfig*.json` at root). Do **not** scan the entire repository, sibling directories may be independent pnpm projects with their own `package.json`/`pnpm-lock.yaml`, and they are out of scope for this skill.
+- A directory is "out of scope" if it contains its own `package.json` or `pnpm-lock.yaml`. Skip those subtrees entirely.
+
+1. **Fetch migration guide** via WebFetch using the table below. If no URL applies, scan the GitHub release notes.
+2. **Install** the group, **from project root only**:
+   - `storybook` group: run `pnpm dlx storybook@latest upgrade` (Storybook's own upgrade tool migrates config alongside the version bump).
+   - All others: `pnpm add <pkg1>@<latest> <pkg2>@<latest> ...` for every group member present in root `package.json`.
+3. **Conflict check**: `pnpm ls 2>&1`. On peer-dep error, attempt one `overrides:` fix in `pnpm-workspace.yaml`, then `pnpm dedupe` to apply it, a bare `pnpm install` won't re-resolve an overrides-only change. If still failing, revert the group and skip with reason.
+4. **Apply breaking changes** within root scope: from the migration guide, identify code-affecting changes (renamed APIs, removed exports, config schema changes). Grep `app/`, `test/`, and root config files for affected patterns. Edit only files inside root scope.
+5. **Verify root `package.json` moved**: read root `package.json` and confirm every group member you bumped now shows the new version. If `pnpm add` did not change root's spec (e.g. the dep is declared in a sibling project's `package.json` and not actually consumed by root code), revert the install and report the package as **skipped, not a root dep**. The skill does not resolve cross-project declarations; the maintainer must clean up manually. If the dep is in root `package.json` but has zero call sites in root scope, that's a phantom declaration: bump it anyway so the version stays current, and add a one-line note `phantom: no call sites in root` to the breaking-changes report so the maintainer can investigate.
+6. **Quality gate**:
+   ```bash
+   pnpm typecheck
+   pnpm lint
+   pnpm test --run
+   pnpm pw
+   pnpm build
+   ```
+   On failure, make one remediation pass: apply fixes inferred from the migration guide, then re-run the gate once. If it still fails after that single re-run, revert the entire group and log as skipped. Do not keep iterating.
+
+Migration guide URLs:
+
+| Group        | URL                                                                        |
+| ------------ | -------------------------------------------------------------------------- |
+| react-router | `https://reactrouter.com/upgrading/v7`                                     |
+| react        | `https://react.dev/blog` (find the major-version post)                     |
+| tailwindcss  | `https://tailwindcss.com/docs/upgrade-guide`                               |
+| storybook    | `https://storybook.js.org/docs/migration-guide`                            |
+| vitest       | `https://vitest.dev/guide/migration`                                       |
+| playwright   | `https://playwright.dev/docs/release-notes`                                |
+| eslint       | `https://eslint.org/docs/latest/use/migrate-to-9` (or relevant X)          |
+| typescript   | `https://www.typescriptlang.org/docs/handbook/release-notes/overview.html` |
+| msw          | `https://mswjs.io/docs/migrations`                                         |
+| vite         | `https://vite.dev/guide/migration`                                         |
+
+Report back: updated packages, breaking changes applied, any skipped reason, quality gate results.
+
+---
+
+## Phase 6: Post-update override audit
+
+For every override that was **retained** in Phase 0, repeat the full Phase 0 toggle test (both the peer-dep and the security-floor check, re-capturing a fresh advisory baseline against the now-updated tree) now that surrounding packages have moved. A version that landed in Wave A or Wave B may have resolved the original peer-dep conflict or carried the patched transitive dependency that made a security-floor pin obsolete. The toggle test re-resolves with `pnpm dedupe`, never a bare `pnpm install`, exactly as in Phase 0. This is the last phase that mutates the `overrides:` map, so the lockfile settles here: close it with the same assertion Phase 0 runs, the lockfile's `overrides:` block must list exactly the keys in `pnpm-workspace.yaml`, repairing any drift with `pnpm dedupe` and re-running the quality gate. Run this as a **Haiku agent**.
+
+## Phase 7: Final report
+
+Build the report **only** from the agent reports returned to you, plus the snooze decision from Phase 1. Do not add rows from your own memory of the run.
+
+**What goes in each section:**
+
+- **Updated packages**: every package the Haiku agent or a Wave B agent reports as `updated`. Nothing else.
+- **Breaking changes applied**: only what Wave B agents report editing in the codebase. Empty if no Wave B group ran.
+- **Overrides audited**: only what the Phase 0 / Phase 6 audit reports. If the `overrides:` map was empty, write "None" and move on.
+- **Skipped packages**: _only_ packages that were attempted and reverted mid-run (peer-dep conflict, quality-gate failure, manual revert by an agent). **Never** include packages filtered out before installation by a policy rule (e.g. the ESLint 9.x cap or the release-age cooldown). Those are silent by design, surfacing them is noise that adopters see every run. When you cannot tell whether a package was policy-filtered before installation or attempted and reverted mid-run, include it in Skipped, a spurious row is recoverable but a silently dropped real failure is not. If nothing was actually skipped during the run, write "None" or omit the table.
+- **Snoozed (deferred this run)**: the companion groups the human chose to skip in the preview, with the version each was snoozed at. These quiet the statusline for 14 days (or until a newer version ships); they are not failures. Omit the section if the human chose "Update all".
+- **Quality gate**: the gate result reported by the agents, verbatim.
+
+If a section would be empty, write "None" rather than leaving it blank or fabricating filler.
+
+Print the report. Do not commit.
+
+```
+## Migration Report
+
+### Updated packages
+| Group | Package | From | To | Type |
+| --- | --- | --- | --- | --- |
+
+### Breaking changes applied
+- [group] description
+
+### Overrides audited
+- Removed: <key>, <reason>
+- Retained: <key>, <reason>
+
+### Skipped packages
+| Package | Reason |
+| --- | --- |
+
+### Snoozed (deferred this run)
+| Group | Snoozed at version | Resurfaces |
+| --- | --- | --- |
+
+### Quality gate
+| Step | Result |
+| --- | --- |
+```
+
+## Phase 8: Publish
+
+**If nothing was updated** (all packages were already up to date or all were skipped), skip this phase entirely.
+
+**Commit the update.** Stage and commit the applied changes on the current branch. Write the message to a temp file first, then commit from it:
+
+```bash
+git add -A
+git commit -F <commit-message-file>
+```
+
+The commit **subject** must be `chore(deps): <concise summary of what moved>` (use `chore(deps-dev):` when every bump is a devDependency). That subject is load-bearing: it triggers the dep-bump bypass in the merge gate (`wiki/concepts/PR Merge Workflow.md`), so the PR is turnkey-mergeable without a code-audit-frontend marker. Routing the message through a file rather than `-m` keeps package-manager keywords from tripping shell-hook false positives. The Wave agents already ran the full quality gate, so nothing else is owed before committing.
+
+Then branch on where the run started.
+
+**If a new branch was created** (interactive run, you were on `main`/`master` at pre-flight and branched off):
+
+1. Push the branch:
+   ```bash
+   git push -u origin <branch-name>
+   ```
+2. Open a PR against `main`. Title: the commit subject. Body: the migration report rendered as markdown, via `--body-file` on a temp file (same false-positive reason). Capture the PR number `<N>` and its URL.
+3. **Merge when green, then clean up locally.** This step runs only on a `main`/`master` run, it is what "completes the flow." Merge per `wiki/concepts/PR Merge Workflow.md` (the `chore(deps)` title clears its audit-marker gate via the dep-bump bypass):
+   ```bash
+   gh pr merge <N> --squash --delete-branch --auto
+   ```
+   `--auto` queues the merge so GitHub lands it once the required checks pass (or immediately if they are already green). If the repo has auto-merge disabled and `gh` rejects `--auto`, wait for the required checks to pass (`gh pr checks <N>`), then re-run the merge without `--auto`.
+
+   `gh pr merge` can exit success while the merge is still queued, so verify the terminal state before touching the local checkout:
+   ```bash
+   for i in 1 2 3 4 5; do
+     state=$(gh pr view <N> --json state -q .state)
+     [ "$state" = "MERGED" ] && break
+     sleep 30
+   done
+   ```
+   - **`state == MERGED`** → clean up locally, then print the merged PR URL:
+     ```bash
+     git checkout main && git pull origin main
+     git branch -D <branch-name>
+     git fetch --prune origin
+     ```
+   - **still not `MERGED`** (auto-merge queued, checks not yet green) → print the PR URL and note that auto-merge is queued and will land when the checks pass. **Do not** delete the local branch or switch off it, the PR is still open.
+
+**If you were already on a non-main branch** at pre-flight, or running in CI (no new branch was created):
+
+1. Push the branch:
+   ```bash
+   git push
+   ```
+2. Do not open a PR and do not merge, the branch owner (the user, or the CI workflow) drives it from here.
+
+If any `git push`, `gh pr create`, or `gh pr merge` above exits non-zero, print the command's error and STOP. Do not retry, force-push, or amend, a rejected push, failed PR creation, or blocked merge is the user's call to resolve (usually a manual rebase, a remote-side block, or a failing check).

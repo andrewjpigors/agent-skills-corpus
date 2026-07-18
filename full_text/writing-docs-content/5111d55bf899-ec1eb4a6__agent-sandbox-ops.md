@@ -1,0 +1,440 @@
+---
+name: agent-sandbox-ops
+description: >
+  Operate safeslop isolation profiles safely: host and container.
+---
+
+# Agent Sandbox Ops Skill
+
+Use this skill whenever tasks involve runtime isolation, network limiting, or
+file transfer between host and sandboxed runtimes.
+
+## Required pre-read
+
+1. `CONTRIBUTING.md`
+2. `AGENTS.md`
+3. `README.md`
+4. Relevant specs under `specs/`
+
+## Command map
+
+- `safeslop validate` — validate a policy against the embedded schema.
+- `safeslop list` — list available profiles.
+- `safeslop catalog list [--bundles] --output json` — list curated package catalog entries/bundles for profile creation UIs; the bundle-list envelope includes `data.defaults` (agent -> default bundle) for UI inheritance.
+- `safeslop catalog bump <pkg> --to V [--security]` — bump a pin: resolve all-arch digests, enforce the version policy (LAW-A/B/C/D + monotonic floor + soak), write `catalog.cue`+`catalog.json`, print a plan sheet. `--security` waives the soak window only, never a LAW.
+- `safeslop catalog propose-version <pkg>` — list upstream candidates newest-first with would-be digests + blast radius (read-only).
+- `safeslop catalog add <pkg> --kind K --version V [--sha256 arch=hex]...` — add a pinned entry (channel ban + full validate).
+- `safeslop catalog audit` — report staleness (versions-behind), yanked/unmaintained advisories, suggested lane (read-only).
+- `safeslop bundle add|remove <name> <pkg>...` — mutate bundle membership, re-validating references.
+- `safeslop bundle list --output json` — list curated bundles.
+- `safeslop profile create --name N --agent A --environment E [--bundle B] [--package P] [--no-default-bundle] [--dry-run] --output json` — create or update a `safeslop.cue` profile; `--no-default-bundle` deliberately omits automatic agent-runtime inclusion and can leave an agent unable to launch, while `--dry-run` resolves packages/recipe and returns the engine's three-section safety evaluation without writing.
+- `safeslop profile delete <name> [safeslop.cue] --output json` — remove exactly one project profile: load, render, and validate the full remaining CUE before writing; builtins are never mutable through this command.
+- `safeslop profile credentials set <profile> [safeslop.cue] --provider github|forgejo [--use-origin] [--repo owner/name] [--write-repo owner/name] --output json` — engine-owned CUE mutation for GitHub/Forgejo repo scopes; preserves other credential providers (including `credentials.pi`)/secrets and clears only the opposite forge.
+- `safeslop profile credentials clear <profile> [safeslop.cue] --output json` — remove only `credentials.github`/`credentials.forgejo`, deleting the `credentials` object if it becomes empty.
+- `safeslop creds list|show [<profile>] --output json` — inspect the credential posture of `safeslop.cue` profiles (declared creds + value-free readiness status, including Pi OAuth provider/model/lifetime only); read-only, never reveals secret values, refs, private paths, or exact expiry.
+- `safeslop creds link|unlink|status` — manage host-only account links in `~/.config/safeslop/accounts.cue` (refs + non-secret ids only); `creds status --output json` is the Emacs account-link status envelope.
+- `safeslop creds gc --host H --repo owner/repo ... [--dry-run|--yes] [--output json]` — narrow Forgejo deploy-key cleanup. It defaults to dry-run; `--yes` is required to delete and conflicts with `--dry-run`. It considers only exact safeslop titles in the explicitly named repos, rechecks before deletion, and never expands egress or container authority.
+- `safeslop profile defaults --output json` — list signed-binary builtin launchable defaults (`claude`, `fish`, `pi`, `zsh`), distinct from scaffold `profile presets`; each uses container/deny, the pinned buildable `personal` image inputs, and an allowlisted read-only host projection. Project profiles take precedence and an invalid local policy fails closed.
+- `safeslop profile show <name> --output json` — inspect a resolved project or builtin profile with package set, dry-run image recipe, source/path/hash provenance, and structured Authority/Trust/Readiness evaluation.
+- `safeslop lock [profile] --output json` — write repo-root `safeslop.lock.json` for the selected profile's recipe identity.
+- `safeslop trust` — approve a policy's exact bytes for launch. Required by every launch lane: `safeslop run <profile>`, `session create --profile`, and the Emacs client all share this gate (specs/0072); an untrusted or changed `safeslop.cue` is refused with a `TRUST_REQUIRED` envelope.
+- `safeslop untrust [safeslop.cue]` — remove that host approval; future launches fail closed until the current bytes are reviewed and trusted again.
+- `safeslop run <profile>` — launch a trusted profile; host-tier profiles require a per-launch yes/no comprehension gate before the agent starts.
+- `safeslop session create --profile <name> [--name <label>] --output json` — create an Emacs-visible session from an existing profile; create/list/status JSON includes value-free `credential_scopes` (credential kind, non-secret target, and access/scope only), the record includes resolved recipe/image metadata for the portal, and the Emacs client streams slow first-use image-build output into `*safeslop session progress*` with the final exit status. `--name` sets an optional display name and is combinable with `--profile`.
+- `safeslop session create --agent <claude|pi|fish|zsh> --environment <host|container> --workspace <dir> [--name <label>] [--trust-host] --output json` — create an ad-hoc Emacs-visible session record (`--environment` is required). A host ad-hoc session runs the agent unconfined with your host credentials, so it requires an explicit `--trust-host` acknowledgement (specs/0072); container ad-hoc sessions do not. The interactive Emacs new-session flow prompts for that host acknowledgement before appending `--trust-host`, and if a host ad-hoc create returns `TRUST_REQUIRED` without a policy path, it offers one retry with the flag. `--name` sets an optional display name. `claude-code` remains accepted as a compatibility alias for `claude` but is not advertised in new UI/docs.
+- `safeslop session run --session-id <id> [--detach]` — atomically claim and run a one-shot session agent under safeslop isolation. A second launch is refused with `SESSION_ALREADY_RUNNING`; a stopped record is refused with `SESSION_STOPPED` and requires creating a new session. Host-tier sessions require the per-launch yes/no comprehension gate first; for `--detach`, the gate runs before the supervisor is spawned. Coupled (default) needs a controlling terminal (Emacs supplies one via `make-term`); with no usable TTY it emits the `PTY_UNAVAILABLE` contract error and the caller switches to the `--output jsonl` status monitor. `--detach` launches a per-session supervisor that owns the agent + its PTY, serves it over a per-session unix socket, and returns immediately (the buffer is freed).
+- `safeslop session attach --session-id <id>` — rejoin a detached session's agent over its socket under a controlling terminal, exiting with the agent's code; one active attach at a time. No usable TTY emits `PTY_UNAVAILABLE`.
+- `safeslop session status --session-id <id> --output <json|jsonl>` — inspect or monitor session state; JSON/JSONL carries value-free credential scope for profile-backed sessions, and a running detached session also reports its `socket`.
+- `safeslop session stop --session-id <id> --revoke-credentials --output json` — stop idempotently, reconciling liveness/process identity before signalling, revoking revocable ephemeral credentials before termination when requested, terminating the process (a detached supervisor's whole process group), removing the socket, and wiping the host stage dir. Pi OAuth cleanup is local wipe, not issuer revocation.
+- `safeslop session rm --session-id <id> --output json` — permanently remove one stopped/created session record so the portal does not accumulate dead-session corpses. Refuses a running session (stop it first); revokes any still-live staged credentials and wipes the host stage dir before deleting, so removal never orphans secrets. Returns `data.removed` (the removed id).
+- `safeslop session rename --session-id <id> --name <label> --output json` — set (or, with an empty `--name`, clear) a session's human display name. Allowed in any status (created, running, or stopped) since a label touches no boundary, credential, or process state. The name is validated (control/format/bidi characters rejected, so it cannot break the JSONL line protocol or spoof a status) and, when set, is surfaced as `data.name` in the session envelope and shown in the portal. Unknown id → `SESSION_NOT_FOUND`; a rejected name → `INVALID_ARGUMENT`.
+- `safeslop session prune --output json` — remove every stopped session record in one call, leaving created and running sessions untouched. Runs the liveness/process-identity reconcile first, so a crashed session (marked `running` but whose process is gone or whose PID was reused) is persisted as `stopped`; stale sockets and host stage dirs are swept in the same pass. Returns `data.removed` (the removed ids). In Emacs these are the portal's `x` (remove one) and `X` (prune) keys.
+- `safeslop doctor` — report available tools and isolation tiers.
+- `safeslop down` — tear down safeslop-managed host-container stacks by label, on the detected container runtime.
+- `safeslop gc [--until <age>] [--keep <N>]` — remove only unreferenced safeslop-managed images; current resolving profiles, the repo lockfile, and live sessions anchor images.
+
+Emacs-specific session guards: coupled and detached container run actions perform
+a best-effort runtime preflight via `safeslop doctor --json`; a shadowed Docker
+helper aborts before launching the terminal/subprocess and lists the
+selected/shadowed paths, while failed/old doctor output proceeds to the CLI.
+Socket reattach does not preflight Docker because it rejoins an existing
+supervisor rather than selecting a runtime.
+
+## Container runtime
+
+The `container` tier runs on an **ambient, user-provided** container runtime; safeslop detects
+one and drives it, and never installs, upgrades, or manages one. Have one present:
+
+- **docker** (Docker Desktop / OrbStack / any docker-compatible CLI) — the only runtime
+  egress-verified for `network: deny` today.
+- **podman** — `podman` plus a working `podman compose`.
+- **lima** — a user-managed lima instance on a containerd/nerdctl template (`lima nerdctl`).
+
+Selection: `SAFESLOP_CONTAINER_RUNTIME=docker|podman|lima` forces one (used or fail closed — no
+silent fallback); otherwise auto-detect **docker → podman → lima** (first with a working compose
+wins); none present fails closed naming all three. Runtime CLIs are resolved once through safeslop's
+sanitized host PATH and carried as absolute paths into later commands. Same-file PATH aliases (such
+as two OrbStack Docker symlinks) count as one helper; distinct binaries still fail closed. This
+point-in-time identity check does not pin an executable against the existing validate-to-exec TOCTOU
+window. A `network: deny` profile is **refused on podman/lima** (not yet egress-verified) unless
+`SAFESLOP_ALLOW_UNVERIFIED_RUNTIME=1` is set; teardown (`down`, the startup sweep, session reap) is
+never gated.
+
+## Default policy
+
+- `environment` is required (`host` | `container`) — there is no default tier
+  (specs/0053 removed the macOS Seatbelt `sandbox` tier; later cleanup removed
+  active VM operator paths).
+- Prefer `environment: "container"` with `network: "deny"` for everyday agent work:
+  network-bound agents (claude, pi) need their runtime + egress inside the boundary.
+- Use `environment: "host"` only when you accept no isolation and can pass the per-launch consent gate.
+- Do not mount or expose host credential directories to agents.
+- A profile's non-empty relative `workspace` is policy-relative; an empty ad-hoc
+  workspace is invocation-relative. Launch must resolve one canonical existing
+  workspace and keep it disjoint from the private runtime stage.
+- Valid hostile spelling (spaces, quotes, colons, Unicode, literal `$`,
+  Compose-looking text) is allowed because Compose is rendered as typed long-form
+  binds. Controls/format characters, invalid UTF-8, missing paths,
+  non-directories, unsupported bind source types, and workspace-stage overlap fail closed.
+
+## Profile safety evaluation
+
+Resolved `profile show` and unsaved `profile create --dry-run` envelopes carry an
+additive v1 evaluation in fixed **Authority → Trust → Readiness** order. Authority
+states what a compromised run can reach and is derived only from the decoded
+profile. Trust reports exact saved-policy approval or embedded-builtin provenance
+(an unsaved preview is N/A). Readiness reports whether local workspace, sanitized
+helpers, runtime/toolchain, and required account-link metadata are available now.
+A failed Trust or blocked Readiness may prevent launch but never reduces Authority.
+There is no aggregate score, grade, combined color, or overall verdict.
+
+Readiness is a timestamped, point-in-time local snapshot. It performs no live
+forge, cloud, cluster, registry, credential, or secret-value probe and cannot
+promise remote authentication or authorization. Treat it as inspection, never as
+an authorization token; the launch CLI re-applies its trust, host-consent,
+helper/runtime, network, and credential gates.
+
+Credential scopes contain only value-free target metadata (for example
+`owner/repo`, registry host, role/profile, API scope, cluster label, or the
+literal Pi OAuth provider/model) plus access, lifetime, and basis. They exclude secret values/refs, private-key or
+account-link refs, staged paths, and private host paths; unknown is never treated
+as read-only. Remediation is typed engine guidance only: do not derive rules from
+prose, auto-edit CUE, or auto-trust a policy.
+
+In Emacs Profiles, `RET`/`i` Inspect renders a fresh `profile show`; compose
+`C-c C-c` shows the exact unsaved dry-run before save; and `r` fetches the engine
+evaluation before final launch confirmation. If evaluation is absent, the client
+labels the `risk`/`risk_axes` compatibility view **Legacy safety summary — trust
+and readiness unavailable**. Present malformed/unsupported evaluation is loud
+`UNKNOWN — update required`, never a legacy green fallback. Custom host-mount
+authoring, live remote permission inference, and arbitrary action execution remain
+deferred.
+
+## Common workflows
+
+### Inspect or create a builtin session from any directory
+
+```bash
+safeslop profile defaults --output json
+safeslop profile show pi --output json
+safeslop session create --profile pi --output json
+```
+
+The four builtins (`claude`, `fish`, `pi`, `zsh`) start at container + deny,
+carry no Pi OAuth credential opt-in, and resolve the `personal` bundle from pinned image inputs: binary URL/SHA256 per
+architecture and exact Debian-snapshot apt coordinates. Pi/Claude project pi
+instructions and skills, Fish projects only demand-loaded `functions/*.fish` and
+`completions/*.fish`, and Zsh projects Zsh/Starship config. Builtin Fish never
+copies or auto-executes host `config.fish`/`conf.d`; normal container-owned Fish
+startup is authoritative. Create a fresh Fish session after this contract update,
+because exact-byte builtin hash fidelity rejects old records. On macOS/Linux the
+engine follows relative source-path links that stay inside the pinned home root
+and exact-spelling absolute links whose raw target is a proper descendant of that
+same root. Absolute targets are converted to components and walked from the
+retained root descriptor; they are never canonicalized or reopened as pathnames.
+The engine copies descriptor-pinned bytes into a private `0700` per-session
+snapshot and mounts only that snapshot before copying into ephemeral home.
+`~/.config -> dotfiles/files/.config` is supported. Retained optional Fish globs
+select physical regular matches; terminal links/directories/special files are
+never followed or opened and yield one aggregate `skipped-nonregular` status while
+eligible siblings continue. Direct/configured links, required globs, and recursive
+trees remain fail-closed for outside-root or alternate-spelling absolute targets,
+relative escapes, excluded targets, internal links, loops, special files, mount
+crossings, or concurrent changes; unsupported OS/filesystem safety has no pathname
+fallback. This spec 0110 resolver refinement leaves builtin CUE bytes and hashes
+unchanged. Only the workspace is a read-write
+host mount. Never broaden projection to all home, raw Git config, or
+credential-bearing paths.
+A project profile of the same name wins with normal trust/provenance checks, and
+an invalid project policy fails closed rather than falling back. Progressive
+egress remains an explicit operator action on the created session; it does not
+change the builtin policy.
+
+### Create and inspect a profile
+
+```bash
+safeslop catalog list --bundles --output json
+safeslop profile create --name review --agent claude --environment container --network deny --output json
+safeslop profile show review --output json
+safeslop lock review --output json
+safeslop session create --profile review --output json
+safeslop validate
+safeslop list
+safeslop run review --dry-run
+```
+
+In Emacs, `C-c s F` opens the Profiles surface, including signed-binary `claude`,
+`fish`, `pi`, and `zsh` defaults labelled `builtin` in Source. A same-named project
+profile wins; builtin rows are launchable/inspectable but immutable. Use `RET`/`i` to inspect a
+profile's resolved packages/egress/recipe and Authority/Trust/Readiness findings,
+`r` to review a freshly fetched engine evaluation before offering to launch a
+session from the row, `e` to edit the CUE at that profile's block,
+`c` to open `*safeslop profile compose*`, `C` to clone, `D` to confirm an
+engine-owned deletion and refresh in place, and `g` to refresh. The compose buffer
+shows catalog defaults as selected/locked inherited rows; its Name, Agent,
+Environment, Network, and Workspace rows are `RET`-editable, and an agent change
+recomputes default-package inheritance. `L` means a row is included by its displayed
+source and cannot be partly toggled. It marks local project-language suggestions and
+uses `RET` to toggle unlocked rows, `?` for bundle/package help, `g` to refresh, and
+preserves the logical row and scroll context in every showing window for either
+operation. Compose remains creation-only so it cannot partially overwrite
+unrepresented existing-profile fields. The `Automatic agent bundle` control is the all-or-nothing opt-out for
+that automatic inclusion: it emits `--no-default-bundle`, retains explicit
+selections, and may leave the agent without its runtime, but it does not relax
+isolation, network, or workspace-only file reach. `C-c C-c` requests the engine
+`profile create --dry-run` Authority/Trust/Readiness preview before the final
+write, and `q` cancels. `r` fetches a fresh `profile show` evaluation and displays
+it before final launch confirmation; the CLI launch gates remain authoritative.
+Arbitrary custom host mounts are deferred until a mount capability model is
+specified.
+`C-c s K` opens the Credentials surface. Universal raw/Evil keys: `A` links a
+GitHub App/Forgejo account using refs/ids only, `U` unlinks the reusable account,
+`R` configures a project profile's origin/manual `owner/repo` scopes, and `X`
+clears only that profile's forge scopes (`g` refresh raw, `gr` Evil). Create or
+clone a project profile first; builtins are immutable. `R` works when credential
+rows are empty, preloads existing read/write scopes, confirms full replacement,
+and retains value-free failed account/scope drafts for `K → A/R` retry. `U`
+warns that profile scopes remain and will fail staging until relinked or cleared.
+`R`/`X` write through `profile credentials set|clear`; review and re-trust changed policy bytes. Live
+repo discovery remains deferred.
+
+`C-c s P` opens the Sessions portal. The tab strip shows each surface's direct
+switch key (`P` Sessions, `F` Profiles, `K` Credentials); `TAB`/`S-TAB` or
+`[`/`]` cycle between them, and the strip is mouse-clickable. Portal rows include a
+value-free `Creds` column sourced from `credential_scopes`, showing only credential
+kind, non-secret target, and access/scope. Portal row keys: `RET`/`o`
+state-aware open, `r` run, `R` run detached, `A` reattach, `i` details, `s`
+stop/revoke, `x` remove one stopped session, `X` prune all stopped sessions, `c`
+new, `g` refresh, `a` pause/resume auto-refresh. Live buffers opened from the
+portal are named and annotated with profile/project, tier/net, and value-free
+credential scope. Their persistent safety chrome mode-line repeats literal
+environment/network posture plus a value-free credential count; hover help
+expands the honest posture and safe scope names. A stopped/failed row visibly
+includes its bounded structured failure reason; `i` shows the engine-owned
+summary/action/code. A fast terminal startup failure opens that durable detail,
+refreshes the portal, and emits one deduplicated value-free notification. Legacy
+`last_error` is fallback-only, and raw resolver paths/OS errors/values are never
+rendered. Each in-place refresh keeps point on the same
+session and preserves window scroll, so
+it never jumps the cursor out from under a row action key; session-mutating row
+actions refresh the portal in place instead of popping a JSON result buffer over
+the dashboard.
+
+### Maintain the catalog (bump / propose / add / audit)
+
+The catalog source of truth is `internal/engine/policy/catalog.cue` (rendered to embedded
+`catalog.json`; `make check` fails on drift). `bump`/`add` and `bundle add`/`remove`
+re-emit **both** files in lockstep and print a reviewable plan sheet. Run from the repo
+root (or pass `--catalog-dir`); add `--output json` for the machine contract.
+Buildable npm catalog packages (`claude-code`, `pi`, `pnpm`) also require a
+per-package `package.json` + `package-lock.json` with transitive SRI. The
+package→binary→script policy registry is closed: arbitrary npm package names,
+foreign sources, missing integrity, extra lock projects, wrong binaries, or
+unreviewed lifecycle scripts fail `make check-npm-locks`. Only selected lock
+projects are copied into the Docker build context, and credential staging is never
+sent to the builder.
+
+```bash
+safeslop catalog propose-version ripgrep          # survey candidates first (read-only)
+safeslop catalog bump ripgrep --to 14.2.0          # enforce LAWs, write cue+json, plan sheet
+safeslop catalog bump ripgrep --to 2.0.0 --security   # CVE lane: waives soak, never a LAW
+safeslop catalog audit                            # staleness + advisory lanes
+safeslop catalog add mytool --kind binary --version 1.0.0 --sha256 amd64=$(…) --sha256 arm64=$(…)
+safeslop bundle add personal jq                   # re-validates the bundle
+make check                                        # proves cue↔json sync, vet, tests
+```
+
+Bumps enforce: **A** atomic all-arch real digest, **B** stable channel only,
+**C** apt coordinates the Debian-snapshot timestamp, **D** one version per name — plus
+the monotonic floor and a SemVer-aware soak window. Non-semver kinds (apt/calver) are
+flagged `requires-human-confirm`. The policy is canonized in
+`specs/research/2026-06-30-version-policy-flo.md`.
+
+### Trust and launch
+
+```bash
+safeslop trust
+safeslop run review
+safeslop untrust   # revoke approval when this repo should no longer launch without review
+```
+
+### Pi OAuth access-only project profile
+
+Builtins never inherit host Pi OAuth. Add this exact opt-in only to a reviewed
+project profile, then run `safeslop trust`:
+
+```cue
+profiles: luna: {
+	agent:       "pi"
+	environment: "container"
+	network:     "deny"
+	credentials: pi: {
+		provider: "openai-codex"
+		model:    "gpt-5.6-luna"
+	}
+}
+```
+
+Launch reads only default `~/.pi/agent/auth.json`. It accepts proven relative
+same-HOME links and exact absolute same-HOME descendant links while requiring
+current-user ownership and `mode & 0022 == 0` on every reached directory (`0755`
+is valid). The leaf remains exact regular `0600`, single-link, bounded, and on the
+same mount; lexical lock checks and a fresh full proof reject outside/ambiguous
+links, writable ancestry, mount crossings, and races. Launch also requires more
+than 15 minutes of access lifetime and copies only a synthetic access snapshot
+into tmpfs. It never copies refresh/account/other-provider data and never renews. A lingering
+Pi lock is handled by waiting for host Pi or running `pi --list-models
+gpt-5.6-luna`, then starting a new session. The bearer retains provider-default
+replay authority: Luna selection and egress rules do not cryptographically
+downscope it. After a denied observation, explicitly grant and later revoke
+`chatgpt.com:443` for this session only. Stop/remove/reconcile wipes local copies
+but does not revoke upstream access. Emacs MVP inspection is value-free and has no
+Pi mutation action; edit/review/re-trust CUE manually.
+
+### Container profile
+
+```cue
+profiles: container_review: {
+	agent:       "claude"
+	environment: "container"
+	network:     "deny"
+	egress:      [".internal.example.com"]
+}
+```
+
+The container tier enforces egress by topology: the agent sits on an internal
+network and reaches HTTP(S) through the proxy allowlist. In `network: deny`, the
+proxy allowlist is domain-only: numeric IP-literal destinations are denied before
+matching, reverse-DNS lookups are disabled for the domain ACL, and Docker's
+external DNS forwarding is pinned to the container loopback (local service names
+such as `proxy` still resolve). Agent launches are hard-set to uid/gid 1000 in
+Compose, matching the image user and writable tmpfs home.
+
+Runtime ownership is single-owner. Direct `safeslop run` creates a random
+`run-<32 lowercase hex>` identity from 128 bits of OS randomness after approval;
+that id labels the stage, Compose project, marker, cleanup, and dead-run reap.
+New session records use the random session id as layout-2 runtime identity. Legacy
+records without runtime-layout fields reconstruct the old stage from
+`session-<id>` plus the canonical-workspace hash; historical backend `system`
+normalizes to Docker. Before the first live egress mutation, a running legacy
+session installs and ACKs its unchanged durable generation; bootstrap uncertainty
+tears the boundary down. Existing deployed sessions therefore remain stoppable and
+are not rewritten on read.
+
+Compose has exactly one read-write host bind: the canonical workspace at
+`/workspace`. The runtime stage, projected builtin snapshots, Squid config,
+allowlist, and proxy overlay are read-only binds with `create_host_path:false`.
+Every dynamic scalar is quoted/escaped, including literal `$`, so valid hostile
+paths do not gain YAML structure or Compose interpolation.
+
+The proxy image is the reviewed `ubuntu/squid` OCI index digest plus locked
+linux/amd64 and linux/arm64 manifests, checked by `make check-proxy-image-lock`.
+Compose uses the digest reference and runs Squid as a hardened non-root service
+with `cap_drop: ALL`, no-new-privileges, read-only root, PID limit, and only
+live-required nosuid/nodev tmpfs paths. Container image builds are integrity-pinned
+but not hermetic or bit-reproducible: production builds still contact selected
+registries/upstreams to fetch URL/SHA256 binary artifacts, Debian snapshot apt
+packages, and npm package-lock/SRI tarballs.
+
+### Progressive session egress
+
+For a running or created `container` + `network: deny` session, inspect denied,
+value-free proxy observations and make an explicit session-only choice:
+
+```bash
+safeslop session egress observations --session-id ID --output json
+safeslop session egress grants --session-id ID --output json
+safeslop session egress grant --session-id ID --host api.example.com --port 443 --output json
+safeslop session egress dismiss --session-id ID --host api.example.com --port 443 --output json
+safeslop session egress revoke --session-id ID --grant-id G --output json
+```
+
+Observations never grant traffic. For Pi OAuth Luna, `chatgpt.com:443` follows
+this same explicit flow and is not statically allowed. A grant is `session-grant / this session`;
+`dismiss` is **Keep denied** acknowledgement state, not authority, and later
+traffic reappears for review. Neither mutates `profile.egress` or `safeslop.cue`.
+On a running session, a grant that adds a new session-grant row or a revoke that
+removes one force-replaces the proxy and returns success only after it ACKs the
+exact grant generation/revision
+and overlay hash by label and mounted file digest. Created sessions persist changes
+for launch without a live replacement; dismiss remains record-only. Proxy
+replacement revokes old tunnels. Widening persists its upper bound before
+activation; narrowing ACKs the smaller runtime set
+before committing it. An unprovable runtime or commit outcome triggers full
+boundary teardown and persists only `network_authority_uncertain`; it never
+guesses which authority is live. If teardown is not proven, egress mutations
+remain blocked until explicit stop/reap. Launch also requires the proxy
+configuration check and local listener to become ready before the agent starts.
+Failure removes the partial stack and persists only the structured
+`network_proxy_unavailable` summary/action/code, never raw Squid/Compose output.
+
+For a typed durable rule for **future sessions**, use `persistentEgress`, never
+legacy `egress`:
+
+```cue
+persistentEgress: [{fqdn: "api.example.com", port: 443}]
+```
+
+Use `safeslop profile egress preview|add|remove <profile> [safeslop.cue] --host
+api.example.com --port 443 --expected-policy-hash HASH --output json`. Preview
+is a value-free CUE-delta/hash review and never writes. Add/remove require the
+exact current hash, fail closed when stale, atomically validate the complete
+policy, leave it untrusted, and affect only a new session after `safeslop trust`.
+They must never be used as a shortcut to alter a running session.
+
+Only `container` + `network: deny` is enforceable; host and `network: allow`
+sessions are rejected. IP literals, private/link-local/metadata, broker/mint,
+wildcard, suffix, URL, and non-80/443 targets are non-grantable. Emacs labels
+container deny **Deny (progressive review)** without granting authority; its
+session detail shows a passive count and `v` opens operator review. There `a`
+allows now, `k` keeps denied, and `A` previews a hash/CUE delta before a separate
+explicit add. Agent traffic never triggers a modal, focuses a buffer, edits CUE,
+or changes authority.
+
+## Safety checklist
+
+- Keep network allowlists narrow and documented.
+- Prefer read-only credentials; use write credentials only for explicit workflows.
+- Verify `safeslop doctor` output before depending on a tier; shadowed protected helpers are unsafe
+  and must be removed/fixed rather than ignored.
+- Run `safeslop down` to clean up safeslop-managed host-container stacks after interrupted work.
+- Run `safeslop gc --keep 2` only when you want to reclaim unreferenced managed images; it preserves profile/lock/live-session anchors.
+
+## Verification
+
+```bash
+go test ./internal/engine/container/ -v
+make check-assets check-npm-locks check-proxy-image-lock
+make check-active-surface-drift
+make check
+make build
+# Opt-in host-Docker gates:
+make test-container-images
+make test-progressive-egress-smoke
+```
+
+For Emacs surface, Doom, or Evil binding changes, also run the local UI matrix:
+`make test-emacs-ui-matrix`.  It keeps `make check` hermetic while covering raw
+Emacs, a Doom `map!` shim, locally installed Evil, Doom+Evil, and an opt-in
+personal command via `SAFESLOP_UI_PERSONAL_CMD` (`SAFESLOP_UI_REQUIRE_PERSONAL=1`
+makes that personal slot mandatory locally).

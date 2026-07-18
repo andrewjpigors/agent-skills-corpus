@@ -1,0 +1,945 @@
+---
+name: forge-codex
+description: Use Forge's curated MCP tools to read, create, update, link, review, and navigate Forge records and specialized domain surfaces. Trigger for Forge planning, People and peer sharing, calendar, preferences, Psyche, questionnaires, health, wiki, artifacts, Movement, Life Events, Life Force, Workbench, agent-runtime, and guided question-flow requests where Codex must choose the correct batch or dedicated API path.
+---
+
+# Forge Codex
+
+Use this plugin when you want Codex to work directly with Forge through the curated
+MCP tool surface.
+
+## Live Contract And Missing-Information Gate
+
+Before the first Forge read or write in a session, call
+`forge_get_agent_onboarding`. Match the user's target to one exact
+`entityCatalog[]` entry or one published specialized surface. Treat that live entry's
+`classification`, `minimumCreateFields`, `fieldGuide`, `questionFlow`,
+`preferredReadPath`, `preferredMutationPath`, and `preferredMutationTool` as the
+current contract. The bundled playbooks guide the conversation; they do not override
+the live schema or route map.
+
+Build a private missing-information diff before asking anything:
+
+- remove details the user already supplied
+- remove optional fields and published defaults that do not change meaning,
+  accountability, timing, retrieval, safety, or route selection
+- on update, read the current record first and preserve every field the user did not
+  ask to change
+- ask one Psyche question at a time; for logistical records, one compact question may
+  group inseparable details such as start, end, and timezone
+- act when no blocking ambiguity remains instead of asking a polished extra question
+
+If the target is absent from live onboarding, refresh once. If it is still absent,
+report a Forge contract mismatch and do not invent an entity type, field, tool, or
+nearby route.
+
+Forge has planning, health, preferences, Psyche, questionnaire, self-observation,
+wiki surfaces, the Artifact Store, read-model surfaces, and specialized Movement, Life Events, Life Force, and Workbench domain surfaces.
+The planning side covers goals, projects, strategies, tasks,
+habits, tags, notes, calendar events, recurring work blocks, task timeboxes, live
+task runs, and agent-authored insights. The health side covers `sleep_session`,
+`workout_session`, and the read-only `training_load` surface for cardiovascular
+load and HR zone review, plus the `weight_loss` read and nutrition evidence
+workflow. The preferences side covers `preference_catalog`,
+`preference_catalog_item`, `preference_context`, and `preference_item` plus the game,
+judgments, and signals. The Psyche side covers values, patterns, behaviors, beliefs,
+modes, guided mode sessions, flashcards, trigger reports, event types, reusable emotion
+definitions, `questionnaire_instrument`, `questionnaire_run`, and the note-backed
+self-observation calendar. The Artifact Store is a specialized CRUD surface for
+trusted stored files such as spreadsheets, documents, PDFs, text, structured text,
+and images; artifact relationships use the general `entity_links` model, and Codex
+must not download, decrypt, open, execute, preview, transform stored file bytes, or
+submit artifact passwords. Read-model surfaces include `operator_overview`,
+`operator_context`, `calendar_overview`, `sleep_overview`, `sports_overview`,
+`training_load`, `weight_loss`, and the self-observation calendar; ask what
+practical decision the read should support before adding write-shaped questions.
+Preferences Workspace is also read-model-only. Use it to explain inferred scores from
+judgments, signals, overrides, evidence count, and uncertainty before offering a
+dedicated Preferences action. A workspace read never initializes or refreshes state;
+if it is missing, report that state and use an explicit Preferences action only after
+the user chooses it.
+Movement, Life Events, Life Force, and Workbench use dedicated route
+families and must not be forced through batch CRUD. Forge is explicitly multi-user: every stored entity can
+belong to a typed `human` or `bot` user through `userId`, reads can scope to one or
+many users with `userId` or repeated `userIds`, and cross-user links are valid when
+the request is intentional.
+
+Write to Forge only with clear user consent. If the user is still thinking aloud,
+help first and offer storage lightly only when it would genuinely help. When the user
+does want to save or update something, ask only for what is missing or unclear.
+
+Keep the operation lane explicit across every entity family. Normal stored entities
+can be added, updated, reviewed or navigated, linked, or placed. Action workflows use
+verbs such as start, continue, complete, adjust, judge, signal, publish, sync, or
+observe. Specialized CRUD uses lifecycle verbs such as create, read, update, sync,
+reconnect, delete, or browse. Read models need a practical read question and scope.
+Movement, Life Events, Life Force, and Workbench use review, correct, repair, run, inspect,
+publish, preserve, calendar-sync, ticket-import, or status lanes through their dedicated
+route keys. Psyche entities need
+formulation before storage when the user wants understanding rather than a direct
+save.
+
+In the planning hierarchy, `issue` and `subtask` are not standalone batch entity
+types. Store issues, tasks, and subtasks through `entityType: "task"` with
+`data.level: "issue" | "task" | "subtask"`; use `projectId` and
+`parentWorkItemId` for placement. Never call batch CRUD with `entityType: "issue"`
+or `entityType: "subtask"`.
+
+## Entity Route Posture
+
+Before asking for lower-level details, decide whether the user's request is normal
+stored-entity CRUD, an action workflow, specialized CRUD, or a specialized domain
+surface. Name the path plainly enough that another Codex agent could follow it
+without guessing.
+
+Keep that route plan internal unless the user asks for implementation detail. Track
+the intent, entity or dedicated domain lane, exact tool or route key, target
+identifiers, and one missing detail privately; with the user, ask about the real
+thing: the span, place, event, artifact, weekday, flow, run, node, belief sentence, parent record, or
+save confirmation. Report product actions such as "saved the belief", "corrected the
+missing stay", "updated the weekday energy pattern", or "read the failed node" before
+any route-key or endpoint detail.
+
+Use the known-target fast path when the user already supplied the object, action, and
+likely lane. For normal entities, ask only for parent, owner, or duplicate-disambiguation that changes the write. For task hierarchy, ask only for the project,
+issue, or parent task that changes placement. For Movement, ask only for the missing
+interval, boundary, saved object, or confirmation. For Life Events, ask only for the missing event id, start/end span, place, calendar match, ticket artifact, travel status target, or confirmation. For Life Force, ask only for the
+weekday, profile field, signal intensity, or planning effect. For Workbench, ask only
+for the missing flow, run, node, input, output, or preservation choice. For direct
+Psyche saves, ask one accuracy or consent question instead of restarting exploration.
+
+Use the active-listening turn contract before deepening: reflect the specific stake,
+working shape, or product object in one sentence; decide internally whether the next
+answer would change wording, placement, timing, route scope, support action,
+verification read, preservation choice, or consent; then ask one question. For Psyche,
+name the felt stake, protection, prediction, payoff, cost, or value conflict, and when
+a functional loop or belief sentence is already visible, offer one tentative
+hypothesis plus one fit-or-correction question instead of another broad exploration.
+For logistical records, keep the reflection short and ask for the operational detail.
+
+Use the route execution handoff before any read, write, run, repair, or publish call:
+freeze the accepted user-facing target, choose exactly one lane, use batch CRUD only
+for catalog entities, use named tools or documented routes for specialized CRUD and
+action workflows, and verify an action workflow's selected operation against live
+onboarding `actionEntities.routeKeys`, `routeTools`, and `methodRoutes` before calling.
+For Movement, Life Events, Life Force, Workbench, or Artifact Store verify `routeKey`,
+method, path, and `pathParams` from live onboarding `methodRoutes` before calling.
+Never hide placeholders in `query` or `body`, and never guess a nearby path.
+
+- Batch CRUD is the default for normal stored entities, including `goal`, `project`,
+  `strategy`, `task`, `habit`, `tag`, `person`, `note`, `insight`, `calendar_event`, `life_event`,
+  `work_block_template`, `task_timebox`, all main Psyche records, basic Preferences
+  CRUD records, `questionnaire_instrument`, `sleep_session`, and `workout_session`.
+- `person` is an owner-scoped local record about someone in the user's life. It is
+  not a Forge `User`, agent identity, peer credential, pairing, or sharing grant.
+  Search, create, update, soft-delete, restore, and replace its general `links`
+  through `forge_search_entities`, `forge_create_entities`,
+  `forge_update_entities`, `forge_delete_entities`, and
+  `forge_restore_entities`. Search the intended owner by name or alias before
+  creating a possible duplicate. Ask only for the accepted display name, owner, and
+  context that serves the user's stated purpose. Do not ask for contact details,
+  birthday data, private notes, or sensitive facts by default.
+- `forge_call_people_route` exposes only these server operation IDs:
+  `listPeopleReadModel`, `getPersonContext`, `scanPeopleWikiCandidates`,
+  `previewPeopleWikiAssociations`, `applyPeopleWikiAssociations`,
+  `interpretPersonQuestion`, `executePersonQuestion`, and
+  `listPersonQuestionHistory`. Use the exact route-key variant schema. People reads
+  require `people:read:basic`; private, contact, sensitive, and restricted fields
+  need their narrower read scopes; Wiki association steps require the published
+  People and Wiki scopes; typed questions require `people:read:basic` plus
+  `peer:query`.
+- `forge_call_peer_route` exposes only `listPeerRequests`,
+  `listPeerRelationships`, `getPeerRelationship`, `listPeerDevices`,
+  `listPeerGrants`, `getPeerSyncStatus`, and `getPeerDiagnostics`. These status
+  reads require `peer:status`. Both People and peer tools require a configured
+  local agent token with the listed scopes. An operator session does not substitute
+  for that token.
+- Pairing acceptance, invitation control, consent changes, grant acceptance,
+  countering, widening or revocation, relationship revocation, device approval or
+  removal, resync requests, approval credentials, and human-presence ceremonies are
+  human-only. They are absent from agent tools. Never emulate them with batch CRUD or
+  a nearby route.
+- `wiki_page`, `calendar_connection`, and `artifact` are specialized CRUD surfaces.
+  Use `forge_call_wiki_route` for the complete Wiki lifecycle, the narrower Wiki
+  helpers for settled operations, `forge_call_calendar_connection_route` for the
+  complete calendar connection lifecycle, the narrower calendar connect/sync helpers
+  when those actions are already settled, and the Artifact Store route family for paged metadata listing,
+  trusted file upload, metadata,
+  static scan, LLM metadata enrichment, generic entity links, trust state, versions,
+  and audit. Batch CRUD may search, update, delete, and restore artifact metadata, but
+  it must not create file artifacts or access file bytes.
+- `task_run`, `work_adjustment`, `questionnaire_run`, `preference_judgment`,
+  `preference_signal`, and `self_observation` are action workflows. Use their
+  dedicated tools or note-backed write model instead of generic entity create/update
+  when the action route is the real product behavior.
+- Attention is a bounded, actor-scoped read-and-action surface, not batch CRUD.
+  Use `forge_call_attention_route` with `list` before acting unless the user supplied
+  a stable item id from a current queue. Use only actions returned in
+  `allowedActions`, pass the id through `pathParams.id`, and never dismiss blocked or
+  overdue work. The runtime path is `/api/v1/attention-inbox`.
+- Pins and recently viewed records use `forge_call_entity_navigation_route`.
+  `list` returns bounded canonical pins plus this agent actor's own recent history;
+  `touch` records an exact in-scope entity only after the agent actually viewed it.
+  Agents cannot pin or unpin. Those choices remain human-operator-only in the Forge
+  Action Bar. The runtime path is `/api/v1/entity-navigation`.
+- Movement, Life Events, Life Force, and Workbench are specialized domain surfaces. Read
+  `forge_get_agent_onboarding.entityRouteModel.specializedDomainSurfaces` and use
+  the dedicated route families for timeline/overlay repair, Life Events chronology/calendar/ticket/status, energy templates/signals,
+  and flow execution/results. When an adapter exposes `forge_call_movement_route`,
+  `forge_call_life_event_route`, `forge_call_life_force_route`, or `forge_call_workbench_route`, use those
+  route-key tools after the conversation has selected the lane. Life Force may be
+  keyed as `lifeForce` and as the entity-style alias `life_force`; both names point
+  to the same `/api/v1/life-force/*` route family.
+- Artifact Store route keys live under
+  `forge_get_agent_onboarding.entityRouteModel.specializedCrudEntities.artifact`.
+  When Codex exposes `forge_call_artifact_route`, use it for artifact list with
+  `limit`/`offset`, trusted upload, metadata update, static rescan, LLM enrichment,
+  generic entity-link replacement, trust state, versions, or audit. Use batch CRUD
+  for artifact metadata delete/restore. Do not expose or call the download, password
+  download, decrypt, or existing-artifact encryption routes from agent tools;
+  password and byte routes are human-operator-only. Codex may read
+  `contentProtection` metadata and password hints, but must not receive, store,
+  submit, or route artifact passwords.
+- Wiki page, calendar connection, and Artifact Store route keys and method/path maps
+  all live under
+  `forge_get_agent_onboarding.entityRouteModel.specializedCrudEntities`. Use the
+  published `routeKeys` and `methodRoutes` for those specialized CRUD surfaces before
+  calling lower-level routes, and cross-check OpenAPI when debugging a contract
+  mismatch. Do not guess wiki, calendar connection, or artifact paths from memory.
+- For `wiki_page`, prefer `forge_call_wiki_route` when the job needs the complete
+  lifecycle, especially `readBySlug` or `delete`. Resolve and read the exact page
+  before update or delete, pass `id` or `slug` through `pathParams`, and read the
+  affected page, list, search, or health state back when verification matters.
+- For `calendar_connection`, prefer `forge_call_calendar_connection_route` with the
+  published `list`, `discover`, `discoverMacOSLocal`, `rediscover`, `create`, `update`,
+  `sync`, or `delete` key. List first for existing-record changes unless an exact id
+  came from a current read, pass that id through `pathParams.id`, and list again when
+  read-back is needed to prove the intended result.
+- The live onboarding `routeKeys` list, `methodRoutes` map, and specialized
+  route-key tool schemas include the exact route-key to method/path map. Use
+  `routeKeys` for the allowed names and `methodRoutes` as the
+  route-key-to-`METHOD /api/v1/...` source of truth when checking specialized
+  methods, especially POST aggregate reads such as Movement `selection` and DELETE
+  repair paths. When a route key's exact path contains placeholders such as `:id`,
+  `:weekday`, `:slug`, `:runId`, `:nodeId`, or `:pointId`, pass those values in
+  `pathParams` using the placeholder names exactly. Do not place IDs inside
+  `routeKey`, `query`, or `body`, invent a raw route string, or ask the user to
+  choose an endpoint when the lane already selects one. If that schema and live
+  onboarding disagree, trust the live onboarding for the current call and treat the
+  disagreement as a Forge contract bug to fix, not as a reason to guess a nearby
+  route.
+- If a specialized route-key tool is unavailable, stale, or missing the needed route
+  key, do not fall back to generic batch CRUD and do not invent a nearby raw path. Read
+  live onboarding, use the exact `methodRoutes` entry for the selected Movement, Life Events, Life
+  Force, or Workbench lane, and cross-check OpenAPI only to confirm the same method
+  and path.
+- Before every Movement, Life Events, Life Force, or Workbench call, run a route-contract
+  handshake internally: select the product lane in plain language, verify the matching
+  `routeKey` against live onboarding `routeKeys` and `methodRoutes`, fill any
+  placeholders through `pathParams`, and ask the user only for the missing product
+  noun that fills the placeholder. If the contract is missing a lane the product
+  clearly supports, report a contract bug instead of silently using generic batch
+  CRUD or a nearby route.
+
+Concrete route-key examples for internal use:
+
+- Attention active queue:
+  `{"routeKey":"list","query":{"state":"active","limit":25,"offset":0}}`
+- Attention snooze:
+  `{"routeKey":"snooze","pathParams":{"id":"attn:insight:ins_123"},"body":{"until":"2026-07-11T09:00:00.000Z","note":"Review after the morning planning block."}}`
+- Attention restore:
+  `{"routeKey":"restore","pathParams":{"id":"attn:insight:ins_123"}}`
+- Person search before create:
+  `{"searches":[{"entityTypes":["person"],"query":"Jon","userIds":["user_operator"],"limit":20}]}`
+- Person create after the user accepts the wording:
+  `{"operations":[{"entityType":"person","data":{"userId":"user_operator","displayName":"Jon","relationshipCategory":"friend","shortDescription":"Friend I often cycle with."}}]}`
+- People collection read:
+  `{"routeKey":"listPeopleReadModel","query":{"userId":"user_operator","query":"Jon","limit":20}}`
+- Calendar availability interpretation:
+  `{"routeKey":"interpretPersonQuestion","pathParams":{"personId":"person_jon"},"body":{"question":"What is Jon doing next Monday?","timeZone":"Europe/Zurich"}}`
+- Goal-horizon interpretation:
+  `{"routeKey":"interpretPersonQuestion","pathParams":{"personId":"person_jon"},"body":{"question":"What are Jon's big goals for the next few months?","timeZone":"Europe/Zurich"}}`
+- Cycling aggregate interpretation:
+  `{"routeKey":"interpretPersonQuestion","pathParams":{"personId":"person_jon"},"body":{"question":"How much has Jon been cycling this month?","timeZone":"Europe/Zurich"}}`
+- Typed question execution: pass the `interpretationId`, `interpretationHash`, and
+  complete typed `query` returned by `interpretPersonQuestion` unchanged to
+  `executePersonQuestion`. Do not hand-author a broader projection, interval, field
+  list, or precision. The active directional grant still limits the result.
+- Typed question reporting: preserve `result.state` and
+  `result.metadata.source`, `asOf`, `receivedAt`, `validUntil`,
+  `completeness`, `precision`, and `redactedFields`. Say when an answer is
+  cached or stale, name material redactions, and never infer withheld fields.
+- Existing peer relationship status:
+  `{"routeKey":"getPeerRelationship","pathParams":{"relationshipId":"peer_relationship_123"}}`
+- Movement all-time read:
+  `{"routeKey":"allTime","query":{"userIds":["user_operator"]}}`
+- Movement timeline read:
+  `{"routeKey":"timeline","query":{"from":"2026-05-01T00:00:00.000Z","to":"2026-05-06T23:59:59.999Z","userIds":["user_operator"]}}`
+- Movement selection aggregate:
+  `{"routeKey":"selection","body":{"from":"2026-05-01T00:00:00.000Z","to":"2026-05-14T23:59:59.999Z","placeIds":["place_home"],"userIds":["user_operator"]}}`
+- Movement trip detail:
+  `{"routeKey":"tripDetail","pathParams":{"id":"trip_123"}}`
+- Movement settings read:
+  `{"routeKey":"settings","query":{"userIds":["user_operator"]}}`
+- Movement settings update:
+  `{"routeKey":"settingsUpdate","body":{"trackingEnabled":true,"publishMode":"draft_review","retentionMode":"aggregates_only"}}`
+- Movement known-place creation:
+  `{"routeKey":"placeCreate","body":{"label":"Home","centerLat":46.2044,"centerLon":6.1432,"radiusMeters":120,"userId":"user_operator","note":"Primary home boundary for future time-in-place reads."}}`
+- Movement known-place update:
+  `{"routeKey":"placeUpdate","pathParams":{"id":"place_home"},"body":{"label":"Home office","radiusMeters":90,"note":"Tighten the boundary so clinic visits do not count as home."}}`
+- Movement missing-stay correction:
+  first `{"routeKey":"userBoxPreflight","body":{"kind":"stay","startedAt":"2026-05-06T13:00:00.000Z","endedAt":"2026-05-06T15:00:00.000Z","placeLabel":"Home","userId":"user_operator"}}`,
+  then `{"routeKey":"userBoxCreate","body":{"kind":"stay","startedAt":"2026-05-06T13:00:00.000Z","endedAt":"2026-05-06T15:00:00.000Z","placeLabel":"Home","userId":"user_operator","note":"Manual correction after reviewing the timeline."}}`
+- Movement saved-overlay update:
+  `{"routeKey":"userBoxUpdate","pathParams":{"id":"box_manual_123"},"body":{"endedAt":"2026-05-06T15:30:00.000Z","note":"Extended after checking the timeline detail."}}`
+- Movement saved-overlay delete:
+  `{"routeKey":"userBoxDelete","pathParams":{"id":"box_manual_123"}}`
+- Life Events timeline read:
+  `{"routeKey":"timeline","query":{"limit":100,"offset":0}}`
+- Life Event detail read:
+  `{"routeKey":"read","pathParams":{"id":"lifeevent_123"}}`
+- Life Event calendar sync:
+  `{"routeKey":"calendarSync","pathParams":{"id":"lifeevent_123"},"body":{"projection":"link_or_create"}}`
+- Mark calendar event as Life Event:
+  `{"routeKey":"fromCalendarEvent","body":{"calendarEventId":"cal_evt_123","eventType":"concert","importance":"meaningful"}}`
+- Import ticket artifact into Life Events:
+  `{"routeKey":"importTicket","body":{"artifactId":"artifact_ticket_123","createDraft":true,"useLlm":true}}`
+- Life Event travel status:
+  `{"routeKey":"travelStatus","pathParams":{"id":"lifeevent_123"}}`
+- Life Force overview:
+  `{"routeKey":"overview"}`
+- Life Force profile edit:
+  `{"routeKey":"profile","body":{"baselineDailyAp":24,"recoveryNotes":"Clinic-admin days need a lower expected afternoon load."}}`
+- Life Force weekday template edit:
+  `{"routeKey":"weekdayTemplate","pathParams":{"weekday":"monday"},"body":{"points":[{"hour":13,"freeAp":-4}]}}`
+- Life Force fatigue signal:
+  `{"routeKey":"fatigueSignal","body":{"signal":"tired","intensity":7,"note":"Sharp post-lunch dip after clinic admin."}}`
+- Workbench flow catalog:
+  `{"routeKey":"listFlows","query":{"status":"enabled","limit":24,"offset":0}}`
+- Workbench flow detail:
+  `{"routeKey":"flowDetail","pathParams":{"id":"flow_research_digest"}}`
+- Workbench box catalog:
+  `{"routeKey":"boxCatalog","query":{"limit":24,"offset":0}}`
+- Workbench flow creation:
+  `{"routeKey":"createFlow","body":{"title":"Research digest","slug":"research-digest","description":"Turn a topic into a cited digest with a stable published summary.","nodes":[],"edges":[]}}`
+- Workbench flow edit:
+  `{"routeKey":"updateFlow","pathParams":{"id":"flow_research_digest"},"body":{"description":"Keep the same input contract but add a stronger evidence-check node."}}`
+- Workbench flow deletion:
+  `{"routeKey":"deleteFlow","pathParams":{"id":"flow_research_digest"}}`
+- Workbench run history:
+  `{"routeKey":"runHistory","pathParams":{"id":"flow_research_digest"},"query":{"limit":10}}`
+- Workbench run detail:
+  `{"routeKey":"runDetail","pathParams":{"id":"flow_research_digest","runId":"run_123"}}`
+- Workbench run nodes:
+  `{"routeKey":"runNodes","pathParams":{"id":"flow_research_digest","runId":"run_123"}}`
+- Workbench node result:
+  `{"routeKey":"nodeResult","pathParams":{"id":"flow_research_digest","runId":"run_123","nodeId":"node_summary"}}`
+- Workbench published output:
+  `{"routeKey":"publishedOutput","pathParams":{"id":"flow_research_digest"}}`
+- Workbench latest node output:
+  `{"routeKey":"latestNodeOutput","pathParams":{"id":"flow_research_digest","nodeId":"node_summary"}}`
+- Workbench run execution:
+  `{"routeKey":"runFlow","pathParams":{"id":"flow_research_digest"},"body":{"input":{"topic":"question flow quality"}}}`
+- Workbench one-off input execution:
+  `{"routeKey":"runByPayload","body":{"flow":{"title":"One-off digest","nodes":[]},"input":{"topic":"question flow quality"}}}`
+- Workbench flow chat follow-up:
+  `{"routeKey":"chatFlow","pathParams":{"id":"flow_research_digest"},"body":{"message":"Refine the summary around API route risks and keep the published output stable."}}`
+- Artifact metadata list:
+  `{"routeKey":"list","query":{"query":"thesis budget","formatFamily":"spreadsheet","limit":20}}`
+- Artifact trusted upload:
+  `{"routeKey":"createWithBytes","body":{"idempotencyKey":"artifact-upload-budget-2026-07-16","originalFileName":"budget.xlsx","contentBase64":"<base64>","title":"Thesis budget workbook","sourceLabel":"Uploaded by the operator from local files","useLlmEnrichment":true,"links":[{"entityType":"project","entityId":"project_thesis","relationship":"evidence"}]}}`
+  Keep that per-file `idempotencyKey` unchanged only when retrying the exact same upload after a timeout or interrupted response. Use a new key when bytes or metadata change; Forge derives agent provenance from the authenticated token.
+- Artifact generic entity-link replacement:
+  `{"routeKey":"replaceGenericLinks","pathParams":{"id":"artifact_123"},"body":{"links":[{"entityType":"wiki_page","entityId":"note_thesis_budget","relationship":"embedded_reference"}]}}`
+- Artifact audit read:
+  `{"routeKey":"audit","pathParams":{"id":"artifact_123"}}`
+- Artifact forbidden agent action:
+  do not call `/api/v1/artifacts/:id/download`, submit artifact passwords, or decrypt/open/preview/transform bytes; hand the human to the Forge web app for download.
+
+## Project Management Hierarchy Rule
+
+Forge project management follows one explicit hierarchy:
+
+- Goal
+- Strategy (high level)
+- Project
+- Strategy (lower level when useful)
+- Issue
+- Task
+- Subtask
+
+Codex should preserve that hierarchy in both planning language and stored Forge
+records. Keep `project` and `strategy` first-class. Treat `issue`, `task`, and
+`subtask` as the execution layer below projects.
+
+Workflow rule:
+
+- Projects are PRD-backed initiatives.
+- PRDs become vertical-slice issues.
+- Issues are classified as `AFK` or `HITL`.
+- Issues and tasks can both preserve `executionMode` and structured
+  `acceptanceCriteria` when the contract needs them.
+- Tasks are ordered, AI-directed, and small enough for one focused Codex
+  session.
+- Subtasks remain lightweight child steps when needed.
+- `aiInstructions` is the dedicated task-execution field.
+- File targets, patterns, and done-shape guidance belong inside
+  `aiInstructions`, not in separate fields.
+- Placement and linking should respect the explicit chain
+  `project -> issue -> task -> subtask`.
+- When Codex helps place or link a work item, it should use a hierarchy-aware
+  search/create flow rather than a flat parent picker.
+
+Completion rule:
+
+- Completed work should preserve
+  `completionReport = { modifiedFiles[], workSummary, linkedGitRefIds[] }` and
+  send the referenced canonical records in `gitRefs`.
+- `modifiedFiles` supports at most 256 safe repository-relative paths of at most
+  512 characters each. `workSummary` supports 8,000 characters.
+  `linkedGitRefIds` supports at most 64 IDs of at most 128 characters each.
+- `gitRefs` supports at most 64 commit, branch, or pull-request records. Each
+  record requires `refType` and `refValue`; any `url` must use HTTP or HTTPS.
+- Every `linkedGitRefIds` value must identify one of the resulting task Git refs.
+- Completing a task run is atomic. Repeating the exact terminal closeout is
+  idempotent; changing the report, Git refs, or closeout note on replay conflicts.
+- A quick or native completion may truthfully leave `closeoutState: deferred`.
+  Read the task back after completion and inspect `closeoutState`,
+  `completionReport`, and `gitRefs` before claiming that closeout evidence exists.
+- Releasing a task run accepts only `actor`, `note`, and `closeoutNote`. It does
+  not accept completion evidence and does not complete the task.
+- Default workflow is direct commits to `main`.
+- Do not assume feature branches or pull requests unless the user explicitly
+  asks for them.
+
+Surface rule:
+
+- Forge exposes one mixed board for `project`, `issue`, `task`, and `subtask`.
+- Forge also exposes one compact hierarchy tree for the repeated hierarchy.
+- Both surfaces share filtering, level visibility, and human/bot ownership
+  controls.
+- Guided modal flows cover create, edit, move, link, and completion actions.
+
+## Conversation rules
+
+- For all entity creation or update flows, use
+  [`entity_conversation_playbooks.md`](./entity_conversation_playbooks.md) before you
+  fall back to field-by-field intake.
+- For Psyche entities, use [`psyche_entity_playbooks.md`](./psyche_entity_playbooks.md)
+  before storing `psyche_value`, `behavior_pattern`, `behavior`, `belief_entry`,
+  `mode_profile`, `mode_guide_session`, `flashcard`, `trigger_report`,
+  `event_type`, or `emotion_definition`.
+- Treat `event_type` and `emotion_definition` as psychologically meaningful Psyche
+  records, not plain taxonomy rows. Start from the repeated lived moment or felt
+  signature before settling the reusable label.
+- Let each question have one job. Know what you are trying to clarify before you ask it.
+- Ask one to three focused questions at a time. One is usually best when the user is
+  uncertain, reflective, or emotionally loaded.
+- Before asking another follow-up, run the playbook's minimum save-readiness
+  checkpoint: if accepted wording, meaningful body, route lane, target object or time
+  scope, and any ownership or placement that changes later use are already clear,
+  summarize once and write, read, run, or update instead of collecting optional
+  fields. For Movement, Life Events, Life Force, and Workbench, interpret target
+  object or time scope in the surface's own nouns: movement span/place/stay/trip,
+  Life Event/calendar match/ticket/travel status, weekday/profile/fatigue signal,
+  or Workbench flow/run/node/input/output.
+- Run the no-question gate before every follow-up: ask only if the answer can change
+  record type, accepted wording, hierarchy placement, owner/accountability, timing,
+  route lane, target object, correction, link, verification read, run/publish/preserve
+  action, or consent. If the question would only add warmth, completeness, optional
+  metadata, or form polish, skip it, summarize what is clear, and act or close.
+- Use the user-facing wording guard after openings, reads, writes, and confirmations:
+  do not say "that sounds important" unless you name the specific stake; do not ask
+  "what would you like to do with this?" when the user's verb or the read result
+  already makes one next action visible; replace endpoint, payload, mutation, batch
+  route, and route key language with product nouns such as missing stay, weekday
+  energy curve, saved flow, failed run, node output, belief sentence, pattern,
+  flashcard, wiki page, calendar connection, or task run; if no answer-changing
+  uncertainty remains, summarize the product result and stop.
+- Make the read's decision value explicit before any follow-up: what the read rules
+  in, what it rules out, and what one uncertainty remains. If no answer-changing
+  uncertainty remains, close cleanly instead of asking another question.
+- Before asking, decide what the user's answer would change: save, update, review,
+  link, schedule, correct, run, publish, preserve, enrich, open the UI, or stop. If
+  you cannot name that change, summarize and act instead of asking.
+- Use a natural progression of:
+  concrete example or intent -> working name -> purpose or meaning -> placement in
+  Forge -> operational details -> linked context.
+- Use those same playbooks for action-heavy non-Psyche flows such as
+  `work_adjustment`, `preference_judgment`, `preference_signal`, and specialized
+  `movement`, `life_force`, or `workbench` work so Codex starts from the user's real
+  job before choosing the route family.
+- Calibrate depth before deepening: choose quick capture, guided formulation,
+  review-first, or action-first. For quick capture, use the user's supplied wording,
+  ask only the one structural, accuracy, or consent detail that changes the write, and
+  do not force full exploration. For guided formulation, use active listening and
+  Psyche hypotheses when the user is trying to understand or name charged material.
+  For review-first, read before write-shaped questions. For action-first, act or ask
+  only for the missing target, span, event, artifact, weekday, flow, run, node,
+  correction, or consent.
+- When one message combines several jobs, sequence them instead of turning them into a
+  broad menu: read before a correction when the current truth is uncertain, formulate
+  the primary Psyche record before deriving a flashcard or note, and ask only for the
+  missing span, wording, flow, run, node, weekday, or link that changes the next
+  action.
+- Before deleting, archiving, invalidating, disconnecting, or replacing a record,
+  confirm the exact target and what should remain understandable; for Psyche records,
+  preserve therapeutic history unless the user clearly wants removal.
+- Treat questionnaire runs, self-observations, reflective notes, wiki pages,
+  sleep/workout enrichment, and preference signals as reflection-sensitive records:
+  ask what the record should help the user understand, decide, notice, remember, or
+  change later, then choose the right route. Do not flatten them into forms, but also
+  do not automatically turn them into full Psyche intake unless a belief, mode,
+  trigger report, or behavior pattern clearly emerges.
+- When the operation is not already explicit, identify the job first:
+  add, update, review, compare, navigate, link, or run. Skip that meta question
+  when the action is already obvious from the user's wording.
+- For emotionally meaningful non-Psyche records such as goals, habits, and notes,
+  reflect the meaning before you ask for the structure.
+- When updating, start with what is changing, what should stay true, and what prompted
+  the update now.
+- If the user already named the exact correction in usable language, keep the next
+  question narrow. Confirm only the scope, timing, or route-selecting detail that is
+  still missing, then act.
+- Treat partial answers as progress. Before another follow-up, identify what is
+  already usable: operation, entity or surface, target record or time span, working
+  wording, owner or placement, route lane, and consent. Ask only for the first missing
+  detail that changes the action: duplicate disambiguation, hierarchy parent, time
+  window, weekday, flow, run, node, correction, link, or save consent.
+- Do not ask for optional tags, priority, status, dates, color, links, or assignees
+  when accepted wording and meaningful body are enough unless that metadata changes
+  accountability, retrieval, or execution.
+- If the next answer would not change the route, wording, or save payload in a useful
+  way, stop asking and write.
+- When the user is vague, ask for one small concrete example, stake, or desired
+  outcome before you ask them to name the record.
+- When the user is clear, state the working formulation and ask only for the last
+  missing detail.
+- When the user wants to review, compare, inspect, or navigate an existing Forge
+  record, ask what they are trying to understand first and look up the existing record
+  before you reopen create or update intake.
+- For review-first requests, use the correct read posture before asking write-shaped
+  questions: shared batch search or read hints for normal entities, wiki/calendar
+  dedicated reads for specialized CRUD, read-model routes for overviews, and
+  Movement, Life Events, Life Force, or Workbench dedicated reads for those domain surfaces. After
+  the read, answer the practical question before asking for any save, correction,
+  link, run, enrichment, or publish detail.
+- If several actions are possible after the read, choose the one most directly
+  supported by what was learned and ask only for the missing detail that would permit
+  that action. Do not hand the user a broad menu after the read has already narrowed
+  the work.
+- After create, update, delete, restore, run, read, or repair actions, confirm the
+  user-facing record, action, and result in the user's language instead of reopening
+  intake. For batch creates and updates, confirm the working title or accepted wording,
+  container, and owner or placement only when those changed retrieval, accountability,
+  or execution; if optional tags, priority, status, color, links, dates, or assignees
+  were left provisional, say that plainly once. For action workflows, confirm the real
+  product action: task run started or completed, work adjustment applied, preference
+  judgment or signal submitted, questionnaire run updated or completed, calendar
+  connection synced, or self-observation note written. For Psyche saves, confirm the
+  accepted wording and whether it was saved as a first version, update, link, archive,
+  or distinct version; do not reopen origin, evidence, repair, or adjacent entity
+  mapping after the save unless that next object is already visible and materially
+  useful.
+- Before saving, briefly summarize the working formulation in the user's own language
+  when that would reduce ambiguity.
+- Search before creating duplicates when the entity is ambiguous. If a likely match
+  appears, ask whether to update it, link to it, or save a separate new record instead
+  of reopening the whole create flow.
+
+## Psyche-specific rules
+
+- Do not treat Psyche as a raw schema form.
+- Start from a recent concrete example before naming an abstract pattern, belief, or
+  mode.
+- If the user wants understanding before storage, the first reply should usually be a
+  brief reflection plus one orienting question.
+- Sound like a steady therapist-like collaborator: accurate, grounded, reflective, and
+  intentional, without drifting into diagnosis language or lecture mode.
+- After the first real answer, choose one follow-up lane at a time: situation,
+  sequence, meaning, protection, cost, longing/value, or tentative name.
+- Do not minimize functional analysis, trigger chains, behavior patterns, modes,
+  beliefs, or schema themes. Once at least one concrete example is clear, offer one
+  careful interpretive hypothesis when it would help the user understand the function,
+  protection, cost, belief, mode, or schema theme.
+- Phrase interpretive hypotheses as collaborative and testable, not as verdicts. A
+  good hypothesis says what the reaction may be protecting, predicting, relieving, or
+  costing, then asks whether that lands or needs correction.
+- For Psyche hypotheses, reduce the formulation burden. After one concrete example,
+  offer one tentative function, danger, protection, payoff, or cost hypothesis and ask
+  one fit-or-correction question. Do not make the user prove the experience, list
+  evidence, or design repair before the wording feels held.
+- Use the Psyche hypothesis examples when one concrete episode, belief sentence,
+  behavior, or mode voice is visible and another broad question would make the user do
+  all the interpretation alone. Offer one testable formulation, ask one correction
+  question, and then bridge to the saveable record if it lands.
+- Use the hypothesis-versus-reflection gate: reflect when no concrete cue, sequence,
+  belief sentence, behavior, body signal, mode voice, payoff, cost, or consequence is
+  visible; offer one discussable hypothesis when the cue, meaning, protection, payoff,
+  or cost is visible and another broad question would make the user carry the
+  interpretation alone. The hypothesis must change saveable wording, the primary
+  Psyche container, links, flashcard/support action, or the next question; otherwise
+  keep listening.
+- Do not keep asking broad exploratory Psyche questions after the cue, meaning,
+  protection, payoff, or cost is already visible. For `behavior_pattern`,
+  `belief_entry`, `mode_profile`, `mode_guide_session`, and `trigger_report`, the
+  next helpful move is usually one active formulation plus one correction question,
+  not another passive reflection.
+- Do not leave the user with interpretation alone. Once the hypothesis lands or is
+  corrected, name the primary Forge record it becomes and ask one accuracy or consent
+  question that moves toward saving the corrected formulation.
+- Use the hypothesis timing checkpoint before asking a second or third deepening
+  question: offer a hypothesis when one concrete episode, body cue, belief sentence,
+  behavior, or mode voice is visible and the hypothesis would change the record shape,
+  wording, links, or next action. Do not hypothesize yet when no concrete moment is
+  visible, the user only wants a direct mechanical save, the user is flooded or unsafe,
+  or the only available interpretation would be diagnosis-like, an origin story, or a
+  certainty claim.
+- In that first exploratory turn, keep the reply short, stay in plain prose, ask only
+  one question, and avoid naming a finished diagnosis-like formulation.
+- Reflect before the next question. Earn the formulation gradually from the user's own
+  words.
+- The next question should help the user feel more able to name the experience, not
+  more examined by a schema.
+- If the user already offers a usable belief sentence, value phrase, or mode name,
+  refine from their wording first instead of replacing it with a cleaner label too
+  early.
+- If the user already offers a usable belief sentence, functional loop, part voice,
+  trigger episode, value phrase, event kind, emotion signature, or flashcard message,
+  treat it as real data and ask one accuracy or consent question instead of reopening
+  origin, evidence, or repair.
+- For direct Psyche saves, do not reopen origin, evidence, or repair when the user
+  already supplied usable wording and asked to save it. Reflect the wording, ask one
+  accuracy or consent question, and save when accepted.
+- If the formulation already lands and no new answer would change the wording or the
+  write, stop asking and save.
+- After a Psyche formulation lands, use the Psyche save-readiness checkpoint from the
+  playbook. If the belief sentence, functional loop, behavior move, part-state,
+  trigger episode, value, event type, emotion definition, or flashcard cue/message is
+  true enough to save, ask at most one accuracy question and then use shared batch
+  CRUD.
+- For Psyche updates, start with what feels newly true, newly visible, or newly
+  inaccurate, then ask what should stay true before you change the wording or links.
+- If a fresh episode is what made a Psyche update visible, anchor in that episode
+  before renaming the durable belief, pattern, mode, or value.
+- When a belief, mode, value, pattern, or note becomes visible alongside the main
+  entity, name that gently and ask whether the user wants to map it too.
+- If the user shows imminent risk of self-harm, suicide, violence, inability to stay
+  safe, or severe disorientation, stop normal intake and prioritize urgent human
+  support instead.
+
+## Preferred workflow
+
+1. Start with `forge_get_operator_overview` unless the user is asking for one exact
+   known write.
+2. Search before creating duplicates with `forge_search_entities`; if a likely match
+   appears, ask whether to update it, link to it, or save a separate new record.
+3. Use batch tools for normal stored-entity work. Batch CRUD is the default for
+   simple entities, so do not spam the agent with hundreds of individual CRUD routes
+   when the shared routes already cover the job:
+   - `forge_create_entities`
+   - `forge_update_entities`
+   - `forge_delete_entities`
+   - `forge_restore_entities`
+     Use `forge_get_psyche_schema_catalog` before setting `belief_entry.schemaId`;
+     the schema catalog is read-only reference material, not a user-owned belief
+     record.
+4. Batch CRUD entities are:
+   - `goal`, `project`, `strategy`, `task`, `habit`, `tag`, `note`, `insight`
+   - `calendar_event`, `work_block_template`, `task_timebox`
+   - `psyche_value`, `behavior_pattern`, `behavior`, `belief_entry`,
+     `mode_profile`, `mode_guide_session`, `flashcard`, `trigger_report`,
+     `event_type`, `emotion_definition`
+   - `preference_catalog`, `preference_catalog_item`, `preference_context`,
+     `preference_item`
+   - `questionnaire_instrument`, `sleep_session`, `workout_session`
+     Keep context consolidation on its dedicated action: read both exact contexts,
+     then call `forge_merge_preferences_contexts` with one `sourceContextId` and one
+     `targetContextId` after explaining that judgments and signals move, the source is
+     deactivated, and the target is recomputed. Never emulate a merge with batch
+     deletion.
+     Treat entity-backed Preference Item enqueue and evidence changes as separate
+     actions. Use `forge_enqueue_preferences_item_from_entity` for an exact existing
+     Forge source instead of hand-building source links. Read the Preferences
+     Workspace before judgment, signal, or score correction; judgment and signal
+     require `userId`, `domain`, and `contextId`, while
+     `forge_update_preferences_score` also requires `itemId`. Use a signal for
+     favorite, veto, must-have, bookmark, neutral, or compare-later language, and
+     reserve score override for an explicit correction or protection of inferred
+     state. Treat `neutral` as removal of the current direct effect, not neutral
+     evidence: prior signals stay in history, but they no longer add direct weight,
+     evidence, or confidence. After writing, report the returned effective signal,
+     score, status, and confidence instead of predicting the result.
+5. Specialized CRUD entities are `wiki_page` and `calendar_connection`.
+   Use wiki pages whenever the user wants durable memory for a book, article, paper,
+   source, concept, person, conversation, project reference, recurring explanation,
+   or personal manual.
+6. Action and workflow entities are `task_run`, `questionnaire_run`, the
+   preferences game and judgment/signal tools, calendar sync/setup flows, work-log
+   adjustments, and similar action-heavy operations.
+7. Read-model-only surfaces include Today priority, operator overview/context, calendar overview,
+   Preferences Workspace, sleep overview, sports overview, training load, weight loss, and the
+   self-observation calendar.
+   In `forge_get_agent_onboarding.entityRouteModel.readModelOnlySurfaces`,
+   operator, calendar, Preferences, self-observation, sleep, sports, training-load, and
+   weight-loss read models are
+   available under camelCase names and entity-style aliases where useful,
+   including `todayPriority`, `operatorOverview`, `operatorContext`, `calendarOverview`,
+   `sleepOverview`, `sportsOverview`, `trainingLoad`, `weightLoss`, `preferencesWorkspace`, `operator_overview`,
+   `today_priority`, `operator_context`, `calendar_overview`, `self_observation`,
+   `sleep_overview`, `sports_overview`, `training_load`, `weight_loss`, and `preferences_workspace`. Treat those as
+   read-only overview surfaces, not batch CRUD entities.
+   Use `forge_get_operator_overview` for broad Forge status,
+   `forge_get_operator_context` for current work and risk, and
+   `forge_get_calendar_overview` before calendar-aware planning or scheduling
+   mutations.
+   Use `forge_get_today_priority` when the user asks what to do next. Follow its
+   explicit ready, continue-active, unresolved-active, overloaded,
+   capacity-limited, or no-work state instead of choosing the first focus,
+   backlog, or blocked task. Its schedule evidence covers task timeboxes; read
+   `forge_get_calendar_overview` separately when meetings or other calendar
+   events matter.
+   Use `forge_get_preferences_workspace` before explaining an inferred ranking, and
+   ground it in supporting judgments, signals, overrides, evidence count, and
+   uncertainty before offering a dedicated Preferences action.
+8. Use the task-run tools for truthful live work:
+   - `forge_start_task_run`
+   - `forge_heartbeat_task_run`
+   - `forge_focus_task_run`
+   - `forge_complete_task_run`
+   - `forge_release_task_run`
+   - on completion, forward bounded `completionReport`, canonical `gitRefs`, and
+     optional `closeoutNote`; exact terminal replay is idempotent and changed
+     closeout evidence conflicts
+   - read the task back because quick or native completion may truthfully leave
+     `closeoutState: deferred`
+   - release accepts only `actor`, `note`, and `closeoutNote`, never completion evidence
+9. Store structured recommendations with `forge_post_insight`.
+10. Use `forge_adjust_work_minutes` for `work_adjustment` when the user wants a
+    truthful signed minute correction on an existing task or project.
+11. Use the dedicated Preferences action tools for `preference_judgment` and
+    `preference_signal` rather than forcing those decisions through batch CRUD.
+12. Use `forge_get_sleep_overview`, `forge_get_sports_overview`,
+    `forge_get_training_load_overview`, and `forge_get_weight_loss_overview`
+    for health read models, and use `forge_update_sleep_session` and `forge_update_workout_session`
+    only for reflective enrichment on one already-existing record. Ordinary
+    `sleep_session` and `workout_session` CRUD belongs on the shared batch routes.
+    Use the dedicated nutrition tools for food/body/gut/appearance/subjective evidence:
+    `forge_search_foods`, `forge_search_nutrition_foods`, `forge_lookup_nutrition_barcode`,
+    `forge_log_food`, `forge_parse_food_log_with_chatgpt`,
+    `forge_log_body_checkin`, `forge_log_appearance_checkin`,
+    `forge_log_subjective_food_effect`, `forge_log_gut_checkin`,
+    `forge_get_nutrition_patterns`, `forge_start_nutrition_experiment`, and
+    `forge_update_nutrition_experiment`. Food parsing must use Forge's
+    configured `openai-codex` ChatGPT subscription connection, not a metered
+    OpenAI Platform API path.
+    For food logging, search Forge's nutrition catalog first and pass a matching
+    result as `item.foodId` to `forge_log_food`. If no result matches and a custom
+    food is needed, research calories plus protein, carbohydrate, and fat on the
+    internet or another reliable public nutrition source before logging it.
+    Custom/no-`foodId` items must include `caloriesKcal`, `proteinG`, `carbsG`,
+    and `fatG`; do not save name-only custom foods.
+    The training-load read model includes zone-time buckets, Combat/Base/Endurance
+    smart modes, next-week targets, and next-workout guidance.
+13. Movement, Life Events, Life Force, and Workbench are specialized Forge API surfaces rather
+    than simple batch entities. For Movement in particular, treat the surface as a
+    timeline of stays and trips that supports time-in-place questions, travel-history
+    review, manual overlays, edits, and links to other Forge records.
+    When those domains matter, consult
+    `forge_get_agent_onboarding` and follow its `entityRouteModel.specializedDomainSurfaces`
+    route families instead of trying to squeeze them through generic CRUD. When an
+    adapter exposes them, prefer `forge_call_movement_route`,
+    `forge_call_life_force_route`, or `forge_call_workbench_route` after selecting
+    the route key.
+14. Use `forge_get_ui_entrypoint` when the Forge UI is the better surface for Kanban,
+    detailed review, graph exploration, or complex Psyche work.
+
+## Entity contract
+
+- Preferred mutation path for simple entities: `forge_search_entities`,
+  `forge_create_entities`, `forge_update_entities`, `forge_delete_entities`,
+  `forge_restore_entities`.
+- Preferred mutation path for `sleep_session` and `workout_session`: the same batch
+  CRUD tools. Dedicated health tools are for review and post-review enrichment, not
+  the default write model.
+- Preferred mutation path for Preferences actions: keep the batch tools for the
+  simple entities and use the dedicated game, judgment, signal, merge, enqueue, and
+  score tools only for those action-heavy flows.
+- Preferred mutation path for questionnaires: use batch CRUD for
+  `questionnaire_instrument`, and use the run, clone, draft, and publish tools for
+  questionnaire workflows.
+  Read first with `forge_list_questionnaires` or `forge_get_questionnaire`; use
+  `forge_clone_questionnaire`, `forge_ensure_questionnaire_draft`, or
+  `forge_publish_questionnaire_draft` only for the matching version action.
+- Self-observation is only for lightweight observed episode notes. When the user
+  describes a psychological chain, map situation, cue, emotion/body, thought/meaning,
+  behavior/urge, and consequence; use `trigger_report` for one meaningful episode,
+  `behavior_pattern` for recurring-loop functional analysis, `behavior` for one
+  repeated move, `belief_entry` for a core sentence, `mode_guide_session` or
+  `mode_profile` for a part-state, `flashcard` for a rehearsable reminder during an
+  urge or trigger, and `wiki_page` for durable memory. If a schema theme is visible,
+  preserve it through the matching belief, pattern, mode, trigger report, flashcard,
+  or wiki explanation instead of hiding it in self-observation.
+- If the user says they feel an urge or asks for help not doing something, search
+  existing `flashcard` records first with `forge_search_entities` and
+  `entityTypes: ["flashcard"]`. If a card matches, show the card message first, then
+  add brief grounding, urge-surfing, cognitive defusion, schema/mode-aware reflection,
+  or values-based support around it. If no card fits and the user wants one, create
+  only after the cue or urge sentence and short message are clear; postpone visual
+  style, colors, tags, and optional links until the intervention sentence works.
+- Preferred mutation path for wiki content: use the wiki tools instead of batch CRUD.
+  Before ingesting source material, call `forge_get_wiki_settings` so Codex knows the
+  available spaces, LLM profiles, and embedding profiles. Prefer the shared wiki
+  space for durable shared knowledge unless settings or the user clearly require
+  another space. Use `forge_ingest_wiki_source` for raw text, local files, and URLs;
+  do not build an ad hoc importer or manually write raw source pages unless the
+  Forge ingest tool is broken, and fix that tool path plus tests first if it is.
+  Preserve source/evidence artifacts for audit, but keep canonical wiki pages as
+  curated, readable, structured articles rather than transcript dumps, movement
+  logs, release logs, or repetitive check-in archives. Detect important people,
+  organizations, projects, places, events, concepts, recurring relationship
+  patterns, decisions, preferences, commitments, and timelines; important detected
+  entities should become or update real wiki pages instead of staying buried in one
+  source note. Merge duplicates into one canonical page per real concept/person/
+  project by combining durable information, preserving aliases/backlinks, and
+  linking original evidence/source pages. Redact actual secrets and security/payment
+  credentials such as passwords, API keys, tokens, private auth links, and card
+  numbers, but do not over-redact useful ordinary personal context such as names,
+  relationships, work context, events, or preferences. After ingest or merge work,
+  run `forge_sync_wiki_vault`, then use `forge_get_wiki_health`, search/list checks,
+  and spot reads to verify created/updated pages, duplicate candidates, unresolved
+  links, missing summaries, evidence links, and evidence reachability from canonical
+  pages. Report created pages, updated pages, merges, unresolved candidates, and how
+  evidence is preserved. If the user wants reviewable candidates, hand off to the
+  Forge UI ingest review instead of pretending Codex can approve candidates inline.
+- Habit outcome writes in the shared agent model should go through `forge_update_entities` on `entityType: "habit"` with `patch.checkIn`, not direct raw calls to `/api/v1/habits/:id/check-ins`.
+- `patch.checkIn` accepts `status` plus optional `dateKey`, `note`, and `description`; if `description` is provided, it replaces the habit's stored `description` in the same write.
+- Preferred API path for Movement, Life Events, Life Force, and Workbench: use the dedicated
+  route families published in `forge_get_agent_onboarding.entityRouteModel.specializedDomainSurfaces`.
+  Prefer `forge_call_movement_route`, `forge_call_life_event_route`, `forge_call_life_force_route`, or
+  `forge_call_workbench_route` when those route-key tools are present.
+- Life Events use both paths deliberately: shared batch CRUD for normal `life_event`
+  create, update, search, soft delete, restore, and generic `entity_links`; dedicated
+  `/api/v1/life-events/*` routes for chronology reads, one-event reads, calendar sync,
+  calendar-to-Life-Event conversion, ticket artifact import, and travel-status reads.
+- When that onboarding payload includes `routeSelectionQuestions`, use them before
+  improvising follow-up questions for Movement, Life Events, Life Force, or Workbench.
+- After the lane is clear, talk in product nouns such as timeline, overlay, calendar match, ticket import, travel status, weekday
+  template, published output, run detail, or node result rather than generic "record"
+  language. Keep implementation words like surface, CRUD, payload, read path, and
+  mutation path out of user-facing questions unless the user asks about implementation.
+- If the truth of the current Movement, Life Events, Life Force, or Workbench state is still
+  unclear, prefer the dedicated read before the mutation so the correction stays
+  truthful.
+- After a concrete Movement, Life Events, Life Force, or Workbench correction, mutation, or
+  result-producing run, read the relevant specialized view back when the user is
+  trying to understand the result rather than only store it: timeline or
+  place/settings detail for Movement, the Life Force overview for energy-planning
+  impact, and flow detail, run detail, node result, latest node output, published
+  output, or run history for Workbench.
+- After any dedicated Movement, Life Events, Life Force, or Workbench read, translate the result
+  into one next action: no change, Movement overlay/place/settings/link, Life Event link/calendar/ticket/status/update, Life Force
+  workload/recovery/timebox/meeting/task-choice change, or Workbench
+  rerun/node-inspection/flow-edit/publish/preserve/stop. Ask only for the missing
+  span, place, event, artifact, weekday, flow, run, node, output, correction, preservation choice, or
+  confirmation that would change that action.
+- In the live onboarding catalog, those domains should read as
+  `specialized_domain_surface`, not as read-only leftovers. If the classification and
+  route family disagree, trust the specialized route family and fix the contract
+  mismatch before inventing a CRUD path.
+- Movement lane hints: review spans through `/api/v1/movement/day`,
+  `/api/v1/movement/month`, `/api/v1/movement/all-time`, `/api/v1/movement/timeline`,
+  `/api/v1/movement/places`, `/api/v1/movement/selection`, and
+  `/api/v1/movement/trips/:id`; fill missing spans through
+  `/api/v1/movement/user-boxes/preflight` then `/api/v1/movement/user-boxes`; only
+  patch `/stays/:id` or `/trips/:id` when editing an already-recorded item; use
+  `/api/v1/movement/user-boxes/:id`,
+  `/api/v1/movement/automatic-boxes/:id/invalidate`, and the stay/trip repair routes
+  for repair actions on already-saved movement data.
+- Use `GET /api/v1/movement/settings` and `PATCH /api/v1/movement/settings` when
+  the user wants to inspect or change passive capture, publish mode, retention mode,
+  or companion readiness. Do not treat movement settings as a place, stay, trip, or
+  batch entity write.
+- Life Force lane hints: overview is `GET /api/v1/life-force`, durable profile edits
+  are `PATCH /api/v1/life-force/profile`, weekday curve edits are
+  `PUT /api/v1/life-force/templates/:weekday`, and real-time tired or recovered
+  reports are `POST /api/v1/life-force/fatigue-signals`.
+- Workbench lane hints: flow catalog reads use `GET /api/v1/workbench/flows`,
+  return compact bounded summaries, and accept `q`, repeated `kind`,
+  `homeSurfaceId`, and `status`, plus `limit` and `offset`. Box catalog reads are
+  also bounded and accept `q`, repeated `category`, `surfaceId`, and `source`.
+  Follow `hasMore` by adding the returned item count to `offset`; use
+  `status=enabled` or `status=disabled` because Workbench has no archive lifecycle.
+  flow creation uses `POST /api/v1/workbench/flows`, saved-flow edits and deletion use
+  `PATCH /api/v1/workbench/flows/:id` and `DELETE /api/v1/workbench/flows/:id`,
+  execution uses `/api/v1/workbench/flows/:id/run` or `/api/v1/workbench/run`,
+  saved-flow chat follow-ups use `POST /api/v1/workbench/flows/:id/chat`,
+  published outputs use `/api/v1/workbench/flows/:id/output`, and per-run or per-node
+  inspection uses the run and node-result routes under `/api/v1/workbench/flows/:id`.
+- For Workbench flow creation or edits, clarify the stable input contract, intended
+  published output, and smallest structural change before asking for raw JSON or node
+  payloads. For deletion, confirm the saved flow and whether published outputs or run
+  history need preservation elsewhere before using the delete route.
+- For Workbench flow chat follow-ups, use `POST /api/v1/workbench/flows/:id/chat`
+  only when the user wants flow-specific conversation. Do not turn that follow-up
+  into a new run, note, or generic entity update unless the user asks for that.
+- When the request is routed through the OpenClaw HTTP proxy instead of direct Forge
+  runtime access, those same specialized families are mirrored under
+  `/forge/v1/movement/*`, `/forge/v1/life-force/*`, and `/forge/v1/workbench/*`.
+- Exact create-shape and question-flow expectations live in
+  `forge_get_agent_onboarding`. Use `entityCatalog[].questionFlow` for the opening question,
+  coaching goal, readiness check, and route posture, and use the rest of
+  `entityCatalog` as the schema source of truth for `minimumCreateFields`,
+  `fieldGuide`, examples, classification, and preferred mutation path.
+- High-signal minimums worth remembering:
+  `goal { title }`, `project { goalId, title }`, `strategy { title, graph }`,
+  `task { title }`, `habit { title }`, `tag { label }`,
+  `note { contentMarkdown, links }`, `calendar_event { title, startAt, endAt }`,
+  `work_block_template { title, kind, timezone, weekDays, startMinute, endMinute, blockingState }`,
+  `task_timebox { taskId, title, startsAt, endsAt }`, `psyche_value { title }`,
+  `behavior_pattern { title }`, `behavior { kind, title }`,
+  `belief_entry { statement, beliefType }`, `mode_profile { family, title }`,
+  `mode_guide_session { summary, answers }`, `flashcard { message }`,
+  `trigger_report { title }`,
+  `event_type { label }`, `emotion_definition { label }`,
+  `preference_catalog { userId, domain, title }`,
+  `preference_catalog_item { catalogId, label }`,
+  `preference_context { userId, domain, name }`,
+  `preference_item { userId, domain, label }`,
+  `questionnaire_instrument { title, sourceClass, availability, isSelfReport, versionLabel, definition, scoring, provenance }`,
+  `sleep_session { startedAt, endedAt }`,
+  `workout_session { workoutType, startedAt, endedAt }`.
+- For `event_type` and `emotion_definition`, put the intended owner scope in each
+  `forge_search_entities.searches[].userIds` array. Put one stable
+  `forge_create_entities.operations[].idempotencyKey` on each intended create and
+  reuse it only for an exact retry of the same owner, entity type, and payload.
+  Changed payload reuse conflicts; a soft-deleted target must be restored, and hard
+  deletion leaves the key terminal rather than allowing recreation.
+- When Psyche authentication is enabled, dedicated event-type and emotion-definition
+  routes require `psyche.read` or `psyche.write`. Agent use through shared batch
+  routes also requires base `read` or `write` for search, or base `write` for
+  mutations, plus the corresponding Psyche scope.
+- For `trigger_report`, keep missing chain segments missing and leave
+  `memoryClarity` as `unspecified` unless the user rates it as `clear`, `partial`,
+  or `uncertain`. Save a sparse `draft` when the user wants to pause. Store a
+  tentative hypothesis, fit, or correction only with explicit
+  `interpretationConsent: true`, and ask whether it fits before treating it as
+  part of the record. Read the current report before updating and pass its
+  `expectedRevision` so a stale edit cannot overwrite a newer one.
+
+## Behavioral rules
+
+- Prefer the operator overview before mutating Forge.
+- Managed Forge tokens may already carry a default scoped read slice. Check
+  `forge_get_agent_onboarding.effectiveScopePolicy` and assume overview/context
+  reads are already narrowed when that policy lists user, project, or tag
+  boundaries. Pass explicit `userIds` only when you are narrowing further.
+- Prefer batch entity tools for simple entities. The point is to keep the agent out
+  of a route jungle, not to memorize every direct CRUD endpoint in the server.
+- When ownership matters, set `userId` deliberately instead of assuming the current
+  operator is the only namespace.
+- Use `note` as the first-class Markdown evidence record for context, reflection,
+  handoff detail, and multi-entity linkage.
+- Delete defaults to soft-delete unless hard delete is explicit.
+- When Forge is local on `127.0.0.1` or `localhost`, the plugin can auto-start the
+  Forge runtime.

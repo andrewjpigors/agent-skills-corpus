@@ -1,0 +1,2391 @@
+---
+name: cli-maintenance
+description: Checklist and decision tree for adding, modifying, or removing CLI commands. Keeps CLI source, slash commands, docs, and skills in sync.
+requires:
+  scripts:
+    - tools/scripts/cli_sync_check.py
+---
+
+# CLI Maintenance
+
+## When to use this skill
+
+- Adding a new subcommand to the CLI
+- Changing args/behavior of an existing command
+- Removing or renaming a command
+- Responding to a cli-plugin-sync hook reminder
+- Auditing CLI / plugin / docs consistency
+
+## Adding a CLI Command — Full Checklist
+
+### 1. Implement in CLI source
+- [ ] Create `tools/cli/cmd_<name>.cpp` with `int cmd_<name>(const std::vector<std::string>& args)`
+- [ ] Add declaration to `tools/cli/cli_common.hpp` in the command forward declarations section
+- [ ] Add entry to the command table in `tools/cli/pulp_cli.cpp` (Command, ScriptCommand, or BinaryCommand)
+- [ ] Update `tools/cli/CMakeLists.txt` to compile the new file
+
+For Rust-native commands, the source of truth is
+`experimental/pulp-rs/src/main.rs`'s `enum Command` plus the matching
+`experimental/pulp-rs/src/cmd/<name>.rs` implementation. Add the command to
+`experimental/pulp-rs/src/help.rs` too; the installed Rust binary's help banner
+is user-facing even when there is no C++ table entry.
+
+### 2. Update the CLI commands manifest
+- [ ] Add entry to `docs/status/cli-commands.yaml` with:
+  - `name`, `status` (use status vocabulary: stable/usable/experimental), `summary`
+  - `args` with name, kind (positional/option/flag/passthrough), description
+  - `subcommands` if applicable
+
+### 3. Decide: does this need a slash command?
+
+**Create a slash command** (`.claude/commands/<name>.md`) if:
+- The command is user-facing and interactive (not plumbing)
+- An agent would benefit from a `/name` shortcut
+- The command has a natural "ask the user then run" pattern
+
+**Skip a slash command** if:
+- It's a low-level plumbing command (e.g., `cache clean`)
+- It's adequately covered by an existing skill
+- It's a subcommand of something already covered
+
+**Commands that intentionally don't have slash commands:**
+audio, cache, clean, export-tokens, ci-local, design-debug, harness, help, identity, macos, overflow, projects, project, tool, tweaks
+
+`project`, `tool`, and `tweaks` intentionally stay slashless: `project`
+is a per-project SDK pin helper, `tool` is registry/install plumbing
+for optional developer tools and importer add-ons, and `tweaks` is a
+local `pulp-tweaks.json` drift diagnostic that mirrors the inspector
+drawer. `identity` is an audit/review helper whose lockfile diff should stay
+explicit in the terminal and commit. Agents call these CLIs directly. Keep this classification in
+sync with `tools/scripts/cli_sync_check.py` and
+`tools/scripts/cli_mcp_parity_baseline.json`.
+
+**Commands that DO have slash commands** (list for cross-reference, not exhaustive — `ls .claude/commands/` is authoritative):
+build, test, run, validate, ship, version, doctor, create, docs, status, design, import-design, inspect, pr, ci, ci-host, upgrade, prototype-loop, motion, trace, audio-harness, audio-inspect, audio-compare
+
+`audio-harness` is a workflow slash command (wraps the audio observability harness `ctest` targets + the `audio-harness` skill) — it is NOT a `pulp` CLI subcommand. Note the distinction from the `pulp audio` CLI: that command owns the model/bundle tooling (model/excerpt-find/read-bundle), the offline `pulp audio validate <verb>` harness CLI (summarize/doctor/compare/assert, `tools/cli/cmd_audio_validate.cpp`, over captured WAVs / `audio-run/` bundles — no live plugin), AND `pulp audio render` (`tools/cli/cmd_audio_render.cpp` driver + `cmd_audio_render_parse.cpp` pure parser + the header-only `cmd_audio_render_step.hpp` block stepper), which DOES load a plugin: it renders an explicit `--plugin <bundle>` offline through `pulp::host::PluginSlot` and emits a WAV + the same metrics manifest the `validate` verbs read. Three `render` gotchas: `--param <id>=<value>` is the **PLAIN** parameter domain (native min..max, NOT normalized `[0,1]` — the `PluginSlot::set_parameter` arg name `normalized_value` is a misnomer; every loader treats it as plain); `--param @frame` is **sample-accurate** — the per-block queue the stepper builds is forwarded straight to `PluginSlot::process` (all four loaders apply `param_events` at the sample offset; LV2 block-rate by its control-port nature) and the driver does NOT also call `set_parameter` (that double-applies); and the stepper is a deliberate callback-driven parallel to `OfflineRenderHost::render` (PluginSlot has no `ProcessContext`, so it can't reuse the core renderer) guarded by a block-partition-invariance test. `pulp audio` intentionally has no slash command of its own; the `/audio-harness` command documents the `validate` and `render` verbs. Keep the live boundary in sync with the `audio-harness` skill: live Audio Inspector use is landed under `/audio-inspect` / `pulp run --audio-inspector`, and live capture-to-WAV is landed in two modes — `pulp run --audio-capture-wav` (earliest-window int16 dump — good for `validate summarize`/`assert`) and `pulp run --audio-capture-rolling` (last-N via `RollingAudioCaptureBuffer` — the steady-state window `doctor`/`compare` want — float by default, or int24 via `--audio-capture-rolling-format int24`). When adding a `run` capture flag, mirror slice A/A2's surfaces: `cmd_run.hpp`/`cmd_run_parse.cpp`/`cmd_run.cpp`, the standalone `detail/standalone_audio_capture_*` writer + `standalone_environment.hpp` env+predicate, `docs/status/cli-commands.yaml` (under `run`), `docs/reference/cli.md#run`, and both the `audio-harness` and this skill. When adding a `validate` or `render` flag, update the matching `cmd_audio_*.cpp`, `docs/status/cli-commands.yaml` (nested under `audio`), `docs/reference/cli.md#audio`, and both skills. WAV writing is `write_wav_file(path, data, WavBitDepth)` — `Int16` (default overload), `Int24`, or `Float32`. `pulp audio render` is also exposed as the `pulp_audio_render` MCP tool (`tools/mcp/mcp_tools.cpp` handler + `pulp_mcp.cpp` tools_list/dispatch + `test/test_mcp_server.cpp` membership/required-arg coverage + the `docs/guides/claude-code-plugin.md` tool table); it takes a single `param`/`midi` token (the hand-rolled MCP JSON has no array extractor), returns the metrics JSON, and defaults `--out` to a temp WAV. When adding a render flag worth exposing, mirror it there too.
+
+`pulp ship swap-pack` signs a hot-reload UX bundle (`tools/cli/cmd_ship.cpp`). It is the
+only `ship` subcommand that does NOT require a configured `build/` dir (it signs an
+explicit `--bundle`, gated out of the build-dir check by `sub != "swap-pack"`). It
+reuses the header-only reload building blocks — `build_signable_manifest` (walk +
+hash + capability inference from the JS), `swap_pack_signing_summary`,
+`serialize_swap_pack_manifest`, and `key_store` — so the CLI itself is thin assembly.
+The Ed25519 signing key comes from a `--sign-key <file>` (created if absent) or, on
+macOS, the login keychain under `pulp.reload.signing.<plugin_id>` / account `gen1`
+(stored as a single-line base64 of the key blob); a freshly generated key prints a
+loud provenance/backup banner and is NEVER silently regenerated (a corrupt keychain
+entry is refused, not overwritten). The subcommand is GPU-gated only because the whole
+CLI target is (`if(PULP_ENABLE_GPU)` around `add_subdirectory(tools/cli)`), so its
+shell-out test `pulp-test-cli-swap-pack` runs in GPU builds.
+
+`pulp audio compare` is the shipped CLI verb over the **dev-only Python Audio Quality Lab**
+`compare` surface (`tools/audio/quality-lab/`, advisory measure→compare→judge). It is a thin
+ORCHESTRATOR: `tools/cli/cmd_audio_compare.cpp` locates the opt-in managed tool
+(`$HOME/.pulp/tools/python-envs/audio-quality-lab/run.sh`, via `tool_registry.hpp`
+`locate_tool`) and forwards the `compare` verb + all flags to it — no numpy/soundfile/FFT ever
+links into the MIT CLI. It parses arity locally (missing WAVs → exit 2), prints an actionable
+`pulp tool install audio-quality-lab` hint + exit 1 when the tool is absent, and otherwise
+passes the tool's stdout/stderr + exit code straight through (2 == could-not-measure/invalid,
+never a judgment). When touching it, mirror: `cmd_audio_compare.cpp/.hpp`, the dispatch +
+usage line in `cmd_audio.cpp`, `CMakeLists.txt`, `docs/status/cli-commands.yaml` (nested under
+`audio`), `docs/reference/cli.md#audio`, the shell-out test `test/test_cli_audio_compare.cpp`
+(help/arity/not-installed-hint/forward-and-passthrough via a fake `run.sh`), and the
+`audio-harness` skill. The `/audio-compare` slash command wraps the SAME surface for agents, and the
+`pulp_audio_compare` MCP tool mirrors this shipped verb (like `pulp_audio_render` mirrors
+`pulp audio render`): handler `handle_audio_compare` in `tools/mcp/mcp_tools.cpp` (+ decl in
+`mcp_tools.hpp`), tool JSON + dispatch + `using` in `pulp_mcp.cpp`, an `mcp_only` entry in
+`tools/scripts/cli_mcp_parity_baseline.json`, and membership + required-arg coverage in
+`test/test_mcp_server.cpp` + the `docs/guides/claude-code-plugin.md` tool table. A new `audio`
+SUB-verb needs no CLI↔MCP parity *promotion* (the checker only tracks top-level `pulp`
+commands), but a new MCP sub-tool still needs its baseline `mcp_only` entry. Distinct from the
+gate-oriented `pulp audio validate compare` (null/spectral diff, nonzero exit): `pulp audio
+compare` is an advisory *judgment*, never a gate.
+
+**Inspector-proxy MCP tools use a different, lighter pattern than the
+`mcp_tools.cpp`-handler tools above.** `pulp_motion_*` and `pulp_trace_*` do NOT
+have `mcp_tools.cpp` handlers — they **inline-forward** in `pulp_mcp.cpp`'s
+dispatch (an `else if (name == "pulp_X_*" || …)` block that maps each tool to an
+`inspector_method` + `--params '<args_json>'` and shells `pulp inspect --command`).
+So a new inspector-proxy tool needs only: tool JSON in `tools_list_json()`, the
+inline dispatch block, membership in `test/test_mcp_server.cpp`'s expected list,
+and the `docs/guides/claude-code-plugin.md` table — no handler, no `mcp_tools.*`.
+Parity: a tool whose top-level CLI command already carries a `cli_only` baseline
+entry (e.g. `trace`) needs NO new baseline row; only add an `mcp_only` entry for
+a tool with no CLI peer at all. Client-side CLI verbs with no inspector RPC
+(`trace doctor` / `open` / `fetch`, offline `query --trace`) get **no** MCP tool —
+say so in the plugin-table row and the `cli_only` reason so the asymmetry reads
+as intentional.
+
+Not every slash command wraps a `pulp` CLI subcommand. A slash command may
+also document a developer-tool *surface* with no CLI backing — e.g.
+`audio-inspect` opens the in-app Audio Inspector window
+(`pulp::view::AudioInspectorWindow`, registered via `CommandRegistry`), so
+it needs no `cli-commands.yaml` entry and no `pulp <name>` subcommand. When a
+slash command is window/feature documentation rather than a CLI wrapper, skip
+the CLI-source / manifest / `docs/reference/cli.md` steps and just keep the
+`.md` and this cross-reference accurate.
+
+### 4. Update docs
+- [ ] Add/update section in `docs/reference/cli.md`
+- [ ] If it changes capabilities: update `docs/reference/capabilities.md`
+- [ ] If it's in the plugin: update `docs/guides/claude-code-plugin.md` command table
+
+### 5. Update skills that reference CLI commands
+- [ ] `grep -r "pulp <name>" .agents/skills/` — update any skill that calls this command
+
+### 6. Update CLAUDE.md if needed
+- [ ] If the command is referenced in the "CLI tool" code block
+- [ ] If the command changes the build/test/validate workflow
+
+### 7. Validate sync
+```bash
+python3 tools/scripts/cli_sync_check.py
+python3 tools/scripts/check_cli_mcp_parity.py --mode=report
+```
+
+`cli_sync_check.py` unions the C++ command tables with Rust-native commands
+from `experimental/pulp-rs/src/main.rs`. `check_cli_mcp_parity.py` uses the
+same installed-command model by default, so a Rust-only command still needs
+either a matching `pulp_<command>` MCP tool or an explicit
+`tools/scripts/cli_mcp_parity_baseline.json` reason.
+
+### 8. Decide: does this need an MCP tool?
+
+Every top-level CLI command is checked for MCP parity by
+`tools/scripts/check_cli_mcp_parity.py`. The check enforces an
+invariant: a new CLI command must either land alongside a
+`pulp_<command>` tool in `tools/mcp/pulp_mcp.cpp` (with both a
+`tools_list_json()` entry AND a `handle_request()` dispatch arm),
+OR it must be added to `tools/scripts/cli_mcp_parity_baseline.json`
+under `cli_only` with a one-line reason.
+
+Decision heuristics for "does this deserve MCP exposure":
+
+- One-shot RPC-shaped command (build, test, validate) → **YES**, add the MCP tool.
+- Long-running watch/loop (dev, loop, run, host) → **NO**, baseline it.
+- Trivial Bash equivalent (clean, version, config) → **NO**, baseline it.
+- Interactive surface (design, ship) → **NO**, baseline it.
+- Subcommand under an umbrella tool already present (audio, docs, inspect) → **NO**, baseline it (the umbrella's sub-tools cover the surface).
+- Trust-boundary workflows with many reviewable subcommands (kit/content) →
+  **YES for the umbrella and explicit MCP sub-tools.** Keep `pulp kit` and
+  `pulp content` documented as top-level CLI commands, but expose agent-safe
+  sub-tools such as `pulp_kit_plan`, `pulp_kit_apply`,
+  `pulp_content_preview`, and `pulp_content_install` so MCP callers cannot blur
+  inspect/preview/approve/apply boundaries. Add those sub-tools to the
+  `mcp_only` baseline with a reason that they are sub-tools of the umbrella CLI
+  command, not missing top-level CLI peers.
+- `tools/cli/kit_commands.cpp` is a frozen refactor hotspot. Before moving kit
+  command code, follow `tools/cli/KIT_COMMANDS_MODULE_MAP.md`: keep manifest
+  validation, archive safety, publish policy, apply/remove mutation, profile
+  verification, and dispatch in separate modules, and lower the hotspot ceiling
+  when the split shrinks the monolith.
+
+The gate runs in three places, all pinned to the same script:
+
+1. `hooks/scripts/cli-plugin-sync.sh` — advisory `--mode=hint` after Edit/Write of
+   `pulp_cli.cpp`, `pulp_mcp.cpp`, or the baseline JSON.
+2. `.github/workflows/version-skill-check.yml` — enforcing `--mode=report`
+   on every PR. Hard-fails if a new CLI command lacks both an MCP tool and
+   a baseline entry.
+3. The shipping pre-push gate stack (skill-sync / version-bump / compat-sync)
+   — the parity check rides alongside.
+
+Naming convention: hyphenated CLI command `import-design` ↔ underscored
+MCP tool name `pulp_import_design`. The script handles the conversion
+automatically; baselines should use the form natural to each side
+(`cli_only` is hyphenated, `mcp_only` carries the full `pulp_` prefix).
+
+When promoting an entry off the `cli_only` list, add the matching
+`pulp_<command>` tool to `tools/mcp/pulp_mcp.cpp` and the parity check
+will auto-detect the new coverage; remove the baseline entry in the same PR.
+
+### Adding an inspector sub-tool (e.g. `pulp_inspect_set_param`)
+
+Inspector tools are MCP sub-tools of `pulp inspect`, so they live in the
+`mcp_only` baseline (no top-level CLI command of their own) — add the new
+`pulp_inspect_*` name there or the parity check hard-fails. Two gotchas when
+the tool takes arguments:
+
+- **Pass arguments via `pulp inspect --params '<json>'`, not by concatenating
+  the JSON after `--command METHOD`.** The CLI parses `--command` and `--params`
+  as separate flags; a bare `{...}` token is ignored. Read-only tools that take
+  no args sidestep this, so don't copy their dispatch shape for a tool that
+  carries a payload.
+- **Do not wrap inspector error text as media.** Protocol-reserved methods that
+  are not wired yet (for example the screenshot surface waiting on a WindowHost
+  reference) should return ordinary text/error content through MCP until the
+  inspector method returns a real payload.
+- **The scripted-UI runtime inspector IS wired now.** `Runtime.evaluate`,
+  `Runtime.getCapabilities`, `Runtime.interrupt`, and `Console.getMessages`
+  (device-log cursor poll) reach the live JS engine when a host calls
+  `DomainHandler::set_script_inspector(session.script_inspector())`. Evaluate is
+  marshaled onto the engine thread by `ScriptInspectorBridge` — single in-flight,
+  ~2 s timeout, auto-interrupt on hang. It is an honest evaluate/inspect console,
+  NOT a step debugger: mainline QuickJS has no breakpoint protocol, so
+  `getCapabilities` reports `canBreak/canStep/canInspectLocals=false`. Cover these
+  in `test_inspector_domains.cpp`. See `docs/reference/scripted-ui-inspector.md`
+  and the `engine` skill's interrupt section.
+- **Mutating tools must go through a typed inspector method** (e.g.
+  `State.setParameter`) with validation + gesture wrapping in
+  `StateInspector`/`DomainHandler` — never via `Runtime.evaluate`. Cover the
+  happy path, the unknown-id error, and any normalized/raw mode in
+  `test_inspector_domains.cpp`.
+
+## Modifying a CLI Command
+
+Same as above, focus on steps 2, 4, 5, 6, 7. Key risks:
+- Changed args not reflected in `cli-commands.yaml`
+- Changed behavior not reflected in slash command `.md`
+- Skills calling the old invocation syntax
+- Slash-command recipes must only name flags accepted by `pulp <cmd> --help`
+  and `docs/status/cli-commands.yaml`. Do not invent convenience aliases such
+  as `--formats`; for platform-gated defaults, document the real opt-in flag
+  (for `pulp create`, `--targets android`) or omit the prompt entirely.
+- `/test` must invoke `pulp test` or `./build/pulp test`, not raw
+  `ctest --test-dir build`; the CLI owns project-root resolution, cold-start
+  builds, FetchContent cache preflight, and ctest passthrough. If slash-command
+  arguments already contain ctest flags such as `--exclude-regex`, forward them
+  after `pulp test` instead of wrapping the whole argument string in `-R`.
+- Output path flags should accept both nested paths and bare filenames; guard
+  empty `std::filesystem::path::parent_path()` before creating directories and
+  add shellout coverage for the bare-filename case.
+
+### `pulp status` — build-governance tier line
+
+`pulp status` reports the active host-resource governance tier via a
+`Build governance: Tier N (…)` line, backed by `detect_build_governance()` in
+`tools/cli/tartci_lease.cpp`. Detection is fail-safe (never throws): Tier 2 when
+`TARTCI_ORCHARD_URL` is set, else Tier 1 when a resolvable `tartci`
+(`PULP_TARTCI_BIN` or PATH, unless `PULP_TARTCI_LEASES=0`) answers
+`tartci host-profile` (surfacing its `PULP_BUILD_JOBS` / `PULP_BUILD_MEM_BUDGET_MB`),
+else Tier 0 (the CLI's built-in bounded builds). Coverage lives in
+`test/test_cli_tartci_lease.cpp`. Keep the tier semantics in step with the
+lease-acquisition path in the same file.
+
+### Package command CMake generation
+
+`pulp add` can now generate CMake for source-backed FetchContent packages, not
+only header-only packages or upstream-exported targets. The registry's
+`cmake.sources` field means "compile these fetched source files into the
+declared target." Keep that behavior centralized in
+`package_commands_util.cpp` so guarded and unguarded blocks stay identical
+except for their surrounding `if(...)` condition.
+
+When adding a new generated-target package shape, update all four surfaces in
+one PR: `tools/packages/registry-schema.json`, `package_registry.{hpp,cpp}`,
+the CMake block generation helpers, and `test/test_cli_package_commands.cpp`.
+`mts-esp` is the reference source-backed case: generated static target,
+position-independent code, include dir rooted at the fetched source, and
+`${CMAKE_DL_LIBS}` linked when available.
+
+Some header-only packages should be fetched source-only because their upstream
+`CMakeLists.txt` builds tools/tests or exports a target shape Pulp does not want
+to impose on plugin projects. Set `cmake.add_subdirectory=false`; generation
+must use `FetchContent_MakeAvailable()` with an inert `SOURCE_SUBDIR`, then
+create the declared interface target itself. `sst-tuning-library` is the
+reference case.
+
+### `pulp dev --hot-dsp` — live DSP hot-swap dev loop
+
+`pulp dev --hot-dsp` (cmd_dev.cpp) is a watch-loop MODE flag, not a new command.
+It sets `WatchOptions::hot_dsp`, which `watch_loop()` (cli_common.cpp) reads to
+**suppress the post-rebuild relaunch**: the launched app stays alive and its
+`ReloadableShell` filesystem watcher hot-swaps the rebuilt DSP logic library in
+place (relaunching would kill the plugin + lose audio/UI state). Gotchas:
+- `--hot-dsp` requires `--run <target>`; cmd_dev errors (exit 2) otherwise.
+- Only meaningful for a **reloadable-shell** target (one whose processor is a
+  `ReloadableShell`); for a plain plugin it just means "don't relaunch." The CLI
+  deliberately doesn't inspect the target — it only changes relaunch behavior.
+- The rebuild must produce the logic library the shell watches; a normal
+  `cmake --build` of the project rebuilds it, and the shell's poll picks it up.
+- `pulp loop --ar-swap-from` is **retired** to a redirect that points here — it
+  no longer prints a bare not-implemented notice (cmd_loop.cpp). If you touch the
+  reload dev loop, keep that redirect message accurate.
+- The C++ delegate (`pulp-cli`) is GPU-gated (`PULP_ENABLE_GPU`), so a GPU-off
+  worktree can't build/run it; verify CLI edits via a `-fsyntax-only` parse and
+  rely on the GPU-on CI lane for the link + shell-out `--help` assertion.
+- Parser-order fixes that preserve the documented command surface still need
+  tests proving malformed argv is rejected before platform guards or side
+  effects, especially for commands like `pulp ship release` where macOS-only
+  execution follows cross-platform flag parsing.
+- Shell-out wrappers that build a command string must quote resolved repo/config
+  paths and every forwarded user argument before interpolation. For passthrough
+  commands such as `pulp docs build-site`, add a fake-tool PATH test that records
+  argv from a nested cwd and includes spaces in forwarded paths, so config
+  discovery and argument preservation do not depend on the real external tool
+  being installed.
+- Platform-specific flags are still parsed cross-platform but only *act*
+  inside a platform `#if`. E.g. `pulp ship package --format appimage --binary
+  <exe> [--icon <png>]` parses everywhere, yet only the `#if defined(__linux__)`
+  arm routes to `pulp::ship::create_appimage`; on other platforms the flags are
+  accepted-but-inert. Document the flag in `cli-commands.yaml` regardless, and
+  put the behavioral assertion in a platform-gated unit test (here:
+  `test_linux_packaging.cpp`) rather than a cross-platform shellout, since the
+  required macOS lane can't exercise the Linux-only branch.
+- `pulp ship package` (macOS) DEFAULTS to a single component-selectable `.pkg`:
+  it collects every built format into one `create_combined_pkg` call so the
+  installer shows a **Customize** pane (one pre-checked, toggleable choice per
+  format) — users are never forced to install every format. `--separate` is the
+  legacy per-format-`.pkg` path; `--dmg` makes disk images. Discovery scans the
+  whole `build/{VST3,CLAP,AU,Standalone}` tree, so a multi-example build bundles
+  EVERY plugin's formats (dozens of choices) unless you pass `--product <name>`
+  to scope to one product's bundles (also names the installer). Verify a real
+  installer by unpacking its `Distribution` (`xar -xf … Distribution`) and
+  checking for `<options customize="allow">` + one `<line choice>` per format —
+  a flat `Bom/Payload/PackageInfo` archive is a bare `pkgbuild` with NO Customize.
+- A subcommand that must work BEFORE a build exists (e.g. `pulp ship doctor`,
+  which makes signing non-interactive) has to be dispatched *above*
+  `cmd_ship`'s `build/CMakeCache.txt` guard — that early-return fires first and
+  would otherwise reject it with "Build directory not found." Put such handlers
+  right after `find_project_root()`.
+- `pulp ship doctor` shells out to `tools/scripts/ensure_signing_ready.sh` (the
+  canonical logic + its own `test_ensure_signing_ready.sh`); the C++ side is a
+  thin pass-through, and `ship sign` invokes it as a **best-effort quiet
+  preflight** (`|| true`) so a doctor failure never masks the real sign error.
+  Keep secrets in `$PULP_SECRETS_DIR/`, never the repo.
+
+### Rust CLI cutover path convention
+
+After the v0.78.1 cutover, the user-facing CLI is Rust `pulp`. Release
+archives install `pulp` plus sibling `pulp-cpp`, and source builds stage the
+Rust binary at `./build/pulp`. Slash-command examples should prefer `pulp`
+on PATH for installed users and `./build/pulp` for source-tree examples.
+Do not point new docs at `./build/tools/cli/pulp`; that path was the old
+C++ default. Use `pulp-cpp` only when documenting fallthrough, rollback, or
+debug comparisons.
+
+### `pulp import` — framework-importer substrate
+
+`pulp import` (`tools/cli/cmd_import.cpp` + `import_run.{hpp,cpp}` +
+`import_detect.{hpp,cpp}` + `import_spi.{hpp,cpp}` + `import_emit.{hpp,cpp}` +
+`import_emit_scan.{hpp,cpp}`) reads an existing audio-plugin project read-only
+and emits a Pulp migration scaffold. The SDK owns only the *generalized*
+substrate; the framework-specific parsers are **vendor-specific add-on tools**
+in their own private repos, driven over a JSON-over-stdio SPI.
+
+Gotchas / invariants when touching this surface:
+
+- **`cmd_import.cpp` is arg-parse + dispatch only.** The SPI-verb orchestration
+  (`run_detect` / `run_inspect` / `run_emit` and their shared helpers —
+  framework-index + importer resolution, the SPI request/response envelope
+  `run_verb`, the analyze/emit payload builders, the clean-room output gate,
+  and scaffold materialisation) lives in `import_run.{hpp,cpp}` under namespace
+  `pulp::cli::import_run`. `cmd_import.cpp` only parses flags into
+  `import_run::ImportOptions` and calls the three `run_*` entry points. Keep new
+  verb logic in `import_run.cpp`; keep `cmd_import.cpp` small. Both files (and
+  any new `tools/cli/*import*` file) must stay vendor-free — the
+  `pulp-test-cli-import` directory scan asserts no `juce`/`iplug`/`steinberg`/
+  `wdl` token appears in any of them.
+
+- **Vendor-agnostic is enforced.** SDK code, mainline tests, and generic CI
+  name NO vendor or framework. The ONLY place real markers (`.jucer`,
+  `juce_add_plugin`, iPlug `PLUG_NAME`, `Steinberg::Vst::`, …) may appear is
+  the DATA file `tools/import/known-frameworks.json`. Tests use a NEUTRAL id
+  (`example-framework`) and a temp index. `test_cli_import.cpp` has a guard
+  that greps `tools/cli/*import*` for `juce/iplug/steinberg/wdl` — keep new
+  import code clean of those tokens (put markers in the data file).
+- **Detection markers are DATA, not code.** `import_detect.cpp` only knows
+  the *shape* of a marker (`file_glob` / `content_match` + `weight`), never a
+  specific marker. Add a framework by editing the JSON index, not the engine.
+- **The Rust front routes `import` via fallthrough automatically.** `import`
+  is NOT a declared clap subcommand in `experimental/pulp-rs/src/main.rs`, so
+  it hits `ErrorKind::InvalidSubcommand` and `clap_exit_code` delegates to
+  `pulp-cpp`. You still add an `Entry` to `help.rs::COMMANDS` so the usage
+  banner lists it (and the C++ `commands[]` table in `pulp_cli.cpp`).
+- **SPI version is negotiated every call.** `import_spi::check_version`
+  compares the importer's response `spi_version` against the registry's
+  `[spi_min, spi_max]` window and fails loudly ("upgrade Pulp" vs "upgrade
+  the importer"). Never silently proceed on a mismatch.
+- **The SPI request goes in on real stdin.** `import_spi::run` writes the
+  one-line request to a temp file and redirects it into the importer through
+  the shell (`/bin/sh -c '<cmd> < tmp'` / `cmd /c`), because
+  `ChildProcess::run` captures stdout but doesn't feed stdin. Reads the first
+  non-empty stdout line as the response envelope.
+- **Importer fields on `ToolDescriptor` are optional.** `frameworks`,
+  `spi_min`/`spi_max`, `sdk_min`/`sdk_max`, `capabilities`, `health_check`
+  are parsed only when present. Don't add a fake vendor entry to
+  `tool-registry.json`; the loader tolerates their absence.
+- **`emit` materialises a real scaffold; the SDK writes + gates the output.**
+  `detect`/`inspect`/`emit` are all real. `emit` runs `analyze` → ProjectIR
+  then the SPI `emit` verb → an **EmissionManifest** (the importer PROPOSES
+  files, never writes them). The SDK then: parses the manifest
+  (`import_emit::parse_manifest`), runs the clean-room **output denylist scan**
+  (`import_emit_scan::scan_manifest`) over every `generated`/`stub` file,
+  computes a write-plan that rejects any path escaping `--output`
+  (`compute_write_plan`), writes each file (inline `content`, or a verbatim
+  `copy_from` copy for `copied-user-file` provenance), and writes
+  `migration_status.json` + `.pulp-import-provenance.json`. Parse / write-plan /
+  scan are **pure functions over structs** so they unit-test without spawning;
+  the spawn/IO is a thin shell in `cmd_import.cpp`.
+- **The output scan is data-driven, not hardcoded.** Keep the clean-room
+  denylist vendor-free: `denylist_from_known_frameworks()` builds it from the
+  known-frameworks index's `content_match` markers (the ONE place real tells
+  live). Do NOT hardcode `juce`/`iplug`/… tokens in `import_emit_scan.cpp` — the
+  vendor guard greps for them. `copied-user-file` provenance is EXEMPT from the
+  scan (it's the user's own DSP); only `generated`/`stub` content is scanned.
+  Watch comment wording too: a literal `.jucer` in a comment trips the `juce`
+  substring guard.
+- **The importer may double-wrap the IR.** When `emit` hands the analyze result
+  back as `project_ir`, an importer that frames analyze as `{"project_ir": IR}`
+  must unwrap its own envelope (the SDK passes the analyze `result` verbatim).
+  If a scaffold comes out with empty formats / pass-through-only DSP, suspect a
+  double-wrapped IR on the importer side, not the SDK.
+- **`inspect`/`emit` are gated by the IMPORTER_TERMS accept-to-run gate**
+  (`import_terms.{hpp,cpp}`, `run_gate`). The terms BODY is vendor DATA carried
+  on the add-on's `ToolDescriptor` (`terms_text`/`terms_version`/`vendor_id`) —
+  the SDK ships no terms body and names no vendor, it only surfaces + hashes the
+  text and records acceptance under `~/.pulp/importer-terms-accepted.json`
+  (honours `$PULP_HOME`), keyed by importer id + an FNV hash of the terms.
+  A changed body → new hash → re-prompt. `--accept-importer-terms` is the
+  non-interactive (CI) path; without a TTY and without the flag the gate returns
+  `NonInteractive` and BLOCKS (exit 1) rather than hanging. Mirrors
+  `pulp add --accept-license` in UX + storage shape. `--importer-cmd` has no
+  registry entry, so `--importer-terms-text`/`--importer-terms-version` supply
+  the body directly (tests + power users). `has_terms()==false` (no body) →
+  the gate passes through transparently. `run_gate` takes injected `GateIo`
+  (in/out/interactive) + a `now_utc` string so it unit-tests deterministically
+  without a real TTY or clock.
+- **Provenance PR-check is `tools/scripts/check_import_provenance.py`** (neutral,
+  vendor-free), the audit that a migrated project landing in a PR was produced
+  clean-room: marker present + well-formed, valid per-file `provenance` values,
+  and no framework-source marker in any file the marker labels `generated`/`stub`
+  (`copied-user-file` is exempt). The content denylist is DATA from the
+  known-frameworks index (`$PULP_KNOWN_FRAMEWORKS` or `tools/import/`); with no
+  index the structural checks still run and the scan reports as skipped. Wired
+  into `gates.sh` as an **opt-in** lane (`PULP_IMPORT_PROVENANCE_DIRS`) so it's a
+  no-op for normal Pulp-repo pushes and only fires on a PR that lands a scaffold.
+
+### `pulp tool install <importer>` — importer add-on packaging
+
+The install-side contract for framework-importer add-ons lives in
+`tools/cli/importer_install.{cpp}` (declarations in `tool_registry.hpp`).
+`pulp tool install <importer>` and the `pulp add <importer>` alias both route
+through it. User-facing contract: `docs/reference/framework-importer-packaging.md`.
+
+Gotchas / invariants when touching this surface:
+
+- **An importer is a tool-registry entry with `category: "importer"`.** The
+  generic binary/python install path is untouched: `cmd_tool`'s `install`/
+  `uninstall` first call `handle_importer_install` / `handle_importer_uninstall`,
+  which return `std::nullopt` for non-importers so the generic path still runs.
+  `try_add_importer_alias` is the `pulp add` entry — it only fires when the id
+  resolves to an importer in `tools/packages/tool-registry.json`.
+- **Three install gates, in order, and they fail/refuse — never warn-and-proceed:**
+  (1) version window — `check_importer_compat` requires the running SDK in
+  `[sdk_min, sdk_max]` AND the importer's `[spi_min, spi_max]` to overlap the
+  SDK's import-SPI window; (2) sha256 — the fetched/`--from` archive must match
+  the registry `sha256`; (3) skill + record. Keep the messages actionable
+  (`upgrade Pulp` vs `upgrade the importer`, `refusing to install`).
+- **SHA-256 is hand-rolled in `importer_install.cpp`, on purpose.** It avoids
+  linking mbedTLS into the lightweight `pulp-test-cli-*` targets (which only link
+  `pulp::platform`). It's validated against FIPS-180-4 known vectors in
+  `test_cli_importer_install.cpp` — if you touch the digest, those vectors are
+  the guard. Do NOT swap it for `pulp::runtime::sha256_hex` without also adding
+  the runtime link to every test target that compiles `importer_install.cpp`.
+- **The SDK version reaches the dispatch via env-var-then-header.** `host_sdk_version()`
+  reads `PULP_SDK_VERSION` (tests set it to drive the window check) and falls
+  back to `PULP_SDK_VERSION_GENERATED` from `<pulp_version_gen.h>`, included via
+  `#if __has_include` so unit-test targets (no generated header) still compile.
+  The pure functions (`install_importer`, `check_importer_compat`) take the SDK
+  version + SPI bounds as PARAMETERS — keep them parameterized so they stay
+  testable without globals.
+- **Skills install to `~/.agents/skills/<skill_name>/` honoring `$PULP_HOME`.**
+  `skills_dir()` maps `$PULP_HOME` → `$PULP_HOME/agents/skills` (tests rely on
+  this); without it, the real `~/.agents/skills`. Records go under
+  `pulp_home()/importers/<id>.json`. Uninstall recovers the skill dir name from
+  the record's `skill_path` so it removes the right directory even if the
+  registry entry changed.
+- **`--from <path|file://>` is importer-only.** Both `pulp tool install` and
+  `pulp add` reject `--from` for non-importers. It's the offline/test source —
+  the checksum + version gates still apply, so a mock local package with a known
+  sha is the unit-test vehicle (build one with `tar -czf`, hash it with
+  `sha256_file_hex`, feed it back into the descriptor).
+- **Producer side is NOT decided in code.** Artifact build/hosting/pinning, the
+  bundled-libclang choice, and signing/notarization are maintainer decisions
+  documented (as open questions) in `docs/reference/framework-importer-packaging.md`.
+  The CLI consumes the contract; don't bake a hosting URL, an LLVM pin, or a
+  signing identity into the SDK.
+- **Two test targets compile `tool_registry.cpp`.** `tool_registry.cpp` now
+  references `importer_install.cpp` + `import_spi.cpp` symbols, so BOTH
+  `pulp-test-cli-tool-registry` and `pulp-test-cli-importer-install` link all
+  three TUs. Adding a symbol used by `cmd_tool` means updating both targets.
+
+### `pulp tool install` — bare binaries vs archives, and the verified-fetcher lane
+
+The generic `binary_download` path in `install_binary_tool` (`tool_registry.cpp`)
+assumes an **archive**: with no `archive_format` it defaults the download
+extension to `.tar.xz` and runs `extract_archive`. A **bare** binary source (no
+`archive_format`, e.g. Perfetto's `trace_processor_shell`) would fail there
+("cannot extract" on a raw Mach-O/ELF) — and this path never verifies a SHA
+(the `sha256` field is read but unused). So a bare-binary tool is installed
+**only** by its own SHA-256-verified fetcher, never this generic path:
+
+- `install_binary_tool` **skips** any source with an empty `archive_format`
+  (returns ok, installs nothing) so an `--all` sweep reaching it via `pulp-cpp`
+  doesn't error. The Rust front-end owns the real install: `cmd/tool.rs`
+  short-circuits `install`/`update <id>` to the verified fetcher, and its
+  `install --all` pre-fetches the bare-binary tool so the delegated C++ sweep
+  finds it already-present (C++ `locate_tool` searches `tools/<id>/`
+  recursively) and skips it.
+- trace-processor is the live example: pins + fetch live in
+  `experimental/pulp-rs/src/cmd/trace_fetch.rs`; `pulp trace fetch` and
+  `pulp tool install trace-processor` share that code. If you add another bare
+  binary, give it a verified fetcher — don't rely on the generic path.
+
+### `pulp tool info` — Rust/C++ parity
+
+`pulp-cpp tool info <tool-id> [--json]` prints the same descriptor metadata
+that installer add-on workflows need when deciding whether a registry entry is
+a machine-scoped tool add-on, importer package, or legacy validator. The Rust
+front-end owns `pulp tool` dispatch for installed users, so adding descriptor
+fields or subcommands to `tool_registry.cpp` must be mirrored in
+`experimental/pulp-rs/src/tool_registry.rs` and
+`experimental/pulp-rs/src/cmd/tool.rs`; otherwise Rust `pulp tool <subcommand>`
+can reject a command that the C++ delegate and tests already support.
+Keep managed-install layout parity here too: C++ npm-package tools install
+under `$PULP_HOME/tools/npm-packages/<id>/run.{sh,bat}`, so Rust
+`locate_tool` and `uninstall_tool` must check/remove that wrapper directory
+alongside binary-download and python-env installs. Otherwise Rust-native
+`pulp tool info`, `path`, `run`, `doctor`, and `uninstall` can disagree with
+tools installed by the delegated C++ install path.
+The targeted `pulp tool doctor <id> [--run]` surface is part of that same
+contract: `--run` executes the resolved tool path with no forwarded arguments
+and returns its exit code. For `npm_package` tools, that path is the
+`run.{sh,bat}` wrapper smoke check.
+
+### Every added `managed_by_pulp` tool must be user-updatable + overridable
+
+**Convention (hard rule for the opt-in tool lane, NOT for shipped-by-default
+deps like Skia/Dawn):** when you register a `managed_by_pulp` tool in
+`tools/packages/tool-registry.json`, users must be able to update it and pin
+their own version **without waiting for Pulp to bump the committed pin**. This
+is what `pulp tool update` + the version-override tiers provide, and it is
+enforced — do not add a managed tool that lacks it.
+
+- **Declare a non-empty `pinned_version`.** It is the anchor the update/override
+  path keys off. `tools/packages/validate_registry.py`'s
+  `validate_tool_registry` fails the build if any `managed_by_pulp` tool ships
+  without one (covered by `tools/packages/test_package_validation_tools.py`).
+- **`pulp tool update <id> [--version <v>]`** lives in
+  `experimental/pulp-rs/src/cmd/tool.rs`. Bare `update` re-installs at the
+  registry pin and clears any prior user override; `--version <v>` re-installs
+  at an explicit version and records a durable override. The archive re-fetch
+  delegates to `pulp-cpp tool install <id> --force` (Rust can't extract
+  archives), forwarding the resolved version via env — the override file is the
+  cross-language source of truth.
+- **Override precedence** (highest first, in `experimental/pulp-rs/src/tool_version.rs`):
+  `PULP_TOOL_<ID>_VERSION` env var → `$PULP_HOME/tool-overrides.json` (durable;
+  what `--version` writes) → registry `pinned_version`. `pulp tool info`
+  surfaces the **active version** and its **source** (text + `--json` as
+  `active_version` / `active_version_source`), so it is always explicit which
+  version is in effect and why.
+- **When you add a managed tool, touch (same PR):** the registry entry (with
+  `pinned_version`), and — if you extend the update/override surface itself —
+  `tool.rs` + `tool_version.rs` + their tests, `docs/status/cli-commands.yaml`
+  (`tool` subcommands), `docs/reference/cli.md#tool`, and
+  `docs/reference/extending-pulp.md`. The full convention lives in
+  [extending-pulp.md](../../../docs/reference/extending-pulp.md#every-added-tool-must-be-user-updatable-and-overridable).
+
+### `pulp tool install <in-tree python tool>` — `source_dir` install
+
+A Python tool that lives **inside this repo** (not on PyPI) registers as a
+normal `python_pip` entry but adds two descriptor fields:
+
+- `source_dir` — repo-relative package dir (with a `pyproject.toml`), e.g.
+  `tools/audio/quality-lab`. When set, `install_python_tool` pip-installs that
+  directory (resolved via `repo_root_from_registry(find_tool_registry_path())`)
+  instead of `<pip_package>==<version>`. This mirrors the repo-local
+  `npm_package` precedent.
+- `module` — the `python -m <module>` the run wrapper invokes (e.g.
+  `quality_lab.cli`); defaults to `pip_package` for classic PyPI tools.
+
+The managed venv still lands under `$PULP_HOME/tools/python-envs/<id>/`, so
+`locate_tool` / `uninstall_tool` need no change. The tool's `pyproject.toml`
+owns its dependency list (mirror `requirements.txt`). Per the parity rule
+above, both new fields are also declared in `experimental/pulp-rs/src/tool_registry.rs`
+(serde `#[serde(default)]`, ignored on the delegated install path) so `pulp
+tool info`/`list` round-trip them. First user: `audio-quality-lab`.
+
+### Remove/uninstall commands name what they deleted
+
+Every extend-surface removal (`pulp tool uninstall`, `pulp kit remove`, `pulp
+content remove`, `pulp add --remove`) closes on an OK line that **names what it
+removed**, not just the id — this is the shared extend-surface lifecycle
+contract (see `docs/reference/extending-pulp.md`). `tool uninstall` prints
+`(removed <path>)` from the returned `PathBuf`; `content remove` mirrors it with
+the deleted content-pack path; `kit remove` deletes a *set* of lock-recorded
+files, so it names the count instead (`(removed N files)`). When you add or
+change a removal command, keep the OK line honest — echo the concrete path (or
+count, for multi-file removals) the command actually deleted, and assert it in
+the command's test via `capture_stdout_for` so "it names what it removed" is
+proven, not assumed.
+
+### Package suggestion and analyzer metadata commands
+
+Package search/suggestion code (`tools/cli/package_commands_search.cpp`) is a
+user-facing CLI surface even when the change is "just output shaping." Keep the
+plain-text and `--format json` lanes semantically aligned:
+
+- JSON output must escape strings through the shared helper, not by hand-writing
+  raw descriptor fields into JSON.
+- `pulp suggest` filters license-gated packages by default; the
+  `--include-license-gated` flag is the explicit inspection path for packages
+  whose license is rejected or needs review. When changing this lane, keep the
+  omission counts and human hints in sync with JSON fields so automation and
+  terminal output tell the same story.
+- Analyzer descriptor plumbing in `package_analyzer_descriptors.{hpp,cpp}` is
+  metadata-only. It maps package `provides` tokens into
+  `pulp::audio::AnalyzerDescriptor` records for UI/control-thread discovery.
+  It must not install packages, fetch network state, launch tools, or enter
+  realtime paths. If a new analyzer capability token lands in package metadata,
+  update the mapping, CLI build list, package command tests, and any package
+  docs/skills that describe discoverable analyzer providers in the same PR.
+
+### Binary subcommand delegation
+
+`BinaryCommand` entries in `tools/cli/pulp_cli.cpp` delegate to helper binaries
+inside the active build tree, e.g. `pulp import-design` launches
+`tools/import-design/pulp-import-design`. Do not hard-code `build/` for these
+lookups: CI uses matrix-scoped directories such as `build-linux`,
+`build-macos`, and `build-windows`, and self-hosted macOS can mask mistakes
+with stale warm `build/` artifacts. Resolve helpers from the running CLI's
+sibling build tree first, honor `PULP_BUILD_DIR` when present, and keep
+`test/test_cli_shellout.cpp` subprocess-output `INFO(...)` diagnostics so
+future failures show the delegated binary's stderr.
+
+On multi-config generators (MSVC / Visual Studio), the helper executable lives
+under the configuration directory, e.g.
+`build-windows/tools/import-design/Release/pulp-import-design.exe`, while the
+delegated relative path remains `tools/import-design/pulp-import-design`.
+Candidate lookup must therefore check both the direct single-config path and
+`Release` / `RelWithDebInfo` / `Debug` / `MinSizeRel` subdirectories, preferring
+the config inferred from the running `pulp-cpp` path when it is itself under
+`tools/cli/<config>/`. Add or keep a focused `delegate_to_build_binary` test
+that asserts the missing-helper diagnostic includes a `Release` candidate; a
+macOS/Linux single-config build will otherwise miss this Windows-only failure
+mode.
+
+**Cwd independence (2026-05-14):** `delegate_to_build_binary` in
+`tools/cli/cli_delegate.cpp` MUST NOT require `cwd` to be inside a Pulp
+project to find a delegate. Sibling helpers live next to the CLI binary
+itself, so the argv[0]-relative resolution path is authoritative and
+project-root is a fallback. The original `require_project_root()` gate
+broke `cd /tmp && pulp import-design --from claude --file ~/x.html` for
+no good reason — a first-time user shouldn't need to `cd` into a pulp
+checkout just to translate a design file with absolute paths. When the
+delegate truly is missing, the error message lists every candidate path
+that was tried and gives the exact `cmake --build` line to remediate;
+do not regress to "Run `pulp build` first" — that's misleading if the
+top-level target doesn't depend on the missing helper.
+
+**Delegated exit codes must be decoded (2026-06-02):** `run()` in
+`tools/cli/cli_common.cpp` returns `std::system`, which on POSIX is a
+*waitpid status*, NOT the child exit code — a child exit of 2 comes back
+as `0x200`, and propagating it as the CLI's own exit code truncates to 0
+(`& 0xFF`). That silently turned delegated failures into success: e.g.
+`pulp import-design --export-tokens --format bogus` (which the helper
+exits 2 for) read as exit 0 through `pulp-cpp`. `run()` now routes through
+`decode_system_status()` (WIFEXITED/WEXITSTATUS on POSIX, raw on Windows,
+128+signal for signalled children); the spinner-runner does the same.
+Any new `std::system` call that feeds an exit code MUST decode it the same
+way. Covered by `pulp delegates a non-zero child exit code intact` in
+`test/test_cli_shellout.cpp` (which runs against `pulp-cpp`, the delegate).
+
+**Prefer `pulp::platform::exec` over `std::system` for quoted-path shell-outs
+on Windows (2026-06-14):** `std::system(cmd)` runs `cmd.exe /c <cmd>`. When
+`<cmd>` *starts with* a quoted path **and** contains further quotes (e.g. quoted
+arguments and a quoted redirect target — the common shape `"C:\tool.exe"
+--output "C:\out" > "C:\log" 2>&1`), `cmd /c` mis-parses it and aborts with
+*"The filename, directory name, or volume label syntax is incorrect"* before
+running anything — so the tool never launches and no output/redirect file is
+created. Reproduced against a real Windows host through the CRT `system()`. The
+robust fix is to **not go through the shell at all**: spawn the tool with
+`pulp::platform::exec(program, args_vector, timeout_ms)`, which passes an argv
+array straight to the process (no `cmd`, no quote parsing). `pulp kit verify
+--execute-screenshots` (`maybe_execute_screenshot_profile` in
+`tools/cli/kit_commands.cpp`) hit this — it now uses `exec()` for both the
+direct-`.exe` path and the `.cmd`/`.bat` path (`exec("cmd", {"/C", shell_command})`).
+If you must use `std::system` (e.g. you genuinely need shell features) and the
+command begins with a quoted path, wrap the ENTIRE command in one extra pair of
+double quotes (`command = "\"" + command + "\"";`) so `cmd` strips exactly that
+pair and runs the remainder verbatim.
+
+### A CLI subcommand that renders shells out to `pulp-screenshot`
+
+`pulp design gallery` renders each tagged card by spawning the sibling
+`pulp-screenshot` binary rather than linking Skia/Dawn into the CLI process —
+the CLI stays GPU-free and testable, and the render tool owns the backend. Two
+conventions apply to any subcommand that does this:
+
+- **Locate the sibling next to the CLI first**, then under `<root>/build/tools/
+  screenshot`, and let the user override with an explicit `--screenshot <bin>`
+  (mirrors `delegate_to_build_binary`'s cwd-independent search). If it is not
+  found, fail with an actionable message or offer a `--no-render` inventory
+  mode — never silently emit an artifact full of broken images.
+- **Spawn with `pulp::platform::exec(bin, args_vector)`, not a shell string.**
+  The command begins with a quoted path and carries quoted `--output`/`--script`
+  args — the exact shape `std::system`'s `cmd /c` mis-parses on Windows (see the
+  quoted-path note above). The argv array sidesteps the shell entirely and gives
+  a `timed_out` flag for the render wall-clock cap.
+
+The render output is content-hash cached: the PNG filename embeds
+`gallery_content_hash(bytes)`, so an unchanged card at an unchanged viewport maps
+to a file that already exists and is skipped. Keep the pure card model
+(`core/view/src/design_gallery.cpp`) free of filesystem/render concerns — the CLI
+owns the walk, the cache, and the shell-out; the core only parses tags and
+serializes the manifest/HTML.
+
+### `pulp design` splits offline verbs from the live-tool launcher
+
+`cmd_design.cpp` is only the verb dispatcher plus the live GPU design-tool
+launcher (project discovery, build, watch loop, spawn). The nine pure-data
+offline handlers — `lint`, `diff`, `compile`, `lint-adherence`, `record`,
+`gallery`, `handoff`, `variants`, `tweak` — live in `cmd_design_subcommands.cpp`
+behind the `pulp::cli::design` namespace, declared in
+`cmd_design_subcommands.hpp`. To add a new offline `pulp design <verb>`: add the
+`run_<verb>` handler (and its private helpers) to `cmd_design_subcommands.cpp`,
+declare `run_<verb>` in the header, and wire one `args[0] == "<verb>"` branch in
+the `cmd_design` dispatcher. Handlers must not open a window; they read/write
+files and call the design cores in `core/view`. Keep helpers namespace-local so
+they stay implementation-private.
+
+### Numeric CLI flags
+
+For count-like flags such as `pulp run --frames`, parsers should accept only
+plain non-negative decimal digits and reject a leading `+`. C++ `from_chars`
+acceptance varies by implementation for signed prefixes, and the Rust-facing
+CLI surface should stay deterministic across platforms. Add regression tests
+for boundary spelling when changing these parsers.
+
+`pulp run` forwards each launcher flag two ways — as argv AND as an env var —
+so the standalone host picks up whichever it reads. When adding a flag here
+(`cmd_run_parse.cpp` parses into `ParseRunResult`; `cmd_run.cpp` exports the
+env var + builds argv via `assemble_launch_args`), wire BOTH and add the flag
+to the `print_help` text plus the `pulp run --help` shellout assertion in
+`test_cli_shellout.cpp` and the parser test in `test_cli_run_options.cpp`.
+The Audio Inspector flags follow this shape: `--audio-inspector` →
+`PULP_AUDIO_INSPECTOR=1` (does NOT imply headless); `--audio-probe-json <path>`
+→ `PULP_AUDIO_PROBE_JSON=<path>` (implies headless, like `--screenshot`);
+`--audio-scope-json <path>` → `PULP_AUDIO_SCOPE_JSON=<path>` (+ window/trigger/
+channel); `--audio-capture-wav <file>` → `PULP_AUDIO_CAPTURE_WAV=<file>` (+
+`--audio-capture-frames` → `PULP_AUDIO_CAPTURE_WAV_FRAMES`), which dumps the live
+output ring to a WAV for `pulp audio validate`, implies headless, and shares the
+single capture FIFO with `--audio-inspector` / `--audio-scope-json` (the three
+are mutually exclusive at parse time). A bare `--audio-probe-json` /
+`--audio-scope-json` / `--audio-capture-wav` run is headless but must NOT
+auto-assign a default screenshot PNG path — guard the headless-default branch on
+all three being empty. See `docs/guides/audio-inspector.md`.
+
+The live window also reads display-only waveform env vars:
+`PULP_AUDIO_INSPECTOR_TRIGGER=rising-zero`, `PULP_AUDIO_INSPECTOR_GRID=0`, and
+`PULP_AUDIO_INSPECTOR_SCALE=<n>`. These are not CLI parse flags and do not
+change the probe JSON or audio path.
+
+Headless here means "no visible UI", not "no system audio". `pulp run` still
+launches a standalone host and may activate the live audio device, including the
+`--audio-probe-json` path. Keep the pre-launch stderr notice wired in
+`cmd_run.cpp`, keep `PULP_RUN_AUDIO_NOTICE=0` as the explicit quiet-automation
+escape hatch, and prefer Audio Doctor / `HeadlessHost` for no-speaker tests.
+
+### Import-design artifact flags
+
+`pulp import-design --output <path>` is the destination for the primary
+artifact, not an artifact-kind selector. Keep sidecar anchoring tied to
+`--output` while using `--emit {js|ir-json|cpp|swiftui}` for the primary artifact
+vocabulary. Accepted import-design artifact or runtime values must stay aligned
+across `pulp_import_design.cpp`, `docs/reference/cli.md`,
+`docs/reference/design-import.md`, `docs/status/cli-commands.yaml`, and the
+import-design skill.
+
+`--emit swiftui` (baked SwiftUI, Workstream B1) is a fourth lowering parallel to
+`cpp` — baked-only, mirroring cpp's enum/parse/validation/dispatch in
+`pulp_import_design.cpp` (`generate_pulp_swift`). Its sidecars are per-view —
+`<RootView>.swift` + a `<RootView>Theme.swift` + `<RootView>.bindings.json` — so
+two imports never collide on a shared theme. `--screenshot-backend {skia|coregraphics}`
+selects the `--validate` render backend (default skia, the faithful path that
+composites file-backed images; see the `screenshot` skill).
+
+`--format` is a separate axis from `--emit`: it picks the **token file** format,
+not the primary artifact kind. Values are `w3c` (default, DTCG JSON),
+`css-variables` (CSS custom properties; base → `:root`, `.dark`-suffixed modes →
+`@media (prefers-color-scheme: dark)`; sidecar default flips from `tokens.json`
+to `theme.css`), and the `tailwind`/`json-tailwind`/`css-tailwind` variants.
+Token dispatch is exhaustive on purpose: an unknown `--format` exits 2, and the
+Tailwind variants are gated to `--from designmd` (they re-parse DESIGN.md for
+section context) — on `--export-tokens` or any non-designmd source they exit 2
+rather than silently emitting W3C under the requested name (generalizing them is
+Workstream A2). Keep `--format` values aligned across `pulp_import_design.cpp`,
+the help text, `docs/reference/design-import.md`, and the import-design skill.
+
+For `--emit ir-json`, asset-manifest flags are part of that same synced surface:
+`--allow-network-fetch`, `--asset-cache`, `--asset-timeout-ms`, and repeated
+`--asset-hash <uri=sha256>`. Keep their help text, YAML manifest rows, reference
+docs, and import-design skill text in lockstep. Network asset fetching must
+remain explicit opt-in; default JS emission should not fail just because an IR
+asset reference points at HTTP(S).
+
+`--mode baked` is implemented for `--emit ir-json` and `--emit cpp`; `cpp`
+requires baked mode. `--mode live` remains the default and `--from jsx --mode
+live --emit js` writes the precompiled bundle verbatim. Because that path does
+not parse or render the bundle, it must reject `--validate`, `--reference`,
+`--diff`, and `--debug` with a clear usage error rather than silently bypassing
+shared post-processing. When changing this lane, keep the CLI help,
+`docs/status/cli-commands.yaml`,
+`docs/reference/cli.md`, `docs/reference/design-import.md`, and the
+import-design skill aligned. The JSX baked snapshot policy is
+`--snapshot-semantics {fail|warn|accept}`: `fail` rejects dynamic APIs by
+default, `warn` proceeds with a structured diagnostic, and `accept` proceeds
+silently.
+
+The shipped import-design default is `--mode live --emit js`. User preference
+overrides belong in the existing config surface as
+`import_design.default_mode` (`live|baked`) and `import_design.default_emit`
+(`js|ir-json|cpp`), with `PULP_IMPORT_DESIGN_DEFAULT_MODE` /
+`PULP_IMPORT_DESIGN_DEFAULT_EMIT` as one-environment overrides. Keep C++ and
+Rust `pulp config`, `pulp status`, the import-design helper, docs, slash
+commands, and the MCP status output aligned whenever these keys change. If
+only `default_mode=baked` is configured, `ir-json` is implied.
+
+**Adding a `pulp config` key:** `cmd_config.cpp` allow-lists every key in three
+places — `is_allowed_key`, `validate_value`, and the `list` dump (plus the
+`usage()` help text). Add the key to all of them or `set` rejects it / `list`
+omits it. Example: `[claude] send_user_file` (`on|off`, default `on`) gates the
+plugin's `SessionStart` hook (`hooks/scripts/inject-claude-prefs.sh`) that tells
+the agent to surface image/file artifacts via `SendUserFile`. A config-only key
+needs no `cli-commands.yaml` subcommand entry (it's not a new command), but do
+update the command `summary` there + `docs/reference/cli.md#config` + a
+`test_cli_shellout.cpp` get/set/validate case. Reading config from a hook (bash)
+means a small TOML scan — scope the read to the right `[section]` so a same-named
+key in another table can't flip it.
+
+**Sidecar output anchoring:** when a CLI command takes `--output
+<path>/main.ext` and also emits sidecar artifacts (e.g.
+`pulp import-design` writes `bridge_handlers.cpp`, `classnames.json`,
+`tokens.json` alongside `ui.js`), the sidecars MUST default to the same
+directory as `--output` — not cwd. Track an `_explicit` bool per sidecar
+flag and only derive the anchored path when the user didn't set it.
+Scattering sidecars to cwd is a first-user trap (we hit it 2026-05-14
+during a `cd /tmp` reimport demo). Test the default-anchored path AND
+the explicit-override path so regressions surface.
+
+### Adding a new value to an enum-like flag (e.g., `--from <source>`)
+
+When extending a flag that takes one of a fixed set of values
+(`pulp import-design --from {figma,stitch,v0,pencil,claude,...}`,
+`pulp validate --target {auval,clap-validator,pluginval,...}`, etc.),
+all four surfaces have to land in the same PR or the skill-sync gate
+trips:
+
+1. The CLI source switch (`tools/import-design/pulp_import_design.cpp`,
+   etc.) — accept the new value in the parser **and** the dispatch.
+2. The slash command file under `.claude/commands/` — usage block,
+   examples, and any "when to detect this" notes.
+3. The matching topical `.agents/skills/*/SKILL.md` — same prose,
+   kept in sync so the agent's pre-context matches what the slash
+   command says.
+4. The path map (`tools/scripts/skill_path_map.json`) — add the new
+   header/source paths if the new source brings new C++ files.
+
+Reason this gets called out: editing `.claude/commands/<name>.md` maps
+to the **`cli-maintenance`** skill (because the path map owns
+`.claude/commands/**`), not to the topical skill. So a diff that
+updates the slash command + the topical skill but leaves
+cli-maintenance untouched still trips skill-sync. Keep this section
+present so the gate stays satisfiable by the topical edit alone.
+`--from claude` is the worked example.
+
+### Adding a credential flag backed by an env-file (`pulp ship notarize` pattern)
+
+When a CLI command needs to consume a credential the user wants to
+persist outside `~/.pulp/config.toml` (e.g. App Store Connect API key,
+ASIO licence file, S3 access keys), follow the lane established for
+`pulp ship notarize --api-key/--api-key-id/--api-issuer`:
+
+1. **Parser** in `tools/cli/notary_env.{hpp,cpp}` (or a sibling file).
+   Hand-roll a tiny bash-style `KEY=VALUE` parser. Support `# comments`,
+   blank lines, `"double quoted"` (with `$HOME` expansion) and
+   `'single quoted'` (literal) values, `export KEY=val` prefix, and
+   trailing ` # inline comment` on bare values. Keep it stdlib-only so
+   the unit test can link it directly without dragging `pulp::runtime`
+   into the test binary.
+2. **Resolver** with a pluggable `getenv` lambda. Layer **CLI flag >
+   env var > parsed file > config.toml**, and record the source of
+   each value (`"cli"` / `"env"` / `"file"`) so the CLI can print
+   diagnostics like `key-id: ABC (from file)`. Cred path values must
+   be redacted to the trailing filename (`…/AuthKey_X.p8`) — never log
+   the secret material itself.
+3. **Default path**: `$HOME/.config/pulp/secrets/<name>.env`,
+   overridable via `PULP_<NAME>_ENV` env var and a `--env-file <path>`
+   flag (the env var is the test hook; the flag is for CI sandboxes).
+4. **`--dry-run`** that short-circuits before the real side effect and
+   prints the assembled subprocess argv. Lets the shell-out test
+   verify resolution without touching the external service.
+5. **Test layers**: a pure-stdlib unit test for the parser + resolver
+   (compiled directly against the source, no `pulp::runtime` link),
+   plus shell-out cases in `test/test_cli_*_shellout.cpp` covering
+   `--dry-run` with CLI flags, with an env file, with CLI overriding
+   env file, and the no-creds error path.
+6. **Skill + doc updates**: extend the topical SKILL.md (here,
+   `ship/SKILL.md`) with the resolution precedence table, and add the
+   new flags to `docs/reference/cli.md` + `docs/status/cli-commands.yaml`.
+
+Reference implementation: PR landing `feature/asc-notary-key-flow`
+(2026-05-26). Files: `tools/cli/notary_env.{hpp,cpp}`,
+`tools/cli/cmd_ship.cpp` (`notarize` block), `test/test_notary_env.cpp`,
+`test/test_cli_ship_shellout.cpp` ASC-key cases.
+
+### A subcommand that orchestrates other subcommands (`pulp ship share`)
+
+`cmd_ship` calls itself recursively (`cmd_ship({"notarize", "--path", ...})`)
+to compose stages — `share` and `release` both reuse the `notarize` handler's
+credential-resolution chain rather than duplicating it. When you add a flag
+like `--path` to a leaf subcommand, any orchestrating subcommand can thread it
+through for free. Conventions that kept this testable without Apple creds:
+
+- Add a `--dry-run` to orchestrators (`share`) that prints the plan and returns
+  0 before any `codesign`/`notarytool`/`spctl` call — shellout tests assert the
+  plan text. Mirror the existing `notarize --dry-run` / `auv3-xcodeproj
+  --dry-run` pattern.
+- Put guard rails (input not found, unsupported extension, missing identity)
+  *before* the side-effecting work so they're exercised by credential-free
+  shellout tests.
+- Keep accepted orchestrator flags discoverable across `cmd_ship` help/usage,
+  `docs/reference/cli.md`, `docs/status/cli-commands.yaml`, topical skill text,
+  and parser-error shellout coverage. The `share` path accepts `--output` and
+  `--entitlements` in addition to credentials/dry-run; if either changes,
+  update all surfaces together.
+- For `pulp ship sign --path`, describe the argument as an explicit desktop
+  artifact rather than an Apple-only `.app`/`.dmg`/bundle set. The same CLI
+  primitive dispatches to macOS `codesign` or Windows `signtool`; `.pkg`
+  installers are intentionally rejected because `package` signs them at
+  creation time.
+- A subcommand of `ship` does NOT need its own top-level slash command or a
+  `commands` top-level entry — it lives under the `ship` entry's `subcommands`
+  in `cli-commands.yaml` and the `/ship` slash command. `cli_sync_check.py`
+  only diffs top-level commands, so a new ship subcommand won't show there;
+  keep the `ship` subcommand list in `cli-commands.yaml` current by hand.
+
+Reference: `feature/ship-oneoff-notarize` (2026-06-01). Files:
+`tools/cli/cmd_ship.cpp` (`sign --path`, `notarize --path`, `release` artifact
+selection, `share`), `test/test_cli_ship_shellout.cpp` `[oneoff]` cases,
+`.claude/commands/ship.md`, `.agents/skills/ship/SKILL.md`.
+
+### SDK build strips the dev authoring surface (§6a)
+
+`cli_sdk.cpp`'s release configure deliberately disables the developer-only
+surfaces so shipped SDKs / plugins don't carry them: it passes
+`-DPULP_ENABLE_AUDIO_PROBES=OFF` **and** `-DPULP_ENABLE_INSPECTOR=OFF` (the
+inspector is the in-plugin authoring / MCP-reachable surface). The scaffolded
+project templates (`tools/templates/.../build.gradle.kts.template`) mirror this.
+
+Keep the two flags together when editing the SDK configure command. A developer
+who deliberately wants an inspectable / MCP-reachable plugin re-enables it in
+their own plugin build with `-DPULP_ENABLE_INSPECTOR=ON`. The standalone `pulp`
+CLI and the MCP server (`tools/mcp/pulp_mcp.cpp`) are **separate binaries** —
+not compiled into a plugin — so this flag never strips them; bundling them
+alongside a plugin distribution is a packaging choice.
+
+The SDK build also passes `-DPULP_ENABLE_DESIGN_IMPORT=OFF`, which strips the
+design-import authoring cluster (importers, codegen, `lock_to_source`,
+`jsx_lock`, `token_lock`, runtime design-import) from shipped plugins. The
+runtime W3C token pair (`importDesignTokens` / `exportDesignTokens`, via
+`core/view/src/w3c_tokens.cpp`) stays compiled; `WidgetBridge::install_runtime_import_handlers()`
+becomes a no-op stub. Keep all three strip flags (audio-probes / inspector /
+design-import) together in the SDK configure command. Building the test suite
+requires `PULP_ENABLE_DESIGN_IMPORT=ON` (the CMake gate hard-errors otherwise);
+a stripped build uses `PULP_BUILD_TESTS=OFF`.
+
+## Removing a CLI Command
+
+- [ ] Remove from `cmd_*.cpp` and command table in `pulp_cli.cpp`
+- [ ] Remove from `cli_common.hpp` declarations
+- [ ] Remove from `CMakeLists.txt`
+- [ ] Remove from `cli-commands.yaml`
+- [ ] Remove slash command if it exists
+- [ ] Remove from `docs/reference/cli.md`
+- [ ] Search all skills: `grep -r "pulp <name>" .agents/skills/`
+- [ ] Search CLAUDE.md
+- [ ] Run sync check
+
+## CLI Git/CMake shell helpers
+
+`tools/cli/cmd_project_common.cpp` and `tools/cli/cmd_misc.cpp` shell out to
+`git` / `cmake` from unit-tested helper paths, including Windows CI. Keep
+output redirection platform-aware: POSIX uses `/dev/null`, but Windows
+`cmd.exe` needs `NUL`. Do not add raw `2>/dev/null` or `>/dev/null 2>&1` in
+these files; route new call sites through the shared `stderr_to_null()` or
+`output_to_null()` helpers in `tools/cli/shell_redirect.*` instead. Otherwise
+Windows can leak "The system cannot find the path specified." into stderr,
+misreport clean/dirty git state, or fail origin-main probes even though the
+same tests pass on macOS/Linux. The `pulp status quotes source checkout paths
+before reading Git metadata` test covers the stderr contract locally; Windows
+CI is the platform proof for the null-device behavior.
+
+### pin / unpin / floating SDK mode
+
+`pin` is the primary command name; `bump` survives as a deprecated alias
+through `cmd_project`'s dispatch (`if (sub == "pin" || sub == "bump")`).
+When adding a new project subcommand, add the canonical name AND keep
+any old alias for one minor release — existing scripts and skill examples
+break otherwise.
+
+The Rust user-facing CLI must mirror the same surface in
+`experimental/pulp-rs/src/cmd/project.rs`, `experimental/pulp-rs/src/main.rs`,
+and `experimental/pulp-rs/src/help.rs`. Do not update only the C++ command:
+`pin`, `bump`, `unpin`, and `undo` all need Rust parser/help coverage too.
+
+`pulp project unpin` rewrites `pulp.toml`'s `sdk_version` to `"latest"`
+in-place (single-line value swap, preserving surrounding TOML
+structure and comments). Do NOT delete the field — downstream tooling
+that greps for it loses a clear signal. The dispatch entry lives at
+the same spot as `pin`/`bump`/`undo` and shares `find_bumpable_project_root_from`.
+
+`sdk_version = "latest"` is the floating-SDK marker. Resolution happens
+in `read_sdk_version()` (cli_common.cpp) — `"latest"` becomes the
+newest installed version under `~/.pulp/sdk/<x.y.z>/`, falling back to
+`PULP_SDK_VERSION` when none are installed. Callers that need to
+distinguish the floating marker from a real semver use
+`read_raw_sdk_version()` + `is_floating_sdk()`. Don't open-code the
+"latest" comparison anywhere — both helpers are exported from
+cli_common.hpp so the comparison stays in one place.
+
+`pulp create` writes `sdk_version = "latest"` by default
+(cmd_create.cpp). The `--pin` flag opts into exact-version pinning
+at create time. Both code paths print a discoverable post-create
+message about `pulp project pin` so users learn the opt-in command
+without hunting.
+
+The Rust-native `pulp create --ci` path is a scaffold-only fallback: it
+parses the full create flag inventory for help/parity, but full-path flags
+such as `--pin` and `--debug` only take effect through the delegated C++
+create path. Keep those flags modeled in `CreateArgs` so the native `--ci`
+path can warn when it ignores them instead of silently treating them like
+typos.
+
+## `pulp pr` — shim over `shipyard pr`
+
+By default `pulp pr` delegates to `shipyard pr` (on PATH), forwarding argv.
+Shipyard owns skill-sync, version-bump, PR creation, tracking state, and
+cross-host validation; `pulp pr` exists so the old invocation, the `/pr`
+slash command, and natural-language triggers in the `ci` skill all continue
+to work. Users can explicitly opt out per checkout with
+`pulp config set pr.workflow github` or `manual`, or for one command with
+`--workflow` / `PULP_PR_WORKFLOW`.
+
+Invariants:
+
+- When `shipyard` is on PATH, `pulp pr` execs `shipyard pr <args>` and exits
+  with shipyard's status. Do NOT add pre/post-processing in `cmd_pr.cpp` —
+  shipyard is the single source of truth.
+- When `shipyard` is NOT on PATH, `pulp pr` prints an install hint pointing
+  at `tools/install-shipyard.sh` and exits non-zero. It must NOT silently
+  fall back to `gh`; that is how Shipyard tracking gaps happen. Update the
+  hint text in `cmd_pr.cpp::print_install_shipyard_hint()` when the install
+  path changes.
+- `pr.workflow=github` is the explicit GitHub CLI path. It requires `gh` on
+  PATH, runs the native gate/bump/PR flow, and leaves Shipyard tracking
+  disabled by design.
+- `pr.workflow=manual` prints the suggested commands and exits before
+  pushing or creating a PR.
+- `pulp status` reports the effective PR workflow and selected tool health.
+- `--native` keeps the legacy in-process orchestrator for forensic/debugging
+  use. Do not use it as the default path and do not document it as the
+  primary surface — Shipyard-managed `shipyard pr` is the primary surface.
+- `pulp pr` (shim or `--native`) still refuses to run on `main`.
+
+Gotchas:
+
+- **Changing `cmd_pr.cpp` triggers the cli-maintenance skill-sync gate.**
+  If you're modifying the shim, the install hint, or `--native` logic,
+  add a bullet here and you're covered. If the change is mechanical (e.g.
+  renaming a helper) and genuinely doesn't need skill documentation, add a
+  `Skill-Update: skip skill=cli-maintenance reason="..."` trailer on the
+  tip commit.
+- **Don't call the Python scripts (`skill_sync_check.py`,
+  `version_bump_check.py`) by hand.** `shipyard pr` calls them with the
+  right flags via the shim. Direct invocation skips the commit-trailer
+  parsing and the PR-body rendering.
+- **Bump level is per-surface.** A plugin-only `feat:` in a commit subject
+  does not upgrade the SDK. The `Version-Bump: <surface>=<level>` trailer
+  is authoritative and surface-scoped.
+- **`pulp version check --with-bump-check`** is the fast sanity check to
+  run *before* `pulp pr` if you want to see what the gate will say. Same
+  script, `--mode=report`.
+
+## `pulp macos` — per-PR macOS-runner retargeting
+
+`tools/cli/cmd_macos.cpp` plus `.github/workflows/build-macos.yml`.
+
+`pulp macos retarget --pr N --to <local|namespace|github-hosted>` cancels
+any in-flight macOS-bearing workflow_runs for PR N (from both `build.yml`'s
+matrix and any prior `build-macos.yml` dispatch) and fires a fresh
+`gh workflow run build-macos.yml --ref <pr-head> --field runner=<choice>`.
+
+Why a separate workflow file (and not just a new `pulp pr --retarget-macos`
+flag): the `build.yml` matrix couples Linux/Windows/macOS into one
+workflow_run. Rerunning macOS via that matrix re-runs Linux/Windows too.
+`build-macos.yml` is independent — it produces its own `macos`-named
+check that supersedes the matrix's `macos` check by recency. Branch
+protection's required-check name stays one stable token.
+
+`pulp macos status --pr N` reads the latest `macos` check from the GitHub
+check-runs API for the PR's head SHA. Useful for confirming a retarget
+landed and which runner pool picked it up.
+
+Repo variables the workflow reads (defined globally for `build.yml`'s
+overflow logic; reused here unchanged):
+- `PULP_LOCAL_MACOS_RUNS_ON_JSON` — `--to local`
+- `PULP_NAMESPACE_BUILD_MACOS_RUNS_ON_JSON` — `--to namespace`
+- (`--to github-hosted` is always `"macos-15"`, no var needed)
+
+When this is the right tool vs. `shipyard rescue`:
+
+| Goal | Tool |
+|------|------|
+| Move one PR's macOS to a different pool without disturbing Linux/Windows | `pulp macos retarget` |
+| Move multiple PRs' workflow_runs to a different provider (cancel + redispatch the WHOLE workflow) | `shipyard rescue` |
+
+## `pulp overflow` — macOS overflow routing
+
+`tools/cli/cmd_overflow.cpp`. Wraps three repo variables that
+`.github/workflows/build.yml`'s resolve-provider reads:
+
+| Var | Purpose |
+|-----|---------|
+| `PULP_LOCAL_MACOS_RUNS_ON_JSON` | Selector when local has capacity |
+| `PULP_NAMESPACE_BUILD_MACOS_RUNS_ON_JSON` | Selector when local is saturated (overflow target; despite the historical name, this is the generic overflow var) |
+| `PULP_LOCAL_MAC_OVERFLOW_THRESHOLD` | BUSY count that trips overflow |
+
+Surfaces:
+
+- `pulp overflow status` — show current state, including which runner
+  the local target points at, the overflow target, threshold value, and
+  registered self-hosted runners (if the default token can list them).
+- `pulp overflow enable [--to <selector>]` — set the overflow target.
+  Default `--to "macos-15"` for free GH-hosted; pass
+  `--to '"namespace-profile-generouscorp-macos"'` for paid Namespace.
+- `pulp overflow disable` — delete the overflow var. Note this only
+  changes future dispatches; in-flight cloud runs keep running.
+- `pulp overflow threshold [N]` — get (no arg) or set the BUSY count.
+
+The variable is named `PULP_NAMESPACE_BUILD_MACOS_RUNS_ON_JSON` for
+historical reasons (Plan B in `planning/2026-05-13-namespace-overflow-
+implementation.md` originally targeted Namespace exclusively). It now
+holds the overflow target regardless of provider — rename tracked as a
+future cleanup.
+
+## `pulp upgrade --check-only`
+
+The sandbox E2E harness runs this command with
+`PULP_UPDATE_CHECK_DISABLED=1` and expects a non-silent, network-free result.
+If the update cache is empty in that mode, print the installed CLI version
+and an explicit disabled/not-queried latest-version line instead of probing
+GitHub Releases. Otherwise PR sandbox lanes can fail spuriously when GitHub
+release fetches are blocked or rate-limited.
+
+## `pulp upgrade` self-heals PATH
+
+After a successful self-update, `cmd_upgrade.cpp` calls
+`upgrade_install::ensure_dir_on_path(install_dir, ...)` to append the CLI's own
+directory to the user's shell profile (`.zshrc` / `.bash_profile` / `.bashrc` /
+fish `config.fish` / `.profile`) when it isn't already on `$PATH`. This closes a
+real gap: the curl `install.sh` adds PATH, but a user who first got `pulp` via a
+source / SDK-prefix install (`cmake --install --prefix ~/pulp-sdk` → the binary
+lands at `~/pulp-sdk/bin/pulp`) could `pulp upgrade` successfully yet still hit
+"command not found" in a fresh shell. The helper is pure on its inputs (env
+passed in, not read from globals) so it is unit-tested in
+`test_cli_upgrade_install.cpp` without mutating the process environment. It
+honors `PULP_NO_MODIFY_PATH=1` (same opt-out as `install.sh`) and is idempotent
+(skips when the profile already references the dir). If you change the
+profile-selection logic, keep it in sync with `tools/install/install.sh`'s PATH
+block so the two install surfaces agree.
+
+## `pulp run --headless / screenshot / live audio flags`
+
+`tools/cli/cmd_run.cpp` plus the shared parser in
+`tools/cli/cmd_run_parse.cpp` (`parse_run_options` / `assemble_launch_args`)
+expose CI-friendly rendering flags and live-audio inspection flags on top of
+the basic launch path. The Rust front end mirrors this surface in
+`experimental/pulp-rs/src/cmd/run_parse.rs`; keep both parsers and forwarding
+orders in lockstep.
+
+- `--headless` — run the standalone offscreen (no window). Forwarded
+  as `--headless` and as the `PULP_HEADLESS=1` env var so binaries
+  that read either source pick it up.
+- `--screenshot <path>` — save a PNG to `<path>` after rendering.
+  Implies `--headless`. Forwarded as `--screenshot <path>` AND
+  `PULP_SCREENSHOT=<path>`. If `--headless` is set without an
+  explicit screenshot path, the CLI writes
+  `build/<target>.png` so simple invocations still produce an
+  artifact.
+- `--frames <n>` — number of frames to render before capturing
+  (default 1). Forwarded as `--frames <n>` AND `PULP_FRAMES=<n>`.
+- `--watch` — re-launch the binary on file changes via the existing
+  `watch_loop` plumbing. Composes with the headless flags so dev
+  loops can render PNGs on every save.
+- `--audio-inspector` — open the live Audio Inspector. Forwarded as
+  `--audio-inspector` and `PULP_AUDIO_INSPECTOR=1`.
+- `--audio-probe-json <path>` — write live probe metrics JSON and exit.
+  Implies `--headless`, but does not imply a screenshot artifact. Forwarded
+  as `--audio-probe-json <path>` and `PULP_AUDIO_PROBE_JSON=<path>`.
+- `--audio-scope-json <path>` — write versioned live Audio Scope JSON and
+  exit. It owns the acquisition flags `--audio-scope-window`,
+  `--audio-scope-trigger`, and `--audio-scope-channel`; those flags are only
+  valid with `--audio-scope-json`. Forward all four argv values plus
+  `PULP_AUDIO_SCOPE_JSON`, `PULP_AUDIO_SCOPE_WINDOW`,
+  `PULP_AUDIO_SCOPE_TRIGGER`, and `PULP_AUDIO_SCOPE_CHANNEL`.
+- `--audio-capture-wav <path>` — write the live output ring to a WAV and
+  exit. It owns `--audio-capture-frames`, implies `--headless`, does not
+  imply a screenshot artifact, and shares the single live capture FIFO with
+  `--audio-inspector` / `--audio-scope-json`. Forward the argv pair plus
+  `PULP_AUDIO_CAPTURE_WAV`; forward `PULP_AUDIO_CAPTURE_WAV_FRAMES` only when
+  the frames option is explicitly positive. Keep the C++ parser, Rust parser,
+  C++ help, Rust help, docs/status entry, and skill text in sync.
+
+The CLI parser is unit-tested in `test/test_cli_run_options.cpp`
+(parse + forwarding contract) and end-to-end shell-out coverage lives
+in `test/test_cli_shellout.cpp`, which exercises
+the discover-binary → launch-with-flags → PNG-on-disk path against the
+fixture binary in `test/fixtures/cli_run_fixture.cpp`. Rust parser and
+orchestrator parity lives in `experimental/pulp-rs/src/cmd/run_parse.rs`
+and `experimental/pulp-rs/src/cmd/orchestrate.rs` tests; update these in the
+same PR whenever the C++ run parser gains a user-facing flag.
+
+Gotchas:
+
+- `--screenshot` without a path argument exits 2 with a diagnostic.
+  Bad `--frames` (non-integer / <= 0) exits 2 too. Both are caught
+  before project resolution so they fail fast in `--help`-adjacent
+  contexts.
+- CLI-owned launcher flags must appear before `--`; tokens after `--`
+  are passed through to the launched binary. Do not document
+  `pulp run -- --screenshot ...` as the screenshot path — use
+  `pulp run --headless --screenshot ...` and reserve `-- ...` for
+  target-specific arguments.
+- Both argv AND env vars are set on every invocation. Do not remove
+  the env-var fallback — older standalone binaries (and the
+  `pulp-screenshot` flow) read env first.
+- `--watch` is consumed by the CLI; it is NOT forwarded to the
+  launched binary. The launched binary just sees the headless
+  flags.
+- `--audio-scope-json` cannot be combined with `--audio-inspector` because
+  both consume the live capture FIFO.
+
+## `pulp validate` — plugin-format validators
+
+Runs `clap-validator` / `pluginval` / `auval` / optional AAX validator
+on built plugins in `build/{CLAP,VST3,AU,AAX}`. Lives in
+`tools/cli/cmd_validate.cpp`.
+
+Modes:
+
+- Default — best-effort. Missing validators skip gracefully but emit a
+  loud WARNING at the end listing each missing tool + install hint.
+- `--strict` — CI enforced tier. Any "skipped because tool not
+  installed" upgrades to exit 1. Use in CI gates.
+- `--all` — also run optional `vstvalidator` + full AAX validation.
+- `--json` / `--report <path>` — emit structured report
+  (`validation-report-v1.schema.json`).
+- `--screenshot` — capture plugin editor PNGs under
+  `artifacts/screenshots/` through `pulp::view::capture_view()`.
+- `--target {standalone|auv3|macho|all} <bundle...>` — run macOS runtime
+  validators on explicit bundle paths instead of walking `build/`.
+
+Gotchas:
+
+- **Missing-tool skip is NOT a silent pass.** The advisory at the end
+  of the run enumerates absent tools; `--strict` gates CI on it. A
+  green run without all four validators is *not* the same as a run
+  where all four passed — the advisory makes that visible.
+- **Each missing tool is reported once** even across many plugins.
+  The `note_missing` helper de-duplicates by tool name.
+- **Install hints are embedded in the code** — if you add a new
+  format lane, wire `note_missing("<tool>", "<format>", "<hint>")`
+  alongside the `++skipped_missing_tool` bump in the skip branch.
+  Otherwise `--strict` won't know about it.
+- **Exit code still follows `failed > 0` first.** `--strict` only
+  adds "OR any skipped-missing-tool" on top. Genuine validator
+  failures still fail without `--strict`.
+- **Validator-discovery preflight.** Before launching any
+  validator binary, `pulp validate` runs the same discovery used by
+  `pulp doctor --validators` and aborts cleanly if any candidate has
+  a broken code signature (the "ripped from .app bundle" pattern,
+  where amfid SIGKILLs the binary at launch with exit 137 / zero
+  stderr). If you add a new validator to `cmd_validate.cpp`, also
+  add it to the priority list in `tools/cli/validator_discovery.cpp`
+  so the preflight covers it.
+- **Keep `/validate` and the plugin guide current.** The slash command and
+  `docs/guides/claude-code-plugin.md` command table must describe the same
+  validator set and options as `cmd_validate.cpp`,
+  `docs/reference/cli.md#validate`, and `docs/status/cli-commands.yaml`.
+  Do not describe `pulp validate` as only `auval` / `clap-validator` /
+  `pluginval`; AAX, optional `vstvalidator`, reports, screenshots, strict
+  mode, and `--target` are part of the current surface.
+- **MCP mirrors project screenshot capture through `pulp_validate`.**
+  `pulp_validate` accepts `screenshot=true` and forwards `--screenshot` to
+  `cmd_validate.cpp`. Keep `tools/mcp/mcp_tools.cpp`, `tools/mcp/pulp_mcp.cpp`,
+  `test/test_mcp_server.cpp`, `docs/guides/claude-code-plugin.md`, and the
+  `pulp_screenshot` wording aligned so agents do not treat the demo/script
+  fixture renderer as the project plugin capture API.
+
+### `pulp doctor --validators`
+
+Discovers `auval` / `pluginval` / `clap-validator` across well-known
+paths (system → cask app bundle → PATH → `~/.cargo/bin`) and verifies
+each candidate's code signature is intact. The pure-logic core lives
+in `tools/cli/validator_discovery.{hpp,cpp}` (no `cli_common` link
+deps — same isolation pattern as `version_diag` / `projects_registry`),
+so unit tests in `test/test_cli_validator_discovery.cpp` can stub
+`path_exists` / `path_owner_uid` / `assess_signature` without shelling
+out to `spctl`.
+
+Signature assessment runs `codesign --verify` first (authoritative
+integrity check) and only treats specific verdicts as Broken:
+
+- "invalid resource directory" / "directory or signature have been modified"
+- "invalid Info.plist" / "plist or signature have been modified"
+- "a sealed resource is missing or invalid"
+- "main executable failed strict validation"
+
+Anything else — including unsigned `cargo` binaries and system CLI
+tools that `spctl` rejects with "code is valid but does not seem to
+be an app" — is treated as Healthy because amfid won't kill them at
+launch. The naive `spctl --assess` check the issue spec proposed
+catches the failure mode but ALSO false-positives on `auval` and
+cargo-installed `clap-validator`; the layered check fixes that.
+
+`--fix` removes broken **user-owned** copies (uid matches `getuid()`).
+Broken **root-owned** copies print `sudo rm <path>` and never
+auto-elevate — that's the safety boundary the spec is explicit about.
+
+When adding a new validator: extend the `kValidators` array in
+`validator_discovery.cpp`, add its priority paths to
+`validator_priority_paths()`, and add a unit-test scenario covering
+all four states (Healthy, user-owned Broken, root-owned Broken,
+Missing).
+
+### `pulp doctor --host-quirks` (host-quirks integration plan P2)
+
+Reports the runtime DAW host-quirks policy. `cmd_doctor.cpp` reads the
+`pulp::format` host-quirks API directly:
+
+- `resolve_quirk_policy()` → effective `QuirkFilter` + `QuirkPolicySource`
+  (compile default / `PULP_HOST_QUIRKS` env / `set_host_quirk_policy()` API)
+- `detect_host_info()` → detected DAW + version
+- `resolved_quirks(type, version)` + `enumerate_quirk_fields(...)` → the
+  per-flag table (name · tier · enforced)
+
+`--host-quirks` (and the `pulp doctor quirks` synonym) prints **only** the
+section and exits 0 — that's the scriptable surface the `cli-doctor-host-quirks*`
+ctest cases pin. The same section is also appended to the default
+`pulp doctor` human output (gated on `mode.empty() && !ci_mode`).
+
+Gotchas:
+- The override-hint line always literally contains `off|validated-only|all`,
+  so a ctest `PASS_REGULAR_EXPRESSION` for a specific policy must anchor on
+  the **source label** (`... (PULP_HOST_QUIRKS env)`), which appears only on
+  the policy line — not on the hint line. See the three `cli-doctor-host-quirks*`
+  tests in `tools/cli/CMakeLists.txt`.
+- `PULP_HOST_QUIRKS` is parsed **once per process** (cached), so each policy
+  variant needs its own `add_test` (fresh process), not a single invocation.
+- The policy is layered on the compile-time `PULP_HOST_QUIRKS_DEFAULT_POLICY`;
+  with nothing set the source reads "compile default" and behaviour is
+  unchanged. Full precedence + the override API live in
+  `docs/reference/host-quirks-policy.md`.
+
+### `pulp doctor --au-cache`
+
+`cmd_doctor.cpp` accepts `--au-cache` to refresh macOS AU registration metadata
+by stopping `AudioComponentRegistrar`; `--dry-run` prints the command instead.
+The flag is accepted on every platform and is a no-op with exit 0 outside
+macOS so cross-platform scripts do not need OS conditionals. Keep this flag in
+`docs/reference/cli.md#doctor`, `docs/status/cli-commands.yaml`, and
+`.claude/commands/doctor.md` whenever the behavior changes.
+
+## `pulp upgrade` — self-update
+
+Lives in `tools/cli/cmd_upgrade.cpp` (moved out of `cmd_misc.cpp` in
+#547 Slice 2 so the update-check surface can grow independently) and
+calls `pulp::cli::pulp_upgrade_url_for()` from
+`tools/cli/upgrade_url.hpp`. The URL/asset-name convention is **pinned
+by the release workflow** (`.github/workflows/release-cli.yml`) and guarded
+by `test/test_cli_upgrade_url.cpp` — both need to agree.
+
+Convention (don't drift):
+
+```
+Asset = "pulp-<platform>-<arch>.<ext>"  (NO version in the filename)
+URL   = ".../releases/download/v<version>/<asset>"
+arch  = "arm64" | "x64"                  (NOT "x86_64")
+ext   = "zip" for windows, "tar.gz" otherwise
+```
+
+Gotchas:
+
+- **Don't bake the version into the asset filename.** The version sits in
+  the release *tag* (path segment `v<version>`), not in the file name.
+  `test_cli_upgrade_url.cpp` explicitly fails if the version reappears
+  in the filename because that shape makes every upgrade URL miss the
+  uploaded asset.
+- **Use `x64`, not `x86_64`.** The release workflow uploads under `x64`.
+- **Install sibling payloads before replacing `pulp`.** Phase 8+
+  archives contain Rust `pulp`, `pulp-cpp`, and the runtime library.
+  Pre-cutover C++ CLIs still run `cmd_upgrade.cpp` during that hop, so
+  the helper in `upgrade_install.hpp` must copy `pulp-cpp` and other
+  top-level payload files next to the current binary before self-replace.
+- **If you change `upgrade_url.hpp`, update the regression test in the
+  same PR.** Both live at HEAD; drift between them is the whole reason
+  the header exists.
+
+## `pulp version --json`
+
+The Rust user-facing `pulp` binary supports `pulp version --json` for a
+machine-readable version snapshot (`cli`, `plugin`, `plugin_min_cli`,
+`plugin_json_path`) using the same semver-compatible field shape as
+`pulp doctor --versions --json`. `pulp-cpp version` remains the
+rollback/delegate command and does not own this JSON lane. Keep
+`docs/reference/cli.md`, `docs/status/cli-commands.yaml`,
+`experimental/pulp-rs/src/cmd/version.rs`, `version_info.rs`, and
+`experimental/pulp-rs/tests/version_parity_test.rs` aligned when this
+surface changes.
+
+## `pulp version check`
+
+Validates consistency across the version-bearing surfaces:
+
+- SDK: `CMakeLists.txt` `project(... VERSION x.y.z ...)` ↔ compile-time `PULP_SDK_VERSION` constant.
+- AU metadata: the AU Info.plist template must use the computed integer form instead of a hardcoded version.
+- Changelog: the latest `CHANGELOG.md` heading must match the framework version.
+- Claude plugin: top-level `"version"` in `.claude-plugin/plugin.json` (semver).
+- Marketplace: top-level `"version"` in `.claude-plugin/marketplace.json` (must match `plugin.json`).
+- Marketplace entry: `.claude-plugin/marketplace.json` `plugins[0].version` (must match `plugin.json`).
+- Optional bump gate: `--with-bump-check` also runs `tools/scripts/version_bump_check.py --mode=report`.
+
+Gotcha: JSON files can have multiple `"version"` fields (for example, top-level `version`, `metadata.version`, and `plugins[0].version`). The check uses the in-repo JSON parser so top-level and marketplace-entry versions stay distinct; do not replace that with ad hoc regex extraction.
+
+
+### Note: pulp scan / pulp host added
+
+These commands live in `tools/cli/cmd_host.cpp` (scan + host share a
+file). When changing scanner.scan() signatures, update cmd_host.cpp's
+ScanOptions construction in lockstep — the cross-format loop builds an
+options struct per iteration.
+
+#### `pulp scan --no-load`
+
+Filesystem-only enumeration mode. Installed Rust `pulp scan` is
+already filesystem-only and filename-derived; it accepts `--no-load`
+for C++ surface parity. The sibling `pulp-cpp scan` rich path opens
+bundles where needed to read entry-point metadata, so `pulp-cpp scan
+--no-load` is the safe escape hatch when a malformed plug-in crashes
+the scanner. `pulp scan --help` is handled by the Rust CLI help path;
+`pulp-cpp scan --help` likewise returns before rich scanning so users
+can discover the flag while diagnosing a broken plug-in.
+
+#### Cross-binary `pulp project bump` ↔ `undo` parity
+
+C++ and Rust both serialize `bump-undo-*.json` records but with
+slightly different field sets — Rust writes a transient `notes:[...]`
+array that the C++ writer never emits. The C++ JSON parser was
+desync-prone on unknown ARRAY/OBJECT values; hardened in commit
+`8f29b1fd` to skip them cleanly. When extending the undo schema,
+keep both writers + the C++ parser in lockstep, and add a fixture-
+level test in `test/test_cli_project_bump.cpp` that round-trips both
+directions.
+
+#### `pulp projects list --json`
+
+The Rust binary always had a `--json` lane; the C++ port for parity
+landed via `70e94dd7`. `pulp projects` is the only `projects`
+subcommand with `--json` today — `add`/`remove` are write-only and
+report success via exit code.
+
+### `pulp coverage diff` — local diff-coverage gate
+
+`pulp coverage diff` (in `tools/cli/cmd_coverage.cpp`) is a thin
+shell-out to `tools/scripts/local_diff_cover.sh`. The script is the
+single implementation; the CLI subcommand, the
+`.claude/commands/coverage-diff.md` slash command, and the pre-push
+hook all delegate there. Threshold + filters live in
+`tools/scripts/coverage_config.json` — that JSON is the single source
+of truth; `.github/workflows/coverage.yml` reads it via `jq` so the
+CI gate stays in lockstep. When changing the threshold, edit the JSON
+once and don't touch any of the four invocation surfaces. Anti-drift
+test: `tools/scripts/test_local_diff_cover.py::WorkflowSourceOfTruthTests`
+fails if a future edit hardcodes `--fail-under=NN` back into the
+workflow.
+
+### `pulp minos` — minimum-OS tooling
+
+`pulp minos` (in `tools/cli/cmd_minos.cpp`) is a thin shell-out, same
+shape as `pulp coverage`. Two subcommands, two scripts:
+
+- `pulp minos measure <binary>` → `tools/scripts/measure_min_os.py --measure`.
+  Reports one binary's OS floor by format (`macho`/`elf`/`pe`) read from the
+  artifact itself.
+- `pulp minos sweep [args...]` → `tools/scripts/sdk_consumer_sweep.py`. Rebuilds
+  every downstream consumer against one installed SDK and compares each floor to
+  the SDK floor. All args pass through (`--sdk-prefix`, `--only`, `--dry-run`,
+  `--json`).
+- `pulp minos update [args...]` / `pulp minos publish-runbook [args...]` →
+  `tools/scripts/sdk_consumer_update.py` (the subcommand name is prepended, then
+  args pass through). `update` bumps every consumer's SDK pin (dry-run default;
+  `--open-prs` to open PRs); `publish-runbook` prints the republish steps
+  (prints only — never builds/signs/publishes). Pin-detect/rewrite + runbook are
+  pure and unit-tested in `test_sdk_consumer_update.py`; the clone/PR side
+  effects are gated and integration-light.
+
+Surfaces that must stay in lockstep (the scripts are the single
+implementation; everything else delegates):
+
+- CLI subcommand `tools/cli/cmd_minos.cpp` + table entry in `pulp_cli.cpp` +
+  decl in `cli_common.hpp` + `cmd_minos.cpp` in `tools/cli/CMakeLists.txt`.
+- Slash command `.claude/commands/minos.md`.
+- MCP tool `pulp_minos` in `tools/mcp/pulp_mcp.cpp` (tools_list_json entry +
+  dispatch arm) with `handle_minos` in `tools/mcp/mcp_tools.{hpp,cpp}`. It
+  exposes only `measure` (RPC-shaped); the `sweep` is CLI-only because it clones
+  and builds many repos — say so in the tool description, don't add a sweep arg.
+- Manifest `docs/status/cli-commands.yaml` + reference `docs/reference/cli.md#minos`.
+- User guide `docs/guides/minimum-os-support.md` (plain-language explainer).
+
+The SDK's own floor is data in `tools/deps/min_os.json`, pinned into every build
+by `tools/cmake/PulpMinOs.cmake`; the sweep registry is
+`planning/sdk-consumers/consumers.yaml` with public build knobs in
+`tools/scripts/sdk_consumer_sweep_recipes.yaml`. Shell-out coverage:
+`cli-minos-*` ctest cases in `tools/cli/CMakeLists.txt`.
+
+## Phase 0 host-contracts touchpoints
+
+`tools/cli/cmd_host.cpp` calls `PluginSlot::process()` which now takes
+a `ParameterEventQueue`. When adding new CLI hosting commands, include
+`pulp/host/parameter_event_queue.hpp` and pass an empty queue if you
+have no automation to deliver. See `docs/reference/host-thread-rules.md`
+for the full contract.
+
+## `pulp projects` + registry wiring
+
+`pulp projects list/add/remove` live in `tools/cli/cmd_projects.cpp`.
+The JSON file at `~/.pulp/projects.json` (or `$PULP_HOME/projects.json`)
+is maintained by `tools/cli/projects_registry.{hpp,cpp}` and is
+populated automatically from `cmd_create.cpp` on successful scaffold
+via `pulp::cli::projects_registry::add_project(...)`.
+
+Design decision: **registry is authoritative.**
+`pulp create` writes to it; `pulp projects add/remove` is the user
+surface; `pulp doctor --versions --scan-parents` walks CWD ancestors
+as an opt-in diagnostic but never mutates the registry. No silent
+disk scans.
+
+Gotchas:
+
+- **`projects_registry` is deliberately decoupled from `cli_common`.**
+  Same rule as `version_diag` — the unit test (`pulp-test-cli-
+  projects-registry`) links just `projects_registry.cpp` +
+  Catch2 so the test binary stays small. Don't reach into
+  `cli_common.hpp` from inside the registry module.
+- **`add_project` dedupes by canonical path, not by string.** The
+  canonicalish helper resolves symlinks via
+  `fs::weakly_canonical`; `/tmp/...` and `/private/tmp/...` land at
+  the same canonical form on macOS. Registry round-trip tests must
+  canonicalise the `TempDir.path` up front or `REQUIRE(x == y)`
+  comparisons will break.
+- **Missing-on-disk entries are kept, not pruned.** Stale-entry
+  policy (from the design doc): the entry is flagged with a
+  `(missing)` line and a copy-paste `pulp projects remove <path>`
+  hint — never auto-removed. Only explicit `pulp projects remove`
+  (or a manual JSON edit) mutates the registry.
+- **Nested parent + child both appear under `--scan-parents`.** The
+  scan returns deepest-first. The caller (`cmd_doctor`) dedupes
+  against the active project but keeps both ancestors if both
+  contain a `pulp_add_*` macro. The user resolves the ambiguity —
+  we surface both rather than picking arbitrarily.
+- **`--scan-parents` reads `CMakeLists.txt` with a simple regex**
+  (`\bpulp_add_[A-Za-z0-9_]+\s*\(`). Matches any `pulp_add_*` macro
+  the SDK introduces without requiring a new entry here.
+
+## `pulp project pin` / `pulp project bump` / `pulp project unpin` / `pulp project undo`
+
+`pulp project pin` (plus deprecated alias `bump`), `pulp project unpin`,
+and `pulp project undo` live in
+`tools/cli/cmd_project.cpp` and delegate to the pure-logic core in
+`tools/cli/project_bump.{hpp,cpp}`. Behavior summary:
+
+- In standalone SDK-mode projects (`pulp.toml` without Pulp's `core/`
+  source tree), bump treats `pulp.toml` `sdk_version` as the SDK pin,
+  rewrites it together with the versioned `find_package(Pulp X.Y.Z ...)`
+  call, and leaves `project(NAME VERSION ...)` alone as the app/plugin
+  product version.
+- In legacy source-embedded projects, bump reads `CMakeLists.txt`,
+  locates the first Pulp pin (FetchContent GIT_TAG,
+  `pulp_add_project(VERSION ...)`, or `project(NAME VERSION ...)`),
+  rewrites it atomically, records an undo batch, and prints migration
+  notes for the hop.
+- `--all` iterates `~/.pulp/projects.json`.
+- `unpin` rewrites standalone `pulp.toml` `sdk_version` to `"latest"`
+  without deleting the field; that is the floating-SDK marker.
+- Undo reads `bump-undo-<timestamp>.json` and reverts each bumped
+  entry's recorded edits. New undo files may contain multiple edits
+  across `pulp.toml` and `CMakeLists.txt`; legacy one-edit files are
+  still parsed.
+
+Gotchas:
+
+- **Singular `project` command, not `projects`.** Registry commands
+  (`pulp projects list/add/remove`) are plural; per-project pin
+  management is singular. Both exist side-by-side in the dispatch
+  table — keep them separate in help text and docs.
+- **Undo filenames replace `:` with `-`.** ISO-8601 stamps contain
+  colons which are illegal on Windows. `undo_batch_path()` maps
+  `2026-04-21T14:30:00Z` → `bump-undo-2026-04-21T14-30-00Z.json`.
+  Tests pin this; don't "fix" it on POSIX without updating Windows.
+- **Dynamic pins (branches, SHAs) are skipped, not failed.**
+  `refuse_dynamic_pin()` returns true for anything that isn't
+  semver-after-optional-`v`. Status ends up as `"skipped"` with a
+  human-readable reason in `failure_reason`. Do not rewrite these.
+- **Do not pin the Pulp source checkout with this command.**
+  `pulp project pin` is for consumer projects. From the Pulp source
+  tree, use `pulp version bump` and the normal release/PR workflow.
+- **Standalone mode's source of truth is `pulp.toml` `sdk_version`.**
+  If a standalone project has `project(NAME VERSION ...)`, that is the
+  app/plugin version and must not be interpreted as the SDK version.
+  Keep `pulp.toml` and `find_package(Pulp X.Y.Z ...)` in lockstep.
+- **`sdk_path` is rewritten only when it points at a managed Pulp cache.**
+  Custom paths are preserved and reported; `pulp build` verifies
+  whether they satisfy the requested `sdk_version`.
+- **`--allow-cli-skew` is the explicit escape hatch.** By default,
+  target SDK versions newer than the installed CLI fail fast and tell
+  the user to run `pulp upgrade` first.
+- **`--allow-redundant` bypasses the origin/main guard.** `pulp project
+  bump` fetches `origin main` best-effort and refuses by default when
+  main already pins the target-or-newer SDK. Fetch failures fail open
+  so offline users aren't blocked by stale refs. In standalone
+  projects, still compare local `pulp.toml` / `find_package(Pulp ...)`
+  lockstep before firing the guard: if `sdk_version` already matches
+  the target but `find_package` is stale, the command should repair the
+  local drift instead of forcing `--allow-redundant`.
+- **Managed `sdk_path` rewrites are only real edits when the path
+  changes.** If a standalone project already targets the requested SDK
+  and `sdk_path` already points at that managed cache, the command must
+  return "already at target version" rather than staging a no-op
+  rewrite just because the path is managed.
+- **`project_bump` is decoupled from `cli_common`.** Same rule as
+  `projects_registry` / `update_mode` — the unit test binaries link
+  just the module + Catch2. Don't reach into `cli_common.hpp` from
+  `project_bump.cpp`.
+- **Catch2 test names can't contain `--flag`.** The Catch2 runner
+  parses `--foo` as a CLI flag even inside a string argument, so
+  ctest's Catch2 invocation fails with "unrecognised token". Rename
+  bump-all test cases to "bump all ..." instead of "--all ...".
+- **Post-upgrade hook respects `update.bump_projects`.**
+  `cmd_upgrade.cpp` reads the key (default `prompt`) and either
+  prints the `pulp project pin --all` hint or stays quiet on `off`.
+  `auto` is accepted for config compatibility but must not claim
+  automatic execution until a new-binary follow-up actually runs the bump.
+  If automatic execution is added later, it must run from the
+  just-installed binary on a later invocation; the old Windows process
+  must not try to spawn `project pin` while `pulp.exe` is still being
+  replaced.
+- **Git-clean gate uses `git -C <proj> status --porcelain`.** If
+  git isn't on PATH, `cmake_is_dirty()` returns false — we refuse
+  to block on a missing tool. `--force-dirty` is the explicit
+  override for users who WANT to bump alongside other edits.
+- **Migration notes print once per bump batch, using the minimum
+  old pin as `from`.** That captures the widest set of applicable
+  notes when different projects were on different versions.
+
+## `pulp doctor --versions` — version diagnostics
+
+This release-discovery diagnostic short-circuits the doctor pipeline:
+it prints CLI/SDK/Plugin versions side-by-side plus advisory skew warnings
+and always exits 0. Lives in `tools/cli/version_diag.{hpp,cpp}` with
+`cmd_doctor` as the only caller.
+
+Gotchas:
+
+- **`version_diag` is deliberately decoupled from `cli_common`.** It
+  re-implements its own tiny `read_toml_scalar` / `user_home_dir_local`
+  helpers so the unit-test binary can link just `version_diag.cpp` —
+  no pulp::runtime link surface. If you add a new helper, keep it
+  local unless you've also evaluated the test impact.
+- **Always exit 0 even on WARN.** Skew is advisory. Making this
+  command gate on skew would break scripts that invoke
+  `pulp doctor --versions` as a routine health check in a pipeline.
+  This is a design choice, not an oversight.
+- **Execution commands can be stricter than `doctor --versions`.**
+  `pulp build` / `pulp dev` may reuse the same semver parsing for a
+  hard preflight while `doctor --versions` itself remains advisory.
+  Keep that split explicit: diagnostics stay 0-exit, execution paths
+  decide whether to block.
+- **Untagged builds are silently skipped.** Anything that doesn't
+  parse as `M.N.P` (e.g. `0.24.0-dev`, a git SHA) has
+  `Semver{.comparable = false}`. Skew analysis short-circuits on
+  non-comparable inputs per the design doc.
+- **Plugin lookup prefers the repo's `.claude-plugin/plugin.json`.**
+  The installed-plugin layout inside `~/.claude/plugins/pulp/` or
+  `~/.claude-plugin/pulp/` is an open question in the design doc —
+  the lookup is best-effort and deliberately forgiving; when in
+  doubt it reports "(not found)" instead of failing.
+- **`cli_min_version` is optional and additive.** The field only
+  becomes meaningful from the first release that needs it; before
+  then it's silently absent and skew analysis skips. Don't
+  retroactively add it to every `pulp.toml` in the repo.
+- **Plugin `min_cli_version` mirrors the same semantics.** A plugin
+  `plugin.json` with no `min_cli_version` skips the
+  check silently; a newer `min_cli_version` emits the same advisory
+  WARN finding in `analyze()` and an inline "needs CLI: >= vX.Y.Z"
+  line under the Plugin entry in the human report. The JSON surface
+  adds a `plugin_min_cli` top-level field alongside `cli` and
+  `plugin` — do not rename it; `tools/scripts/cli_version_check.sh`
+  and the `upgrade` skill parse it by key.
+
+The diagnostic also supports `--scan-parents` and `--json` plus the
+`~/.pulp/projects.json` registry — see the section above for registry
+gotchas. The `--versions` core remains pure-logic and scoped to
+`version_diag.{hpp,cpp}`.
+
+Keep follow-up version-diagnostic work independently reviewable: update
+checks, migration docs, `/upgrade` skill changes, mode enforcement, and
+plugin ↔ CLI skew fields (`min_cli_version`, `plugin_min_cli`, and
+`tools/scripts/cli_version_check.sh`) should land as focused issues and
+PRs.
+
+### `pulp doctor` — `pulp-mcp` advisory row
+
+
+
+`run_doctor_checks()` in `tools/cli/cli_common.cpp` ends with an
+**optional** check for the Claude Code plugin's MCP server binary. The
+check is purely advisory (never gates the doctor exit code) and resolves
+the binary in this order:
+
+1. `pulp-mcp` on `$PATH` (the steady-state after `curl install.sh | sh`).
+2. `~/.pulp/bin/pulp-mcp` (the install location, in case `$PATH` didn't
+   reload yet in this shell).
+3. `<repo_root>/build/tools/mcp/pulp-mcp` (source builds).
+
+When found, the row prints the binary's own `--version` output alongside
+`PULP_SDK_VERSION` so users see drift between an old installed
+`pulp-mcp` and a newer CLI. **Never escalate this to a hard gate** — the
+plugin must remain tolerant of older installed `pulp-mcp` so users on an
+older project SDK aren't blocked. Cross-version compatibility belongs in
+per-tool feature detection inside `pulp-mcp` itself.
+
+`pulp-mcp` accepts `--version` / `-V` and `--help` / `-h` short-circuit
+flags before entering its JSON-RPC stdin loop (`tools/mcp/pulp_mcp.cpp
+main()`). Both flags exit cleanly without consuming stdin so the
+release-CLI smoke gate and `pulp doctor` can probe the binary without
+speaking MCP framing. **Anything new that needs stdin must NOT short-
+circuit here** — fall through to the main loop instead.
+
+`serverInfo.version` returned from the MCP `initialize` method is wired
+to `PROJECT_VERSION` via `tools/mcp/pulp_mcp_version.h.in`. Hardcoding a
+new version string there will be silently overridden by the configure
+step; bump the project version instead.
+
+## `pulp doctor --caches` — FetchContent cache health
+
+Like `--versions`, `--caches` is a dedicated diagnostic that
+short-circuits the doctor pipeline. It scans Pulp's shared FetchContent
+source cache (the one `pulp_register_fetchcontent_source` populates) and
+classifies each entry as healthy, dangling-symlink, stale-commit, or
+root-owned. Lives in `tools/cli/fetchcontent_cache.{hpp,cpp}` with
+`cmd_doctor` and the `cache_preflight_check` helper in
+`cli_common.cpp` as the only callers.
+
+Gotchas:
+
+- **Same `cli_common`-decoupling rule as `version_diag`.**
+  `fetchcontent_cache.cpp` reimplements `user_home_dir_local` and a
+  small env-string helper so the unit-test binary
+  (`test/test_cli_fetchcontent_cache.cpp`) can link only
+  `fetchcontent_cache.cpp` and Catch2 — no pulp::runtime, no
+  cli_common. If you add a helper, keep it local unless you check the
+  test impact first.
+- **DiscoveryEnv is the unit-test seam.** All filesystem access goes
+  through `DiscoveryEnv::lstat` / `stat_follow` / `list_dir` callables
+  set up by `make_real_env`. Tests construct their own env with
+  deterministic mock callables — they never touch
+  `~/Library/Caches/Pulp/`. Adding new classification logic? Put the
+  syscalls behind the env so the new behaviour can be covered without
+  prepping a fixture cache on the dev's machine.
+- **FetchContent scratch dirs (`<dep>-src`/`-build`/`-subbuild`)**
+  always coexist with the populated source dir we created. They are
+  CMake's own working state, not entries we own. Discovery treats any
+  trailing segment of `src`, `build`, or `subbuild` as scratch and
+  classifies them Healthy regardless of declared REF — clobbering them
+  defeats the configure-time cache. The
+  `discover: FetchContent scratch dirs do not register as stale-commit`
+  test pins this behaviour.
+- **`--fix` only touches user-owned entries.** Root-owned classification
+  is the safety gate: an entry whose POSIX uid is not `geteuid()` gets
+  `RootOwned` even when the underlying state would otherwise be
+  Dangling or StaleCommit, and `apply_fixes` skips it. Agents must
+  never silently elevate; the user has to run `sudo rm` themselves.
+  On Windows, ownership is treated as user-writable (POSIX uid is a
+  no-op concept on the platform that hosts the cache under the user's
+  profile by definition).
+- **Stale-commit needs both a declared REF AND a cached REF.** When
+  `pulp_register_fetchcontent_source` is called without a `REF`
+  argument (some optional deps are floated by branch), the entry is
+  classified Healthy regardless of directory contents. Adding a new
+  cache classification? Mirror this guard so missing-data inputs
+  don't fire false positives.
+- **Comments in `CMakeLists.txt` are stripped before the regex pass.**
+  The `parse_declared_refs_from_text` helper does a line-by-line
+  first-`#` cut before scanning. A commented-out
+  `pulp_register_fetchcontent_source(foo REF bar)` does NOT pollute
+  the declared-refs map, which keeps stale-commit detection honest
+  for example/documentation snippets in CMakeLists.
+- **Preflight is gated on `needs_configure`.** `pulp build` only runs
+  the preflight when CMake will reconfigure; incremental rebuilds
+  skip it (the cache scan is cheap but the gate matters more — a
+  healthy cache that fits a stale `CMakeCache.txt` would surface the
+  bad path eventually but not on the cheap incremental loop).
+  `pulp test` mirrors the rule: preflight only runs when a cold-start
+  build is needed (no `CMakeCache.txt`).
+- **`PULP_SKIP_CACHE_PREFLIGHT=1` bypasses the preflight, NOT the
+  doctor command.** Set it in CI environments that intentionally
+  curate the cache and would rather see CMake's native error than
+  the early gate. `pulp doctor --caches` always runs its scan
+  regardless — the diagnostic is the diagnostic.
+- **JSON shape is committed.** `pulp doctor --caches --json` prints
+  `{"cache_root", "healthy", "entries": [{"name", "path", "status",
+  "is_symlink", "resolved_target", "declared_ref", "cached_ref",
+  "dep_name", "reason", "remediation", "fixable"}]}`. `status`
+  values are `healthy`, `dangling-symlink`, `stale-commit`,
+  `root-owned`, `unknown`. Don't rename keys; scripts and the Rust
+  CLI port parse them by name.
+
+Adjacent modules to coordinate with: `tools/cmake/PulpFetchContent.cmake`
+(the cache-root and sanitize-suffix logic — `default_cache_root` and
+`sanitize_ref` in `fetchcontent_cache.cpp` MUST mirror it), and the
+build / test commands that call `cache_preflight_check`.
+
+## `pulp config` + update-check
+
+This wires a 24h update-check cache plus a config surface for
+`~/.pulp/config.toml`. Key layout:
+
+- **`tools/cli/update_check.{hpp,cpp}`** — pure-logic core. No
+  `cli_common` link dep so the unit tests in
+  `test/test_cli_update_check.cpp` can compile it standalone (same
+  pattern as `version_diag`). Exposes `CacheEntry`, `parse_cache_json`,
+  `serialize_cache_json`, `read_cache_file`, `write_cache_file`,
+  `is_cache_stale`, `is_newer`, `compose_banner`,
+  `write_toml_key_in_section`, and the `Fetcher` interface with a
+  real `GitHubReleasesFetcher` (curl/PowerShell) so tests can inject
+  a fake and never hit the network.
+- **`tools/cli/cmd_upgrade.cpp`** — moved out of `cmd_misc.cpp`. Adds
+  `--check-only` reading the cache. Writes
+  `banner_shown_for_version` after a successful upgrade so the
+  next-invocation banner stays quiet for the version we just installed.
+- **`tools/cli/cmd_config.cpp`** — `pulp config get|set|list` with an
+  allow-list of keys (`pr.workflow`, `update.mode`,
+  `update.check_interval_hours`, `update.channel`,
+  `update.bump_projects`, `import_design.default_mode`,
+  `import_design.default_emit`, and `claude.send_user_file`).
+  Allow-list prevents typos silently inflating the config surface.
+- **`tools/cli/pulp_cli.cpp`** — `maybe_emit_update_banner_and_refresh()`
+  runs before dispatch. `PULP_UPDATE_CHECK_DISABLED` env short-circuits
+  it (used by CI). `banner_blocked_commands` = `config`, `version`,
+  `help` so machine-parseable output stays clean.
+- **Banner shape** (locked, tested verbatim):
+  `Pulp vX.Y.Z available (you have vA.B.C). Run \`pulp upgrade\` or \`pulp config set update.mode manual\` to silence.`
+  Emitted on **stderr**, not stdout — never corrupts piped output.
+
+Gotchas:
+
+- **Anonymous GitHub API only.** 60 req/hr/IP. The 24h cache default
+  keeps us well under that. Do NOT add authenticated fetches — the
+  design is explicit about "no GitHub App, no auth".
+- **Background refresh is a detached `std::thread`.** The original
+  `std::async` + static-future pattern can block on destructor; the
+  current `std::thread(...).detach()` is correct. Do NOT regress this
+  back to `std::async` without understanding the Windows CRT
+  finalization path — the process must be able to exit while the fetch
+  thread is still in-flight.
+- **Cache file is atomic via `.tmp` + rename.** A torn write just
+  forces a re-fetch on the next invocation, not corruption. Cross-device
+  rename falls back to `copy_file` + `remove`.
+- **Commit trailer block must be contiguous.** Version-bump + skill
+  trailers live on the tip commit. Do NOT split with blank lines —
+  `git interpret-trailers --parse` treats them as non-trailers.
+
+## Mode enforcement + pending-upgrade
+
+All four `update.mode` values are wired into the dispatch path in
+`pulp_cli.cpp`, including auto-mode staging and Windows tombstone
+cleanup. Key layout:
+
+- **`tools/cli/update_mode.{hpp,cpp}`** — pure-logic core: `Mode` enum,
+  snooze read/write, pending-upgrade JSON round-trip, tombstone path
+  helpers, mode-specific banner composers, decision helpers
+  (`decide_prompt_banner`, `should_stage_auto_download`). No
+  `cli_common` link dep — same standalone-test pattern as
+  `update_check`. Unit tests in
+  `test/test_cli_update_mode.cpp` mock the filesystem via per-test
+  tmpdirs and inject time via explicit epoch-seconds arguments.
+- **`tools/cli/pulp_cli.cpp`** — `maybe_emit_update_banner_and_refresh`
+  now consumes `update_mode`. Decision tree:
+  - `off` → zero I/O, zero network, zero banner.
+  - `prompt` → one-shot banner per new version (Slice 2 behavior,
+    preserved); 24h snooze via `~/.pulp/update-snooze` when it's set
+    (writes happen from `cmd_config` on mode-change and from the
+    `/upgrade` Claude skill on user decline — the dispatch path
+    never writes the snooze itself, it only reads it).
+  - `manual` → one-liner per new version ("Run `pulp upgrade` when
+    you're ready."), suppressed after `banner_shown_for_version`
+    matches.
+  - `auto` → writes `~/.pulp/pending-upgrade`, prints "downloaded,
+    will complete on next invocation". The actual binary swap lives
+    in `cmd_upgrade` — Slice 5 does NOT download in the background
+    thread, only stages intent via the marker file. This preserves
+    Section G's "no binary is ever replaced without the user's
+    session touching `pulp` again".
+- **`tools/cli/cmd_config.cpp`** — `pulp config set update.mode ...`
+  now clears `~/.pulp/update-snooze` as a side effect. Reason: a mode
+  change is itself an act of re-engagement with update management,
+  so an existing 24h snooze would otherwise silence the new mode's
+  behavior. Also adds the `update.bump_projects` allow-list entry
+  (values: `prompt | auto | off`, default `prompt`) used by the
+  post-upgrade project-bump nudge.
+- **Banner shapes** (locked, tested verbatim in `test_cli_update_mode.cpp`):
+  - manual: `Pulp vX.Y.Z available (you have vA.B.C). Run \`pulp upgrade\` when you're ready.`
+  - auto staged: `Pulp vX.Y.Z downloaded. The upgrade will complete on your next \`pulp\` invocation.`
+  - auto completed: `Pulp CLI upgraded to vX.Y.Z. Run \`pulp upgrade --notes\` to see what changed.`
+
+Gotchas specific to Slice 5:
+
+- **Windows tombstone pattern (`*.pulp.old`).** The swap in
+  `cmd_upgrade` on Windows can't overwrite a file-locked running exe
+  in place. The rustup/pip/Python pattern is: `MoveFileEx(exe,
+  exe.pulp.old, REPLACE_EXISTING)` (rename-out the old bytes),
+  then copy the new binary into the original path. On the NEXT
+  invocation of the new binary, `cleanup_tombstone()` deletes the
+  `.pulp.old` file. macOS/Linux overwrite the running inode fine —
+  `cleanup_tombstone()` is a no-op there. Always call cleanup from
+  the dispatch hook (top of `main`) so the sweep is universal.
+- **Never replace the binary mid-command.** Design Section G is
+  explicit: the auto-mode dispatch path only stages — it must not
+  call `cmd_upgrade` directly or start a download that can race
+  `main()`'s exit. The staging path here is intentionally a
+  marker-write + user-facing notice, not a network fetch.
+- **`decide_prompt_banner` is pure.** Never call it from the snooze
+  write path — it'd double-count the banner against the
+  `banner_shown_for_version` counter. The snooze file is written by
+  (a) `cmd_config` on mode change (as a clear) and (b) the
+  `/upgrade` Claude skill on explicit decline. Nowhere else.
+- **`update.bump_projects` is consumed after successful upgrade.**
+  `prompt` and `auto` print the `pulp project pin --all` hint, while
+  `off` stays quiet. Keep
+  `cmd_config` validation, the `cmd_upgrade` hook, `docs/reference/cli.md`,
+  and shell-out coverage in sync.
+
+## Migration notes + `pulp upgrade --notes`
+
+`cmd_upgrade` carries an embedded, per-release migration index. The table is generated at CMake configure time from
+`docs/migrations/*.md` and compiled into the binary so upgrade notes
+are always in lock-step with the shipped version — no runtime
+download, no filesystem scan.
+
+Key layout:
+
+- **`docs/migrations/vX.Y.Z.md`** — one file per release with notes
+  worth surfacing. TOML frontmatter fields: `version` (required),
+  `breaking` (bool), `applies_if` (expression string), `summary`.
+  `docs/migrations/README.md` is the schema reference; the codegen
+  skips it. Only write a note when a reasonable pro developer needs
+  to change code / config / habits — not every PR.
+- **`tools/scripts/build_migration_index.py`** — standalone Python
+  codegen. Parses the TOML frontmatter, escapes the Markdown body for
+  a C++ string literal, sorts entries by parsed semver, and writes
+  `tools/cli/generated/migration_index.cpp`. Runs from
+  `tools/cli/CMakeLists.txt` via `add_custom_command`; also invokable
+  directly for iteration.
+- **`tools/cli/migration_index.hpp`** — schema (`MigrationEntry`),
+  `EvalContext`, `evaluate_applies_if`, `entries_for_hop`,
+  `applicable_entries`, `render_notes_text`, `render_notes_json`.
+  Link-free from `cli_common` (same pattern as `version_diag` /
+  `update_check`).
+- **`tools/cli/migration_runtime.cpp`** — evaluator + renderers. The
+  generated `migration_index.cpp` defines only the data table so
+  `migration_runtime.cpp` is the single TU unit tests build against
+  (the test provides its own stub `kMigrationIndex`).
+- **`pulp upgrade --notes [--json] [--from X --to Y]`** — new flag.
+  No network, no binary swap. `--json` is stable-shape for Slice 4
+  (`/upgrade` Claude skill); do NOT rename the keys (`from`, `to`,
+  `entries[].version|breaking|summary|applies_if|body`) without
+  bumping the skill.
+
+`applies_if` grammar:
+
+```
+expr    := or
+or      := and ("||" and)*
+and     := cmp ("&&" cmp)*
+cmp     := ident op version | "(" expr ")"
+ident   := "cli_version_from" | "cli_version_to"
+op      := "<" | "<=" | ">" | ">=" | "==" | "!="
+```
+
+Fail-closed semantics: unknown idents, malformed expressions, or
+unparseable context versions all evaluate to false (so a bad note
+doesn't noise the output). Empty expression matches every hop.
+
+Gotchas:
+
+- **Version literals in `applies_if` have optional `v` prefix, but
+  the lexer requires `v` to be followed by a digit.** `vnull` is
+  NOT a version; it's an identifier (and fails closed). If you need
+  a plain `v`-prefixed literal, make sure the next char is `0-9`.
+- **`from` is exclusive, `to` is inclusive.** `entries_for_hop(A, B)`
+  returns entries with version strictly `> A` and `<= B`. Stepping
+  `--from 0.27.0 --to 0.27.0` returns zero entries. This is
+  intentional — a no-op hop prints "No migration notes apply."
+- **`docs/migrations/README.md` is excluded from the index.** It's
+  the schema reference, not a migration note. Don't rename it without
+  updating `build_migration_index.py`.
+- **Generated `.cpp` lives under `${CMAKE_BINARY_DIR}/` — it is NOT
+  checked in.** The source of truth is `docs/migrations/*.md`.
+- **Duplicate `version = "X.Y.Z"` across two files is a hard error.**
+  The codegen exits 2 and CMake fails to configure. Rename one.
+- **MSVC transitive-include hygiene.** `migration_runtime.cpp`
+  explicitly `#include <cstddef>`, `<sstream>`, `<string>`, `<vector>`,
+  `<tuple>`. Don't rely on libc++ giving you those transitively.
+
+## SDK cache filenames — version pin
+
+`pulp install` (and the underlying `pulp cache fetch skia`) used to write
+the downloaded SDK tarball to `~/.pulp/cache/pulp-sdk-<platform>.tar.gz` —
+unversioned. The cache-hit path checked only `fs::exists()`, so a stale
+tarball from a prior release would silently shadow a fresh download and
+the CLI would "install" yesterday's SDK without warning. The fix pins the
+SDK version into the filename:
+
+```
+~/.pulp/cache/pulp-sdk-v0.92.0-darwin-arm64.tar.gz
+```
+
+Plumbing:
+
+- `tools/cli/sdk_cache_paths.{hpp,cpp}` — two helpers,
+  `sdk_tarball_filename` and `legacy_unversioned_sdk_tarball_filename`.
+  Standalone TU (no `cli_common` deps) so the unit test
+  `test/test_cli_sdk_tarball_filename.cpp` can link them without dragging
+  in pulp::runtime / pulp::platform. Same pattern as `version_diag` and
+  `fetchcontent_cache`.
+- `tools/cli/cmd_misc.cpp` `cmd_cache` `fetch skia` branch — calls
+  `pulp::cli::sdk_tarball_filename(PULP_SDK_VERSION, platform)` for the
+  local cache filename. GitHub release assets are still uploaded with the
+  unversioned filename (the version lives in the URL path segment), so
+  the remote URL uses `legacy_unversioned_sdk_tarball_filename` only as
+  a *filename component of the URL*, not as a local cache key.
+- Best-effort legacy cleanup — if `~/.pulp/cache/pulp-sdk-<platform>.tar.gz`
+  exists from a pre-#1814 install, the fetch path removes it before
+  resolving the versioned filename, so stale tarballs don't sit in
+  `~/.pulp/cache/` forever. `std::error_code` is used to skip silently
+  on permission / mount errors.
+- User-facing output — both "fresh download" and "cache hit" paths now
+  print the SDK version explicitly: `SDK v0.92.0 (includes Skia) already
+  cached at …` / `Downloading SDK v0.92.0 (Skia binaries for …)`.
+
+Gotchas:
+
+- **Don't compare the local filename against the URL filename.** They're
+  intentionally different — local pins the version (so cache lookup
+  misses on stale tarballs), URL doesn't (because that's the GitHub
+  release-asset shape). The version-pin contract is between cache lookup
+  and cache write, not against the remote.
+- **`pulp install` is the user-facing alias.** It calls
+  `cmd_cache({"fetch", "skia"})` internally — fixing `cache fetch` fixes
+  `install` automatically.
+- **`pulp sdk install` is *not* the same path.** That's the Rust CLI's
+  fall-through to `pulp-cpp sdk install` (see `pulp-rs/src/cmd/sdk.rs`);
+  the C++ `cmd_sdk` is a different code path with its own per-version
+  `~/.pulp/sdk/<version>/` layout. #1814 fix lives only in `cmd_cache`.
+- **Rust SDK fallthrough must capture the whole subcommand tail.**
+  `pulp sdk install --version X.Y.Z`, `pulp sdk install --local`, and
+  `pulp sdk available` are C++ SDK branches today. The Rust front end
+  must not let clap reject those flags/tokens before `cmd/sdk.rs` can
+  delegate to `pulp-cpp`; keep `SdkArgs` as a trailing-var-arg capture
+  and add parser tests for any new delegated SDK subcommand.
+- **Checkout-backed SDK builds force dev probes off.** `ensure_checkout_sdk`
+  configures local SDK builds with `-DPULP_ENABLE_AUDIO_PROBES=OFF` so
+  `pulp sdk install --local` and checkout-backed standalone resolution do not
+  export the dev standalone audio-probe surface in cached SDK artifacts.
+- **If you bump `PULP_SDK_VERSION`, you do NOT need to manually
+  invalidate `~/.pulp/cache`.** The new version means the filename
+  misses on the old cache and the user gets a fresh download
+  automatically.
+- **`pulp create` defaults to `CMAKE_BUILD_TYPE=Release`; `--debug` opts in** (2026-05). Was Debug-default historically, which silently produced ~5-10× slower binaries because `pulp build`'s incremental configure doesn't re-pass `-DCMAKE_BUILD_TYPE` (so the create-time value sticks for the project's lifetime). Two call sites in `cmd_create.cpp` both honor the flag — keep them in lockstep when adding new configure paths. Intentionally NOT mirrored:
+    - `cmd_project.cpp`'s `bump --verify-build` keeps Debug — throwaway verify build, faster compile, binary isn't run.
+    - `validate-build.sh` keeps Debug — that's the validator's job (catches debug-only assertion failures).
+    - `cli_common.cpp`'s SDK install path already used Release.
+  Follow-up scope (not done yet): `pulp build --debug` / `--release` that force a reconfigure of an existing `build/` directory.
+- Standalone `pulp create` configure/test shell commands live in
+  `tools/cli/create_build_commands.{hpp,cpp}` so path quoting is tested without
+  running a full scaffold build. Keep every path-bearing command argument
+  quoted via the shared `tools/cli/shell_quote.{hpp,cpp}` helper, including
+  `-S`, `-B`, `-DCMAKE_PREFIX_PATH=`, and `ctest --test-dir`; users can pass
+  `--output` paths with spaces.
+- **`pulp sdk available` + newer-SDK banner cache contract.** `pulp sdk available` shells out to curl for the GitHub `/releases?per_page=30` endpoint and parses `tag_name` entries — no JSON dep. `maybe_print_newer_sdk_banner(installed)` caches the latest release at `~/.pulp/cache/latest_release.txt` (line 1 = version, line 2 = Unix timestamp) with a 24h TTL and a 2s curl timeout. The cache is best-effort — if curl fails the banner just doesn't print this run. Wired into `pulp sdk status` only; `pulp build` and `pulp create` deliberately stay quiet on the hot path. To invalidate the cache: `rm ~/.pulp/cache/latest_release.txt`.
+- **`tools/cli/cli_doctor_helpers.cpp` owns doctor check bodies** (2026-05, R2-4). The 971-line doctor block moved out of `cli_common.cpp` into its own TU. Public API (`DoctorCheck` struct + `run_doctor_*` functions) stays in `cli_common.hpp`; no new public header was added (Codex risk callout: don't replace one catch-all surface with another). When adding a new doctor check, edit `cli_doctor_helpers.cpp` only.
+- **`pulp doctor list` + `--only <name>`** (2026-05, R2-8). `pulp doctor list` enumerates available checks; `pulp doctor --only <substring>` case-insensitive filter runs a subset. Works across modes (`pulp doctor android list`, `pulp doctor --only emulator`). Filter logic lives in `cmd_doctor.cpp`, not in the helpers TU — the `DoctorCheck` vector returned by `run_doctor_checks` already IS the registry. No new struct or registration step needed when adding a check.
+- **Validator commands must suppress editor hosts.** Any CLI path that shells out to `auval`, `pluginval`, `clap-validator`, or `vstvalidator` must run the command with `PULP_DISABLE_PLUGIN_EDITOR=1 PULP_HEADLESS=1 PULP_TEST_MODE=1`. This is part of the launch-safety contract: validation should never open a native plugin editor or OS window on a user/agent machine.
+
+## Build type — helper-backed tool builds default to Release (perf)
+
+`ensure_repo_build_configured` (`cli_common.cpp`, currently used by the
+`pulp design` configure path in `cmd_design.cpp`) passes
+`-DCMAKE_BUILD_TYPE=Release` on a fresh configure. Previously it passed NO build
+type, so CMake configured with no optimization (no `-O`, no `NDEBUG`) — an
+unoptimized binary whose plugin editor/DSP feels sluggish in a DAW for the same
+reason a Debug build does (confirmed 2026-05-22: ChainerSynth AU laggy
+unoptimized, "super snappy" in Release). `pulp create` already defaults Release
+with a `--debug` opt-in.
+
+`pulp build` has its own configure path in `tools/cli/cmd_build.cpp`; do not
+assume changes to `ensure_repo_build_configured` affect `pulp build`.
+
+Notes for CLI maintenance:
+- Override helper-backed fresh configures with `PULP_BUILD_TYPE=Debug` (read in
+  `ensure_repo_build_configured`); it only applies on a FRESH configure — an
+  existing `CMakeCache.txt` build type is left untouched (re-configure or wipe
+  `build/` to change it). The helper prints `Build type: <type>`.
+- The `PULP_BUILD_TYPE` value is `shell_quote`'d before it goes into the cmake
+  command (the configure runs via the shell), like every other interpolated
+  value there. Never concatenate a raw env value into a shell command string —
+  a value like `Release; rm -rf ~` would execute.
+- Don't reintroduce an empty/Debug default for plugin builds — plugins are
+  perf-tested in a host, so unoptimized is the wrong default.
+- Companion runtime signal: `decide_gpu_host` (core/format/gpu_host_select.hpp)
+  logs `build=debug|release` on the `[plugin-gpu-host]` adapter line and warns
+  once on Debug, so a host log immediately shows which build was loaded.
+
+## `pulp build --install` + `--skip-validation`
+
+The documented `build → validate → install` pipeline now exists as
+real CLI flags rather than implied tooling. `tools/cli/cmd_build.cpp`
+gained:
+
+- `--install` — after a successful build, copy each format bundle to
+  its per-format system folder (`~/Library/Audio/Plug-Ins/Components`
+  for AU, `~/Library/Audio/Plug-Ins/VST3/` for VST3,
+  `~/Library/Audio/Plug-Ins/CLAP/` for CLAP). The install runs the
+  `cmd_validate(["--strict"])` gate first; a failing validator
+  refuses to copy anything to the user's system tree.
+- `--skip-validation` — debug-only escape hatch for adapter work. It
+  is **only valid when paired with `--install`** (using it alone is
+  rejected at parse time so users can't accidentally disable
+  validation on a normal build). `--install + --watch` is also
+  rejected — repeated installs from a watch loop would race the host.
+
+Implementation lives in `tools/cli/install_paths_mac.{hpp,cpp}` and is
+mediated through an `InstallEnv` interface so the 14 Catch2 cases in
+`pulp-test-cli-install-paths-mac` can verify the mkdir → rm → cp
+ordering, idempotency, and failure cases without writing to a real
+`~/Library` tree. CLI-surface contract is pinned by 2 shellout cases
+in `pulp-test-cli-ship-shellout`.
+
+The Rust front-end (`experimental/pulp-rs/src/cmd/orchestrate.rs`) must
+recognize `--install` and `--skip-validation` and delegate the install
+branch to `pulp-cpp`; do not let either flag pass through to
+`cmake --build`. If `--install` is paired with Rust-only
+`--check-identity`, Rust runs the identity check first and strips the
+identity flags from the delegated argv before handing the install path
+to C++.
+
+Gotchas:
+
+- **rm comes before cp**, not the other way around. A leftover bundle
+  with stale Info.plist can confuse the AU registrar even after a
+  fresh copy. Tests pin this order.
+- **Relative `$HOME` is rejected.** The destination resolver refuses
+  any path that's not absolute under `$HOME/Library/Audio/Plug-Ins/`.
+- **Plugin Install Policy applies.** See CLAUDE.md "Plugin Install
+  Policy" — a plugin that crashes a DAW during scan is worse than no
+  plugin at all. The validation gate is non-optional in normal use.
+
+## `pulp ship auv3-xcodeproj`
+
+Thin wrapper over `cmake -G Xcode` that generates an Xcode project
+for an AUv3 target without disturbing the user's regular Ninja /
+Makefile build dir. Surface:
+
+```bash
+pulp ship auv3-xcodeproj <target>                    # iphonesimulator (default)
+pulp ship auv3-xcodeproj <target> --sdk iphoneos     # device
+pulp ship auv3-xcodeproj <target> --sdk macosx       # macOS lane
+pulp ship auv3-xcodeproj <target> --output build/xcode/MyPlugin
+pulp ship auv3-xcodeproj <target> --open             # open in Xcode after gen
+pulp ship auv3-xcodeproj <target> --dry-run          # print cmake invocation + build hint
+```
+
+Default output dir is `build/xcode/<target>-<sdk>`. The generated build
+hint targets `<target>_AUv3`; configure does not use a separate
+target-selector cache variable. iOS SDKs include
+`tools/cmake/ios.toolchain.cmake` with the correct `IOS_PLATFORM` (OS for
+device, SIMULATOR64 for simulator). macOS projects also contain the runnable
+containing-app target `<target>_AUv3Host`. The full Xcode-project generation
+flow plus device entitlement templates live in the `auv3` skill — this section
+just pins the CLI surface so the slash command, docs, and skill stay in
+lockstep.
+
+## `pulp identity` — committed plugin identity lockfile
+
+Track 3.12 (macOS plugin-authoring plan) introduced a Rust-side surface
+for managing `.pulp/identity.lock`, the committed pin of each plugin's
+host-visible identity (AU 4CC + manufacturer code, AAX product code,
+optional VST3 FUID, optional CLAP id, version). Lives in
+`experimental/pulp-rs/src/cmd/identity.rs`; schema doc at
+`docs/reference/identity-lock.md`.
+
+Surface:
+
+- `pulp identity record [--allow-identity-change] [--dry-run]` —
+  refresh the lockfile. Refuses to overwrite drifted entries without
+  `--allow-identity-change` (the audit-trail flag a reviewer can grep
+  in the commit message).
+- `pulp identity check [--allow-identity-change]` — pure read; exit
+  1 on drift, 0 with `--allow-identity-change`. CI-friendly.
+- `pulp build --check-identity [--allow-identity-change]` — runs the
+  check before the configure step so a drifted PR fails the whole
+  build, not just a downstream gate. Wired in
+  `cmd::orchestrate::build_with`.
+
+Gotchas (lessons from the slice):
+
+- **Empty recorded fields are NOT drift.** `vst3_fuid` and
+  `clap_plugin_id` are optional today because the recorder doesn't yet
+  scrape `Steinberg::FUID(...)` literals out of source files. The diff
+  treats `recorded == ""` as "not yet pinned" — only non-empty
+  recorded values that no longer match the current source trigger a
+  failure. A future slice can teach `parse_plugins_from_text` to walk
+  source-side identity declarations once the regex shape is locked in.
+- **Single-file CMake scan.** `parse_plugins_from_cmake` reads the
+  project's top-level `CMakeLists.txt`. Nested `pulp_add_plugin(...)`
+  invocations under `add_subdirectory(...)` are out of scope today —
+  add a CMake-tree-walker if real projects start hiding plugin
+  declarations in nested files.
+- **Lock file is reviewable.** TOML output is sorted by `target` and
+  uses `to_string_pretty`, so `git diff .pulp/identity.lock` is
+  always linear. Don't switch to `to_string` (compact) — the on-disk
+  layout being readable is the whole point.
+- **Two flag sites, same semantics.** `--allow-identity-change` works
+  on both `pulp identity {record,check}` and `pulp build
+  --check-identity`. Keep them in lockstep — the orchestrate path
+  re-uses `cmd::identity::run(Check)` rather than re-implementing the
+  comparison.
+
+## Standalone host transport + MIDI + persistence (item 3.5)
+
+`StandaloneApp` is the user-facing surface behind `pulp run`. As of
+the 3.5 wiring it consumes three Pulp subsystems the way a DAW would
+consume the equivalent host APIs:
+
+- **`pulp::midi::MidiMessageCollector` (item 1.9)** — `ui_midi_collector()`
+  is the lock-free SPSC path for UI / virtual-keyboard / scripting
+  MIDI. The audio callback drains it into each block's `MidiBuffer`
+  at the correct sample offsets via `drain_into(block_start_seconds,
+  ctx.buffer_size, ctx.sample_rate)`. Hardware MIDI still goes
+  through the mutex-guarded `pending_midi_` accumulator on the
+  input-thread callback.
+- **Built-in transport (item 1.3)** — `StandaloneConfig` carries
+  `tempo_bpm`, `time_sig_numerator`, `time_sig_denominator`, and
+  `transport_playing`. The audio callback populates
+  `ProcessContext::tempo_bpm`, `position_beats`, `bar`, and
+  `is_playing` from those values; `position_samples` advances on a
+  rolling atomic counter so plugins read a monotonic timeline.
+- **`pulp::state::ApplicationProperties` (item 1.2)** —
+  `StandaloneApp::{save,load}_persisted_config(app_name)` round-trip
+  the entire `StandaloneConfig` through the platform user-properties
+  file. Keys are namespaced under `standalone.*` so they don't collide
+  with plugin-owned state. Empty `app_name` is the documented
+  "persistence disabled" sentinel — callers can opt out by passing
+  `""`.
+
+When extending the standalone surface (new `StandaloneConfig` field,
+new transport field, new persisted key), update **both**:
+
+1. The audio callback's `ProcessContext` population in
+   `core/format/src/standalone.cpp` (so plugins see the new value
+   immediately).
+2. `save_persisted_config` / `load_persisted_config` (so the value
+   survives a `pulp run` restart).
+
+Test coverage lives in `test/test_standalone_transport_midi.cpp` —
+add a case there when you extend either surface.
+
+## Gotcha: MSVC caps a string literal at 16 KB (C2026) — split big embedded blobs
+
+`tools/mcp/pulp_mcp.cpp` `tools_list_json()` embeds the whole MCP tools-list JSON
+as one raw-string literal. MSVC errors `C2026 "string too big"` once a single
+literal exceeds 16384 bytes, which broke the Windows CLI leg of
+`release-cli.yml` (and thus releases) when the tools list grew. Clang/GCC have no
+such limit, so it builds fine locally and only fails on the Windows release lane.
+Fix: split into adjacent raw-string literals — `)JSON" R"JSON(` — which the
+compiler concatenates (output byte-identical). Keep each chunk well under 16 KB;
+when you add MCP tools, watch the literal size.
+
+## `pulp validate --json` carries machine-readable evidence
+
+The `--json` / `--report` output of `pulp validate` is a consumer contract, not
+just a log dump. Both the `--target` path and the format-walk path emit an
+aggregate `"summary"` (total/passed/failed/skipped) and an `"install_ready"`
+bool derived from the install policy (no failures, and under `--strict` no
+skips). CI and example harnesses key off these instead of scraping text — when
+you add a validator or change the gate, keep `install_ready` consistent with the
+command's exit code and update any consumer that reads the report.
+
+## Any CLI command that emits a build must bound its parallelism
+
+When a command shells out to `cmake --build` / `ctest` / `make`, route the job
+count through the tartci lease helpers in `tartci_lease.{hpp,cpp}`:
+`TartciAgentBuildLease::acquire()` returns `jobs()` (a host lease when tartci is
+present, else the tier-0 default `tier0_default_build_jobs()` =
+`min(cores, RAM_budget / 1.5 GiB)`), and `cap_cmake_build_parallel_args()` /
+`ScopedBuildParallelEnv` inject it. Never emit a bare `--parallel` (unbounded
+`make -j`): honor an explicit `PULP_BUILD_JOBS` if set, else fall back to
+`tier0_default_build_jobs()`. `build_parallelism_guard.py` fails CI on a bare
+`--parallel`/`-j` anywhere under `tools/cli/`.
+
+## Standalone render seam for headless RT / audio tests
+
+`StandaloneApp`'s device-callback body lives in a private
+`render_audio_block(input, output, ctx)` (the device lambda is a one-line
+wrapper), and the device-independent buffer/probe prep is split into
+`prepare_render_state()`. A test can therefore drive the exact render path
+WITHOUT opening a real audio device — `prepare_render_state()` then
+`render_audio_block(...)` via `friend struct StandaloneRenderTestAccess` (see
+`test/test_standalone_rt.cpp`, which asserts the path is allocation/lock-free
+under the RT trap build). Keep the extraction behavior-preserving — the full
+standalone suite (start/apply-config/transport) is the regression gate.
+
+## A CTest case that shells out to a CLI command must not require `planning/`
+
+The `planning` submodule is private and optional — a public clone, a fresh
+worktree, and every CI runner can be missing it. So a `add_test(... COMMAND
+pulp-cli <cmd>)` whose command reads something under `planning/` will fail on
+those checkouts, and if it lands it turns the required macOS gate red for every
+open PR until it is fixed.
+
+`pulp minos sweep` and `pulp minos publish-runbook` read
+`planning/sdk-consumers/consumers.yaml`. Their CTest cases pair the usual
+`PASS_REGULAR_EXPRESSION` with a skip keyed on the script's own message:
+
+```cmake
+set_tests_properties(cli-minos-sweep-dryrun PROPERTIES
+    PASS_REGULAR_EXPRESSION "Planned sweep:"
+    SKIP_REGULAR_EXPRESSION "consumers registry not found")
+```
+
+CTest checks the skip regex before the pass regex and before the exit code, so a
+missing registry reports `Skipped` with the reason visible, while a checkout that
+*has* the registry still asserts the real output. Never spell the degradation as
+a second `PASS_REGULAR_EXPRESSION` — that greens a genuinely broken tool.
+
+The skip is only as strong as the agreement between the script's wording and the
+CMake property. `tools/scripts/test_minos_registry_absent.py` asserts both ends:
+the scripts really print the phrase, and the CMakeLists really keys its skip on
+it. Extend that test when you add another registry-reading CLI test.

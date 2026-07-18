@@ -1,0 +1,843 @@
+---
+name: phase-runner
+description: End-to-end phase orchestrator. For the current SDLC phase, runs every registered analyzer, then drives a real cross-AI consensus verdict HEADLESSLY via hooks/scripts/consensus-run.sh (runs the codex/gemini reviewer CLIs + finalises verdict.json — no dependency on the disable-model-invocation consensus skills, so phase-runner no longer deadlocks). On APPROVED it records consensus + auto-advances via the sdlc-engine MCP tools; on NEEDS_REVISION/REJECTED it stops with an explicit operator breadcrumb (the deep-rewrite specialist→arbiter→apply chain edits the primary artifact and stays operator-confirmed by design). In TESTING it first generates the coverage artifact (Sprint 29). One command replaces the manual analyzer → consensus → advance walk.
+disable-model-invocation: false
+allowed-tools: Read Write AskUserQuestion Bash(git status*) Bash(git rev-parse*) Bash(bash hooks/scripts/consensus-run.sh*) Bash(bash *stream-id.sh*) Bash(bash *ui-verification-debt.sh*) Bash(bash *ui-styling-check.sh*) Bash(bash *integration-wiring-check.sh*) Bash(jq *) Bash(mkdir *) Bash(rm *) Bash(npm *) Bash(npx *) Bash(pnpm *) Bash(yarn *) Bash(pytest *) Bash(dotnet *) Bash(cargo *) Bash(go *) mcp__sdlc-engine__sdlc_get_state mcp__sdlc-engine__sdlc_advance_phase mcp__sdlc-engine__sdlc_list_phases mcp__sdlc-engine__sdlc_record_consensus mcp__sdlc-engine__sdlc_start_cycle
+---
+
+# Phase Runner (Sprint 19-F)
+
+The one-command phase loop. Before Sprint 19, an operator walking
+REQUIREMENTS → DESIGN typed something like:
+
+```
+/vibeflow:prd-quality-analyzer docs/PRD.docx
+/vibeflow:consensus-orchestrator docs/PRD.docx
+/vibeflow:consensus-specialist <sid>
+/vibeflow:apply-arbiter-patch <sid>
+/vibeflow:consensus-orchestrator docs/PRD.docx  # round 2 (manual)
+/vibeflow:advance
+```
+
+Sprint 19-F collapses that to `/vibeflow:phase-runner`. Every
+step uses the same artifacts + skills that were already doing the
+work — phase-runner just sequences them, gates on
+`phaseRunner.autoAdvance`, and bounds iteration via
+`phaseRunner.maxConvergenceAttempts`.
+
+## Usage
+
+```
+/vibeflow:phase-runner [TARGET_PHASE]
+```
+
+- `TARGET_PHASE` (optional) — REQUIREMENTS / DESIGN / ARCHITECTURE
+  / PLANNING / DEVELOPMENT / TESTING / DEPLOYMENT. Default: read
+  `currentPhase` via `mcp__sdlc-engine__sdlc_get_state`.
+
+Both the target phase and the current phase must match — the skill
+does **not** run analyzers for a different phase than the project
+is in. If they disagree the skill stops and tells the operator to
+`/vibeflow:advance` first (or run the right analyzer by hand).
+
+## Phase → analyzer map
+
+Hardcoded in the skill. Matches `skills/phase-policy.json`
+registrations + the Sprint 19-A `docs/PRIMARY-ARTIFACT.md` table.
+
+| Phase | Analyzer skills (sequential) | Primary (resolved by marker v2) |
+|---|---|---|
+| REQUIREMENTS | `prd-quality-analyzer` | `<PRD path from argument or docs/>` |
+| DESIGN | `design-bootstrap` (operator-interactive — produces the design spec; not auto-forked) | `design/design-spec.md` |
+| ARCHITECTURE | `architecture-bootstrap` (operator-interactive author) → `architecture-validator` (validate, model-invocable) | `docs/architecture.md` |
+| PLANNING | `test-strategy-planner`, `traceability-engine` | `.vibeflow/reports/test-strategy.md` |
+| DEVELOPMENT | `quality-gates` | the increment diff — `git diff <base>..HEAD`, base resolved robustly (see below; **not** a hardcoded `HEAD~1..HEAD`) |
+| TESTING | _(generate coverage — Step 2a)_ → `coverage-analyzer`, `mutation-test-runner` **+ (UI-facing increment only) the front-end battery: `input-validation-matrix`, `e2e-test-writer`, `business-rule-validator`, `traceability-engine`, `visual-ai-analyzer`, `uat-executor`** (Sprint 44) | `.vibeflow/reports/coverage-report.md` |
+| DEPLOYMENT | `release-decision-engine`, `deploy-verifier` | `release-notes/<version>.md` |
+
+DESIGN's analyzer (`design-bootstrap`) is **operator-interactive** — it asks
+which design source to use (Claude-native / Figma) — so phase-runner does NOT
+auto-fork it. If `design/design-spec.md` does not exist yet, stop and emit the
+breadcrumb `▶ Next: /vibeflow:design-bootstrap` (it authors the spec + arms the
+consensus marker). Once the spec exists, phase-runner runs the headless
+consensus (Step 3, `consensus-run.sh`) on `design/design-spec.md` (the
+marker's primary, or `design.sourceDir` fallback `design/`) and announces the
+manual-criterion reminder from `docs/AUTO-SATISFY.md` (`design.approved` +
+`accessibility.verified` stay operator-confirmed).
+
+**ARCHITECTURE is the same shape.** `architecture-validator` only *validates*
+`docs/architecture.md` (its hard precondition is that the doc exists), and the
+**operator-interactive** `architecture-bootstrap` is what *authors* it (asking
+the technology baseline). So if `docs/architecture.md` does not exist yet, stop
+and breadcrumb `▶ Next: /vibeflow:architecture-bootstrap`. Once it exists,
+run `architecture-validator` as a **Skill** (Step 2 — not a general agent),
+then headless consensus on `docs/architecture.md`.
+
+**DEVELOPMENT — resolve the diff robustly (don't hardcode `HEAD~1..HEAD`).**
+The analyzer-map lists the primary as "the diff", but a literal
+`git diff HEAD~1..HEAD` is fragile: it **fails with exit 128** when the project
+isn't a git repo or has fewer than two commits (no `HEAD~1`), and it only
+reviews the **last commit** — a DEVELOPMENT increment usually spans several
+commits (sprints / slices). Resolve the base first:
+
+```bash
+# 1) must be a git repo
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "DEVELOPMENT review needs a git repo (the primary is the work diff)."
+  echo "▶ Next: git init + commit your work, then re-run /vibeflow:phase-runner"
+  exit 0; }
+# 2) prefer the increment base (merge-base with the default branch) so the WHOLE
+#    increment is reviewed, not just the last commit
+BASE="$(git merge-base HEAD origin/main 2>/dev/null \
+     || git merge-base HEAD main 2>/dev/null \
+     || git merge-base HEAD origin/master 2>/dev/null || echo '')"
+# 3) fallbacks: ≥2 commits → HEAD~1 ; exactly 1 commit (initial) → the empty tree
+if [ -z "$BASE" ]; then
+  if git rev-parse HEAD~1 >/dev/null 2>&1; then BASE="HEAD~1"
+  else BASE="$(git hash-object -t tree /dev/null)"; fi   # empty tree → first commit IS reviewable
+fi
+DIFF_RANGE="$BASE..HEAD"          # the DEVELOPMENT primary
+```
+
+Use `$DIFF_RANGE` as the primary the `quality-gates` analyzer + consensus
+review. `quality-gates` runs lint/typecheck/tests (mechanical — invoke it as a
+**Skill**, not a general agent); consensus on the diff satisfies `code.reviewed`.
+
+**DEVELOPMENT — catch a *skinless* UI here, not at TESTING (Sprint 55).** A UI
+whose *structure* is built (the right DOM, content binding, a11y, even the
+design's class names) but whose *design was never implemented* — no stylesheet,
+no Tailwind, no CSS-in-JS, design tokens never consumed — compiles fine, passes
+lint/typecheck/tests, and reads clean in a diff (an **absence** is invisible to
+`quality-gates` + `code.reviewed`). It then renders as bare default HTML, nothing
+like the mockup. Run the read-only static check on the DEVELOPMENT diff:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/scripts/ui-styling-check.sh" .
+```
+
+- `"skinless"` → surface **prominently** (this is a real DEVELOPMENT gap, not a
+  nit): `⚠ the UI uses className but applies no stylesheet/tokens — the design`
+  `(design-spec mockup + design-tokens.json) was specified but never implemented.`
+  `Implement the styling before TESTING.` Do not advance past it silently.
+- `"styled"` / `"no-ui"` → say nothing.
+
+The TESTING `frontend-render-check` is the hard gate (it BLOCKs a skinless UI);
+this catches the same gap **when the UI is written**, so it can't ship structure-
+only.
+
+**DEVELOPMENT — catch an *unwired* UI here too (Sprint 58).** The same class of
+invisible-absence bug applies to the front↔back boundary: a UI that calls
+`fetch('/api/...')` over an endpoint **no server implements** (or is hard-bound to
+mock fixtures) compiles, renders on mocks, and reads clean in a diff — its links
+have **no backend behind them**. Run the read-only static check:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/scripts/integration-wiring-check.sh" .
+```
+
+- `"unwired"` → surface **prominently**: `⚠ the UI calls a server API but no`
+  `backend serving those routes was found — the links have no backend behind them.`
+  `Wire the backend before TESTING (▶ /vibeflow:integration-verifier proves it).`
+  Like `ui-verification-debt`, this also flags an `unwired` boundary left from an
+  earlier cycle, not just the current increment.
+- `"wired"` / `"single-tier"` / `"no-app"` → say nothing.
+
+The check is **stack-agnostic** (Sprint 59) — it recognises Node, Python, Go,
+.NET and Java back-ends (manifest-first), so a UI over a Python/FastAPI or Go
+backend is surfaced the same as one over Express.
+The TESTING `integration-verifier` is the hard gate (it boots the real back-end —
+any stack — + seeds data + BLOCKs a 404/won't-boot); this surfaces the same gap
+**while the UI is built**, so a mock-front-end-over-a-claimed-backend can't reach
+TESTING unseen.
+
+**DEVELOPMENT — render every new screen as it's built (Sprint 67).** `skinless`
+and `unwired` are *static absence* checks; they don't catch a screen that renders
+but looks wrong (bad spacing, a missing glyph, no empty-state, a dağınık layout) —
+the class of defect that shipped in Clera and was only caught by a human eyeballing
+the screens. So when the increment is **UI-facing** (`vf_web_ui_kind .` ≠ `none`
+via the readers **and** the diff touched UI), run `frontend-render-check` **via the
+Skill tool** in its DEVELOPMENT render-as-you-build mode — scoped to the screens
+this increment changed — so each new screen is RENDERED + SHOWN (screenshots) +
+visually checked while you build it, not deferred to TESTING:
+
+```
+Skill: vibeflow:frontend-render-check     # DEVELOPMENT mode — scoped to changed screens
+```
+
+- **`BLOCKED`** (won't render / skinless / no relation to the design) → **stop**
+  with the fix breadcrumb — a proportionate DEVELOPMENT gate (don't advance a
+  screen that doesn't render or has no relation to its design).
+- cosmetic **drift findings** → surface **prominently** (with the screenshots) +
+  continue; the operator fixes before TESTING.
+- It **never arms the consensus marker** in DEVELOPMENT (arm-on-pass is TESTING),
+  so it can't block the iteration that fixes the screen.
+
+The TESTING run is still the full battery (frontend-render-check +
+visual-ai-analyzer + input-validation + integration-verifier) and the hard
+arm-on-pass gate; this just moves the *first eyes-on render* to where the screen
+is written.
+
+**DEPLOYMENT closes the cycle (Sprint 42).** DEPLOYMENT is terminal — there is no
+phase after it. When its exit criteria are satisfied (`release.decision.go` =
+GO + `deployment.verified` + `consensus.deployment.approved`), the **cycle is
+done**: update `.vibeflow/state/lifecycle.json` — set
+`currentCycle.status = "completed"` + `completedAt`, then move it into
+`history[]`. Close with the cycle-completion breadcrumb (track-and-breadcrumb;
+the operator runs the git/gh):
+
+```
+Cycle <id> (<title>) shipped — DEPLOYMENT GO. The PR for this cycle is ready to merge.
+▶ Next: gh pr merge <branch>   then   git checkout -b increment/<next>  &&  /vibeflow:brownfield-intake
+```
+
+Until those criteria are met, DEPLOYMENT stays `in-progress` (don't mark a cycle
+complete on a CONDITIONAL/BLOCKED release decision). **A merged PR does not
+complete the cycle** — only the GO above does.
+
+**When DEPLOYMENT can't reach GO (Sprint 46).** `deployment.verified` needs real
+CI / deploy / health infra; a project often parks at DEPLOYMENT `in-progress`
+because that infra doesn't exist yet (the code shipped to a repo, the PR merged,
+but nothing is *deployed + verified*). That is a **legitimate in-progress
+state**, not a finished cycle. The honest options are exactly two — surface both,
+pick neither for the operator:
+
+1. **Finish the deploy** — wire the CI/deploy/health pipeline, run
+   `deploy-verifier` + `release-decision-engine` to a GO; the cycle then
+   completes itself.
+2. **Explicitly close/defer the cycle** — if you're deliberately stopping before
+   a real deploy, the **operator** sets `currentCycle.status` (e.g. `completed`
+   with a `note: "shipped to repo; deploy deferred"`, or a `deferred` status).
+   This is a human decision, recorded — never inferred from a merge.
+
+**Do not** auto-start a new increment / `brownfield-intake` to "move on" from a
+stuck DEPLOYMENT — that silently abandons the open cycle. Resume, finish, or have
+the operator close it.
+
+**TESTING — UI-conditional front-end battery (Sprint 44).** The default TESTING
+analyzers (`coverage-analyzer`, `mutation-test-runner`) measure *quality of
+tests*, not whether the **UI** is right. So when the active increment is
+**UI-facing** (the change-type classification from `brownfield-intake` /
+`design-bootstrap` is `ui` or `mixed`, or `design/design-spec.md` exists for this
+cycle), phase-runner runs the **front-end battery** in TESTING **in addition to**
+coverage + mutation — each as a **Skill** (not a general agent), arm-on-pass
+(Sprint 43), so their reports feed the TESTING consensus + the gated test suite:
+
+1. **`frontend-render-check`** (web only, Sprint 53) — **actually boots the UI**,
+   serves mock data, captures + **surfaces** screenshots of the hero screens, and
+   compares them to the **design** (Figma via `db_compare_impl`, else the
+   design-spec mockups + tokens). This is the step that ends the "dark tunnel":
+   it catches a UI that ships unit-tested but never rendered, a dev server that
+   won't start (a broken alias / a path-with-spaces), and an implementation that
+   has *no relation to the design*. Run it **first** so its screenshots feed
+   `visual-ai-analyzer`.
+2. **`input-validation-matrix`** — per-field data validation (required / type /
+   boundary / format / type-mismatch / injection-safety / output-formatting).
+3. **`e2e-test-writer`** then run — functional flows end-to-end (Playwright web /
+   Detox mobile): the functions actually work.
+4. **`business-rule-validator`** — the functions meet the PRD's rules.
+5. **`traceability-engine`** — every UI requirement maps to a test (no
+   untested requirement / orphan test).
+6. **`visual-ai-analyzer`** — design conformance on the captured screens (layout
+   / typography / a11y), reusing `frontend-render-check`'s screenshots.
+7. **`integration-verifier`** (full-stack increments only, Sprint 58) — boots the
+   **real** back-end locally, seeds deterministic test data (via
+   `test-data-manager`), points the **real** front-end at it instead of mocks, and
+   drives the `SCN-UI-*-DATA-*` data-binding scenarios end-to-end (populated /
+   loading / empty / error / offline). Proves the UI *talks* to a backend, not
+   just that it *renders* — **no deploy required**. Gate it on
+   `hooks/scripts/integration-wiring-check.sh .` = `wired`/`unwired`; a
+   `single-tier` / `no-app` result means skip it (the front-end-only / back-end-only
+   carve-out). BLOCKs when the back-end won't boot (or has no HTTP server), a
+   called endpoint 404s, or the UI errors on real data — the "mock front-end over
+   a *claimed* backend" trap that lets unverified backends ship.
+8. **`uat-executor`** — end-to-end on **deployed staging** with the real backend +
+   human steps, when a staging URL is configured (else breadcrumb it as the
+   operator's manual step). The three integration rungs, in order:
+   `frontend-render-check` renders on **mocks** (looks right) →
+   `integration-verifier` runs the **real front↔back locally** with seeded data
+   (talks right, **no deploy**) → `uat-executor` is the **deployed** live
+   front+back walk. The middle rung is what was missing: the live front+back
+   integration used to be checked *only* on a
+   staging env most projects never stand up, so a UI-over-claimed-backend slipped
+   straight to GO.
+
+Because the validation + e2e tests are written **into the project suite**, the
+existing gates enforce them: they must pass (`regression-test-runner` /
+`quality-gates`) and count toward `coverage.met`. The battery's reports
+(`validation-matrix.md`, `rtm.md`, visual findings) become **evidence** for
+`consensus.testing.approved`. A **backend/infra** increment skips the battery
+entirely — coverage + mutation only, unchanged. `docs/FRONTEND-TESTING.md` maps
+each step to what it guarantees.
+
+**…and on mobile, add the crash/stability lane (Sprint 45).** When
+`vibeflow.config.json.platform` is `ios` / `android` / `all`, also run
+**`mobile-stability-runner`** as a Skill — functional E2E asks "does the flow
+work?", this asks "**does the app crash?**", the failure mode that actually bites
+mobile (and Expo especially, where the crash is usually at cold start, not in the
+happy path). It is **Expo-aware** (auto-detects Expo → Maestro / bare RN → Detox)
+and runs a crash-focused battery (cold-start smoke, background/foreground,
+low-memory, deep links, permission denial, network loss, rotation) detecting
+native crashes / JS redbox / ANR. **Graceful-degrade:** with no simulator/device
+it doesn't fail hard — it breadcrumbs the local run command and records
+`NEEDS_REVISION` (env gap, not a crash). A crash on cold-start or a P0 flow is a
+hard BLOCKED. `docs/MOBILE-TESTING.md` covers it.
+
+## Process
+
+### Step 0: Lifecycle — resume the open cycle, or start a new increment (Sprint 42)
+
+> **Gather setup state with the Read tool + MCP, NOT Bash (Sprint 56).** An
+> analysis skill (e.g. `prd-quality-analyzer`) often armed
+> `.vibeflow/state/consensus-needed.json` just before you ran — and
+> `consensus-gate` then blocks **every Bash/Write/Edit** until consensus drains.
+> phase-runner is the *legitimate drainer*, but its **setup reads** (lifecycle,
+> phase, reports) trip that gate if you do them with `cat`/`jq` in Bash. So read
+> `.vibeflow/state/lifecycle.json` with the **Read tool** (when streams are on,
+> its exact path is the `lifecycle` field from the allowlisted read-only
+> `stream-id.sh`), the engine phase via
+> `mcp__sdlc-engine__sdlc_get_state` (**MCP**), and any report with the Read tool
+> — all three are **ungated**. Then the only Bash you need under an armed marker
+> is `hooks/scripts/consensus-run.sh` (already allowlisted), which drains it. Do
+> **not** reach for `VF_SKIP_CONSENSUS_GATE=1` just to read state — switch tools.
+
+**Resolve the work-stream first (Sprint 60).** VibeFlow keys all state on a
+**work-stream id**. With the default single-stream setup it is the bare project
+id and nothing changes. When `streams.enabled` is on (opt-in parallel team
+work), it is derived per git branch so two developers on two branches/worktrees
+run **independent** SDLC states that never clobber each other. Resolve it with
+the read-only reader (allowlisted, ungated — safe under an armed marker):
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/scripts/stream-id.sh"
+```
+
+Use the printed `streamId` as the `projectId` for **every** `sdlc_*` MCP call
+below, and the printed `lifecycle` path wherever this step names
+`.vibeflow/state/lifecycle.json`. (With streams off these are the project id and
+`.vibeflow/state/lifecycle.json` — today's values. See `docs/TEAM-WORK.md`.)
+
+> **Integration branch hint (streams on).** If `streams.enabled` is on and the
+> reader's `branch` is an integration/base branch (e.g. `main`/`master`/`release/*`
+> — the stream id collapsed to the bare project) **and** other feature streams
+> have merged in, this is a **merge point**, not a fresh feature walk. Drive the
+> combined product through the integration gate instead:
+> > ▶ Next: /vibeflow:integrate
+> A feature branch (its own `<project>__<slug>` stream) just runs phase-runner
+> normally below.
+
+**Run first.** A project moves through one or more **cycles** — one pass of the
+SDLC per deliverable (the initial build, then one per increment). The runtime
+question is never "greenfield or brownfield" (that was a one-time cycle-1
+decision); it's **"is there an open cycle to resume, or did the last one ship?"**
+— read from state, not from whether source files exist. **Read** (the tool) the
+lifecycle file (the `lifecycle` path from the reader above):
+
+- **`currentCycle.status == "in-progress"`** → resume; continue to Step 1 at the
+  cycle's `currentPhase`. (This is the *greenfield-paused-and-resumed* case — it
+  must resume, never get re-onboarded or treated as brownfield.) **This holds at
+  DEPLOYMENT too** — an in-progress cycle sitting at DEPLOYMENT resumes DEPLOYMENT;
+  do **not** offer a new increment for it (see the completion rule below).
+- **`currentCycle.status == "completed"`** (last cycle shipped) → there is no
+  open work. Stop and breadcrumb a new increment on a fresh branch:
+  > Last cycle (`<title>`) shipped (DEPLOYMENT GO). Start the next increment:
+  > ▶ Next: git checkout -b increment/<slug>  &&  /vibeflow:brownfield-intake
+- **No `lifecycle.json`** (pre-Sprint-42 project) → backfill an `in-progress`
+  cycle from `currentPhase`, then resume.
+
+> **What "completed" means — read this before suggesting a new increment
+> (Sprint 46).** A cycle is `completed` **only** when the `status` field says so,
+> and that flips **only** on DEPLOYMENT GO (the rule below). It is **not**
+> completion when: the increment branch was **merged to main**, the project
+> **reached DEPLOYMENT** (the last phase), or all the *code* is done. A merged PR
+> on a cycle that's still `in-progress` at DEPLOYMENT is **still in-progress** —
+> resume it. **Never narrate or breadcrumb "start the next increment /
+> brownfield-intake" for an `in-progress` cycle**, even at DEPLOYMENT, even after
+> a merge. Only a literal `status: "completed"` opens the next-increment path.
+
+Each cycle maps to **one branch / one PR** (track-and-breadcrumb — VibeFlow
+records `branch`/`prUrl` in the cycle and *suggests* the `git`/`gh` commands;
+the operator runs them).
+
+**Engine/lifecycle drift — reconcile before Step 1 (Sprint 48).** The
+`sdlc-engine` MCP models one linear pass; opening a new increment cycle in
+`lifecycle.json` does **not** by itself rewind the engine, which stays at the
+prior cycle's terminal phase (DEPLOYMENT). Normally `brownfield-intake` calls
+`mcp__sdlc-engine__sdlc_start_cycle` when it opens the cycle, so they agree. But
+if you find the engine **ahead** of this cycle's phase — `sdlc_get_state`'s
+`currentPhase` is later than the cycle's `currentPhase` (e.g. a cycle opened
+before this reset existed, like a pre-2.36 ANTOS cycle-2) — call
+`mcp__sdlc-engine__sdlc_start_cycle` `{ projectId, note: "<cycle/​increment>" }`
+once to reset the engine to REQUIREMENTS, then continue. Without it, Step 1's
+phase-mismatch guard correctly refuses to run.
+
+**Surface pending work before progressing (Sprint 52).** phase-runner advances
+the SDLC *phase* — it does **not** commit/push your work, and "run phase-runner"
+is not "commit everything and ship". Operators reasonably expect "just do what's
+needed", so before resuming/advancing, **look for in-flight work that the phase
+step would otherwise skip, and name it** (surface only — never auto-commit; git
+is the operator's):
+
+```bash
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
+  git status --porcelain | head -20          # uncommitted changes
+[ -f .vibeflow/state/review-pending.json ] && echo "review-pending marker present"
+```
+
+- **Uncommitted changes** — list them. **This matters most when the phase is (or
+  is advancing into) DEVELOPMENT**, because `code.reviewed` runs consensus on the
+  **committed** diff (Step 1's base-resolver), so anything uncommitted is **not
+  reviewed**. Emit a heads-up + the breadcrumb, e.g.
+  `⚠ N uncommitted file(s) won't be in the DEVELOPMENT review diff — commit first: git add -A && git commit`.
+- **`review-pending.json`** (the `trigger-ai-review` marker) — a
+  committed-but-unreviewed change. Name its sha and remind that consensus on the
+  diff covers it.
+
+phase-runner does **not block** on pending work (the operator may intentionally
+leave it) and does **not** commit it — it surfaces it so "run phase-runner"
+doesn't silently advance past unreviewed in-flight work. If there's nothing
+pending, say nothing.
+
+**UI render-verification debt (Sprint 54).** The front-end battery runs only when
+the *current* increment is UI-facing — so a web UI built in an earlier cycle (or
+before the visual-testing tooling existed) can stay **never rendered or compared
+to its design**, buried under later backend cycles. Run the read-only reader and
+surface it (surface-only — never blocks, never auto-runs):
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/scripts/ui-verification-debt.sh" .
+```
+
+- `"never"` → `⚠ this project has a web UI that has never been render-verified — `
+  `▶ /vibeflow:frontend-render-check` (it'll catch a won't-boot bug + any
+  design divergence).
+- `"stale"` → `⚠ the UI changed since the last render-verification — re-run`
+  `/vibeflow:frontend-render-check`.
+- `"verified"` / `"no-ui"` → say nothing.
+
+### Step 1: Resolve phase + config
+
+```bash
+CURRENT="$(mcp_sdlc_engine_sdlc_get_state | jq -r '.currentPhase')"
+TARGET="${ARGUMENTS:-$CURRENT}"
+TARGET="${TARGET^^}"  # upper-case
+
+if [[ "$TARGET" != "$CURRENT" ]]; then
+  echo "phase-runner mismatch: current=$CURRENT target=$TARGET. Advance or re-run with matching phase."
+  exit 1
+fi
+
+AUTO_ADVANCE="$(vf_config_get '.phaseRunner.autoAdvance' 2>/dev/null || echo true)"
+MAX_CONV="$(vf_config_get '.phaseRunner.maxConvergenceAttempts' 2>/dev/null || echo 3)"
+MAX_ITER="$(vf_config_get '.consensus.maxIterations' 2>/dev/null || echo 5)"
+# Sprint 29: TESTING coverage generate-step opt-out (flag or env).
+NO_GENERATE=0
+[[ "$ARGUMENTS" == *--no-generate* || "${VF_SKIP_GENERATE:-}" == "1" ]] && NO_GENERATE=1
+```
+
+### Step 1b: Initialise the progress ledger (Sprint 21-C)
+
+`phase-runner` is a long walk (up to `maxConvergenceAttempts` ×
+`maxIterations` reviewer rounds). So the operator can see where a run
+is, write a structured ledger to
+`.vibeflow/state/phase-runner-progress.json` and update it at **every
+step boundary**. `/vibeflow:flow-status` reads this file (Sprint 21-D).
+
+```bash
+LEDGER="$(vf_state_dir)/phase-runner-progress.json"
+# Fresh ledger at run start — overwrites any stale prior run so a new
+# walk never shows a phantom step from last time.
+jq -n -c --arg phase "$CURRENT" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson maxConv "$MAX_CONV" \
+  '{phase:$phase, startedAt:$ts, status:"running", attempt:1,
+    maxConvergenceAttempts:$maxConv, currentStep:"init", steps:[]}' \
+  > "$LEDGER"
+
+# Helper used at every boundary below. Appends/updates a step and sets
+# currentStep; pass status running|done|failed|skipped and an optional detail.
+vf_progress() {                 # vf_progress <step-name> <status> [detail]
+  local name="$1" st="$2" detail="${3:-}"
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -c --arg name "$name" --arg st "$st" --arg detail "$detail" --arg ts "$ts" '
+    .currentStep = $name
+    | .steps = ((.steps // []) | map(select(.name != $name))
+        + [{name:$name, status:$st, detail:$detail, updatedAt:$ts}])' \
+    "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+}
+```
+
+Call `vf_progress` at each boundary: `analyzer:<name>` (running→done),
+`consensus-round-<attempt>` (running, with `detail="agreement=<n>"`),
+`specialist` / `arbiter`, `apply`, and `advance`. At the very end set
+the terminal status (Step 5).
+
+### Step 2a: Generate TESTING artifacts (Sprint 29 — TESTING only)
+
+`coverage-analyzer` **parses** an existing coverage JSON — it does not
+run the suite to produce one. So in **TESTING only**, before forking the
+analyzers, generate the coverage artifact by running the project's
+coverage command. (`mutation-test-runner` self-generates its mutants and
+runs the suite itself, so it only needs `tech.testCommand` to exist.)
+Other phases skip this step entirely — the REQUIREMENTS / ARCHITECTURE /
+PLANNING / DEVELOPMENT / DEPLOYMENT walks are unchanged.
+
+```bash
+if [[ "$CURRENT" == "TESTING" && "$NO_GENERATE" != "1" ]]; then
+  RUNNER="$(vf_config_get '.tech.testRunner' 2>/dev/null || echo "")"
+  COV_CMD="$(vf_config_get '.tech.coverageCommand' 2>/dev/null || echo "")"
+  if [[ -z "$COV_CMD" ]]; then
+    case "$RUNNER" in
+      vitest) COV_CMD='npx vitest run --coverage' ;;
+      jest)   COV_CMD='npx jest --coverage' ;;
+      pytest) COV_CMD='pytest --cov --cov-report=json' ;;
+      dotnet) COV_CMD='dotnet test --collect:"XPlat Code Coverage"' ;;
+      *)      COV_CMD='' ;;   # unknown runner → nothing to run
+    esac
+  fi
+  vf_progress "generate:coverage" "running" "${COV_CMD:-<no coverage command>}"
+  if [[ -n "$COV_CMD" ]]; then
+    if eval "$COV_CMD"; then
+      vf_progress "generate:coverage" "done" "$COV_CMD"
+    else
+      # Best-effort: do NOT abort. The coverage-analyzer below will
+      # surface the missing/empty-coverage block, giving the operator a
+      # precise "coverage didn't generate" signal instead of a silent
+      # phase-runner failure.
+      vf_progress "generate:coverage" "failed" "$COV_CMD (continuing — analyzer will surface the gap)"
+    fi
+  else
+    vf_progress "generate:coverage" "skipped" "no coverage command for testRunner=$RUNNER"
+  fi
+fi
+```
+
+**Opt-out.** `--no-generate` (or `VF_SKIP_GENERATE=1`) sets
+`NO_GENERATE=1`, skipping this step — for operators who generate coverage
+in CI / by hand and just want the analyze → consensus → advance walk.
+
+### Step 2: Run phase analyzers
+
+Look up the phase's analyzer list from the hardcoded map. For each:
+
+1. **Run the analyzer as a skill — use the Skill tool (or its
+   `/vibeflow:<analyzer>` slash command).** The analyzers
+   (`architecture-validator`, `test-strategy-planner`, `traceability-engine`,
+   `coverage-analyzer`, `quality-gates`, …) are model-invocable skills with
+   their own logic + auto-satisfy gates. If an analyzer comes back as a
+   bare *codebase exploration* / summary (no report written, no
+   marker / criterion), that is the **Sprint 38 bug** — those skills used
+   to carry `agent: Explore` in their frontmatter, which routed them to the
+   read-only Explore agent that **cannot Write** their report, so they
+   couldn't execute and the phase-gate was silently bypassed. v2.26.0
+   removed `agent: Explore` from all of them; if you still see exploration,
+   the installed plugin is stale — update it.
+2. The analyzer writes its marker (v2 per Sprint 19-A) +
+   auto-satisfies its criterion (per Sprint 18) + writes
+   `consensus-needed.json`.
+3. `consensus-gate` hook will now block further work until
+   consensus runs.
+
+If an analyzer is **operator-interactive** (it must ASK the operator
+something before it can run — `design-bootstrap` for DESIGN,
+`architecture-bootstrap` for ARCHITECTURE author the artifact and need a
+human decision) phase-runner does NOT auto-run it: if its primary artifact
+(`design/design-spec.md`, `docs/architecture.md`) doesn't exist yet, stop
+and breadcrumb `▶ Next: /vibeflow:<bootstrap>` so the operator authors it,
+then re-run phase-runner to validate + consensus it.
+
+Sequential runs so each analyzer's marker drain + re-write
+doesn't collide with the next. For PLANNING and TESTING which
+have two analyzers, the second analyzer overwrites the marker
+(last-writer-wins — its evidence[] should include prior
+analyzer's report to avoid losing signal).
+
+### Step 3: Consensus — headless, real verdict (Sprint 31-C)
+
+phase-runner is the one **operator-invoked** entry point that may
+drive consensus itself. The `/vibeflow:consensus-orchestrator` skill
+(and specialist / arbiter / apply / advance) are
+`disable-model-invocation: true`, so Claude **cannot fork them** —
+before Sprint 31 that made this loop un-runnable and phase-runner
+deadlocked against its own `consensus-gate` (the analyzer's
+`consensus-needed.json` blocked every tool call, and the only thing
+that could drain it was an un-forkable skill). Instead, call the
+headless runner as **plain Bash**:
+
+**Step 3a — Claude reviews first, independently (Sprint 73).** Before running the
+CLIs, fork the **`claude-reviewer` agent** (via the Task tool) to review the
+primary artifact **as if a third party wrote it** — do NOT assume the authoring
+reasoning is sound; a fresh-eyes, adversarial quality/security/maintainability
+lens. Write the agent's **native JSON review** (its normal
+`{ score, verdict, criticalIssues:[…], suggestions:[…], summary }` output — see
+`agents/claude-reviewer.md`) verbatim to
+`.vibeflow/state/consensus/claude-review.json`. The runner's `append_cli_verdict`
+consumes that shape directly (`criticalIssues` may be an array or an int;
+`suggestions[]` flows to the arbiter exactly as codex/gemini's do) — no reshaping
+needed.
+
+**Step 3b — run the panel with Claude in it.** Then call the headless runner,
+passing Claude's verdict so it's a first-class panel member:
+
+```bash
+bash hooks/scripts/consensus-run.sh .vibeflow/state/consensus-needed.json \
+  --claude-verdict .vibeflow/state/consensus/claude-review.json
+```
+
+(If no marker exists — e.g. DESIGN, which has no analyzer — pass the primary
+artifact path directly: `… consensus-run.sh design/spec.md --claude-verdict …`.)
+
+**Claude is ALWAYS in the panel**, so the project never stalls on missing CLIs:
+- codex/gemini available → the panel is Claude + whichever CLIs ran.
+- **neither available → Claude alone still finalises a verdict — no stall, no
+  exit 3.** (This is the fix for "orchestration stopped because codex/gemini
+  weren't usable.")
+
+The runner resolves the primary, records Claude's verdict + runs every external
+reviewer CLI on PATH (codex, gemini), finalises a real `verdict.json` via
+`consensus-aggregator.sh --finalize` (no 600s quorum stall — it knows
+the panel is exactly the CLIs that ran), feeds the same
+history.jsonl / reviewer-memory / auto-revert machinery the interactive
+path uses, and **drains `consensus-needed.json`** so the gate unblocks.
+It prints one JSON line:
+`{sessionId, status, agreement, criticalTotal, reviewers, verdictFile}`.
+
+**Exit 3 now only means Claude's review was *also* not supplied** (you skipped
+Step 3a). With the Claude verdict written, the runner never exits 3 — Claude is a
+sufficient panel on its own. If you do hit exit 3, fork `claude-reviewer` (Step
+3a) and retry, or use the interactive `/vibeflow:consensus-orchestrator`.
+
+#### Step 3b.5: Semantic dedup — reduce-only (Sprint 74-D)
+
+The aggregator dedups critical findings **structurally** (same file + overlapping
+`line_range`) and **lexically** (language-agnostic title similarity ≥ 0.6). A
+lexical miss is possible — two reviewers describing the SAME defect in *reworded*
+titles (e.g. "Özkaynağına faiz devri hesaplanmıyor" vs "Özkaynağa faiz devir
+hesabı eksik", similarity ≈ 0.44) score below the threshold, so the count stays
+inflated and the `rejected≥1 and criticalTotal≥2` rule can flip an otherwise
+non-rejected verdict to **REJECTED**. You are the semantic layer bash/jq cannot be.
+
+**Run this pass ONLY when the runner's output has BOTH:**
+`status == "REJECTED"` **AND** `escalatedByCriticalCount == true`.
+In every other case (reject-majority REJECTED, APPROVED, NEEDS_REVISION) skip it
+entirely — no cost, no change.
+
+When it fires, read `criticalDeduped[]` from the runner output (title + rationale
++ target per item) and group items that describe the **same underlying defect**.
+
+**Hard guardrails — this pass can only *reduce*:**
+- It may lower **REJECTED → NEEDS_REVISION** only. It may **never** raise to
+  APPROVED, and **never** touch a reject-majority REJECTED (which never triggers
+  this pass — `escalatedByCriticalCount` is false there).
+- It may **never** increase `criticalTotal`.
+- If the distinct-defect count is still ≥ 2 after your grouping, leave REJECTED
+  unchanged (record that you confirmed it).
+
+If (and only if) your grouping collapses the criticals to a **single** distinct
+defect, patch the verdict + append the telemetry row (replace `<sid>`/`<round>`;
+`SEM=1` = your semantic distinct count, `LEX` = `criticalTotal` from the runner):
+
+```bash
+VF=".vibeflow/state/consensus/<sid>.verdict.json"
+RAW=$(jq '.criticalRawCount // 0' "$VF"); LEX=$(jq '.criticalTotal // 0' "$VF"); SEM=1
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq --argjson sem "$SEM" --arg ts "$TS" --arg lex "$LEX" '
+  .criticalTotal = $sem
+  | .status = "NEEDS_REVISION"
+  | .dedupNote = {rawCount:(.criticalRawCount // 0), lexicalCount:($lex|tonumber),
+      semanticCount:$sem, decidedBy:"claude", at:$ts,
+      reason:"reworded duplicate criticals collapsed to one defect"}
+  | (.rounds[-1]) |= (.status = "NEEDS_REVISION" | .criticalTotal = $sem)
+' "$VF" > "$VF.tmp" && mv "$VF.tmp" "$VF"
+printf '%s\n' "$(jq -n -c --arg s "<sid>" --argjson r <round> --argjson raw "$RAW" \
+  --argjson lex "$LEX" --argjson sem "$SEM" --arg ts "$TS" \
+  '{type:"semantic-dedup",sessionId:$s,round:$r,from:"REJECTED",to:"NEEDS_REVISION",
+    rawCount:$raw,lexicalCount:$lex,semanticCount:$sem,recordedAt:$ts}')" \
+  >> .vibeflow/state/consensus/history.jsonl
+```
+
+Then continue with the **patched** `status` (now NEEDS_REVISION) in the branch
+below. If you left it REJECTED, branch on REJECTED as usual.
+
+Read `status` from the runner's output (or `verdictFile`) and branch:
+
+- **APPROVED** → record + advance (Step 4).
+- **REJECTED** (`rejected ≥ 1`) → **stop**. Reviewers actively rejected
+  the artifact; emit triage citing `verdictFile`. Do NOT advance, do NOT
+  fabricate a pass.
+- **NEEDS_REVISION / HUMAN_APPROVAL_REQUIRED** → **stop** with the honest
+  revision breadcrumb. The deep-rewrite chain rewrites the primary
+  artifact (PRD/ADR/…) and is `disable-model-invocation: true` **by
+  design** — only the operator runs it. Emit, as the literal last lines:
+
+  ```
+  Consensus did not converge for $CURRENT (status=$STATUS, agreement=$AGREE).
+  Resolve, then re-run phase-runner:
+  ▶ Next: /vibeflow:consensus-specialist <session-id>   (deep rewrite)
+      then  /vibeflow:apply-arbiter-patch <session-id> --yes
+      then  /vibeflow:phase-runner
+  ```
+
+  **Operator choice (mobile-friendly — see `docs/OPERATOR-CHOICES.md`).** After
+  the breadcrumb, also surface the next step via the **`AskUserQuestion`** tool
+  as tappable options so the operator can pick one from a phone instead of typing
+  the command — each description carrying the condensed verdict (top critical
+  finding / agreement):
+  - **Run specialist** (Recommended) — deep-rewrite the primary artifact
+    (`/vibeflow:consensus-specialist <session-id>`).
+  - **Run arbiter** — turn reviewer suggestions into a diff-first patch
+    (`/vibeflow:consensus-arbiter <session-id>`).
+  - **Stop** — pause here; the operator will handle it.
+
+  These edits still need human review (the chain stays `disable-model-invocation`)
+  — the choice only makes *launching* the next step one tap; "Other" lets the
+  operator type any command.
+
+phase-runner does **not** auto-loop through specialist/apply — those
+edit the primary artifact and need human review. Autonomy stops at the
+verdict; human judgment owns the rewrite. One `phase-runner` invocation
+= analyzers + one consensus verdict + (advance | breadcrumb).
+
+### Step 3.6: Grow the living Product Bible docs (Sprint 70)
+
+After the phase's analyzers ran (regardless of the consensus verdict — growing
+docs is not gated), grow the **living** bible docs this phase feeds, so the
+glossary / domain-model / personas / api-standards / rule-dsl / roadmap accrete
+instead of going stale. Run it **via the Skill tool**, surface-only (never blocks
+the walk):
+
+```
+Skill: vibeflow:bible-update      # folds this phase's artifacts into the living docs that grow now
+```
+
+It reads `bible-manifest.json` `growsIn` to pick the living docs for the current
+phase, folds in only what the phase artifacts support (merge, never clobber,
+never invent), and reports what grew. Skip silently when the project has no
+`docs/product-bible/` yet (run `/vibeflow:bible-intake` first to seed it).
+
+### Step 4: Record + auto-advance (APPROVED only)
+
+On APPROVED, first **record the verdict** into project state — the
+advance gate reads `lastConsensus`, and consensus-run.sh (a shell
+script) cannot call MCP tools, so phase-runner does it:
+
+```
+mcp__sdlc-engine__sdlc_record_consensus {
+  "projectId": "<streamId from Step 0's stream-id.sh>",
+  "phase":     "<currentPhase from config>",
+  "status":    "APPROVED",
+  "agreement": <verdict.json .agreement>,
+  "criticalIssues": <verdict.json .criticalTotal>
+}
+```
+
+Then, if `phaseRunner.autoAdvance` is true, advance directly:
+
+```
+mcp__sdlc-engine__sdlc_advance_phase {
+  "projectId": "<streamId from Step 0's stream-id.sh>",
+  "to":        "<next phase per canonical order>"
+}
+```
+
+…and close with the breadcrumb for the new phase:
+
+```
+Advanced $CURRENT → <next>.
+▶ Next: /vibeflow:phase-runner
+```
+
+If `autoAdvance` is false, emit the advisory instead:
+
+```
+Consensus APPROVED for $CURRENT. autoAdvance=false.
+▶ Next: /vibeflow:advance
+```
+
+### Step 5: Summary output
+
+One-screen summary:
+
+```
+phase-runner: $CURRENT
+  analyzers: [list with OK/FAIL per analyzer]
+  convergence: $attempts attempt(s), final status=$STATUS
+  advanced:    <next phase> / deferred (autoAdvance=false) / blocked
+  reports:     .vibeflow/reports/phase-runner-<phase>.md
+```
+
+Write `phase-runner-<phase>.md` with the full trace — analyzer
+exit codes, verdict.json summaries per attempt, patch manifests
+applied, and final status. Operators who want to audit a run
+have a single doc to read.
+
+**Finalise the ledger (Sprint 21-C).** Set the terminal status so
+`/vibeflow:flow-status` stops showing a "running" walk:
+
+```bash
+FINAL=advanced   # or: approved | stalled | rejected | blocked
+jq -c --arg st "$FINAL" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.status = $st | .finishedAt = $ts' \
+  "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+```
+
+## Flags
+
+- `--pause-between-steps` — after each analyzer + each consensus
+  round, stop and wait for operator `[enter]` before continuing.
+  Useful when debugging a new phase.
+- `--no-auto-advance` — override `phaseRunner.autoAdvance=true`
+  for a single run.
+- `--no-auto-chain` — override `apply-arbiter-patch`'s Sprint
+  19-E chain (forwards `--no-chain` to every apply invocation).
+- `--no-generate` (or `VF_SKIP_GENERATE=1`) — Sprint 29: skip the
+  TESTING coverage generate-step (Step 2a). For operators who generate
+  coverage in CI / by hand. No effect outside TESTING.
+
+## Guardrails
+
+- **Phase mismatch**: refuses to run if `TARGET_PHASE != currentPhase`
+  (see Step 1).
+- **Config guard**: no `vibeflow.config.json` → refuse and suggest
+  `/vibeflow:onboard`.
+- **MCP unreachable**: if `mcp__sdlc-engine__sdlc_get_state` fails,
+  emit a visible advisory and stop. The phase-runner needs state
+  access to know which phase to run.
+- **Idempotent**: re-running on an already-APPROVED phase is
+  a no-op on Step 3 (orchestrator sees APPROVED immediately,
+  loop exits, advance fires if configured — and advance is
+  itself idempotent at the MCP layer).
+
+## Non-goals
+
+- **No new analyzers**: phase-runner orchestrates existing
+  skills; adding a new analyzer is a separate sprint.
+- **No breadth-first convergence**: handles one phase at a time.
+  To walk multiple phases, invoke phase-runner multiple times
+  (auto-advance makes the next invocation land on the new
+  phase automatically).
+- **No interactive TUI**: there is no live-redrawing terminal UI.
+  Sprint 21-C ships a structured progress **ledger**
+  (`.vibeflow/state/phase-runner-progress.json`) that `/vibeflow:flow-status`
+  renders on demand (Sprint 21-D) — a real redrawing TUI would need a
+  host-side renderer and stays Sprint 22+ out-of-scope.
+
+## See also
+
+- `docs/PRIMARY-ARTIFACT.md` — marker v2 schema + per-phase
+  primary map
+- `docs/CONSENSUS-FLOW.md` — 4-layer consensus flow
+- `docs/CONSENSUS-ITERATION.md` — round / iteration / auto-chain
+  detail
+- `docs/AUTO-SATISFY.md` — which criteria each analyzer
+  auto-satisfies
+- Sprint 18 release notes (`release-notes/2.6.0.md`) — the
+  analyzer auto-satisfy rollout this skill composes over
+
+## Breadcrumb as a tappable card (Sprint 64)
+
+**Operator choice (mobile-friendly — see `docs/OPERATOR-CHOICES.md`).** When you
+finish with a `▶ Next:` breadcrumb naming a single next command, also present it
+as a tappable **`AskUserQuestion`** so the operator can advance with one tap from
+a phone: **Run `<that command>` now (Recommended)** / **Not yet**. The built-in
+"Other" lets them type a different command. Keep the literal `▶ Next:` line too
+(it is the textual fallback). Skip the card only when the breadcrumb names no
+runnable command (e.g. a plain "add tests" advisory).

@@ -1,0 +1,571 @@
+---
+name: verify-cache-events
+description: 이벤트 기반 캐시 무효화 아키텍처 검증 — emit/emitAsync 선택 일관성, 리스너 Promise 반환, 레지스트리 커버리지, SSOT 캐시 키 패턴
+---
+
+# verify-cache-events — 이벤트 기반 캐시 무효화 검증
+
+## Purpose
+
+73차 해네스에서 발견된 근본 아키텍처 결함을 기반으로 한 상시 검증:
+
+1. **이벤트 레지스트리 dead coverage** — 서비스가 `emitAsync`로 발행했으나 `CACHE_INVALIDATION_REGISTRY`에 미등록 → 캐시 무효화 no-op → stale read
+2. **리스너 Promise 반환 누락** — `eventEmitter.on(name, (p) => ...)` 콜백이 undefined 반환 시 `emitAsync` 의미 없음 → fire-and-forget 회귀
+3. **캐시 키 정규식 JSON sorted keys 함정** — `{"uuid":"..."}` 선두 가정 시 `includeTeam` 필드 있으면 매칭 실패 → 캐시 무효화 no-op
+4. **SSOT 캐시 키 패턴 바이패스** — `cache-patterns.ts`의 `buildDetailCachePattern` 대신 인라인 정규식 사용
+
+## When to Run
+
+- `cache-event.registry.ts`, `cache-invalidation.helper.ts`, `cache-event-listener.ts` 편집 후
+- 서비스에 새 이벤트 `emit`/`emitAsync` 추가 후
+- `deleteByPattern` 인라인 정규식 작성 시
+- verify-implementation 통합 실행 시
+
+## Related Files
+
+| File | Purpose |
+|---|---|
+| `apps/backend/src/common/cache/cache-event.registry.ts` | `CACHE_INVALIDATION_REGISTRY` SSOT |
+| `apps/backend/src/common/cache/cache-event-listener.ts` | 이벤트 리스너 (async Promise 반환 필수) |
+| `apps/backend/src/common/cache/cache-invalidation.helper.ts` | helper 메서드 |
+| `apps/backend/src/common/cache/cache-patterns.ts` | `buildDetailCachePattern` 등 SSOT 빌더 |
+| `apps/backend/src/common/cache/cache-events.ts` | `CACHE_EVENTS` 상수 (캐시 전용 이벤트 SSOT) |
+| `apps/backend/src/modules/notifications/events/notification-events.ts` | `NOTIFICATION_EVENTS` 상수 (알림+캐시 복합 이벤트) |
+| `apps/backend/src/modules/**/*.service.ts` | `emitAsync` 발행처 (SSOT 위치) |
+| `apps/backend/src/modules/**/*.controller.ts` | `emitAsync` 컨트롤러 발행 탐지 대상 (Step 4a) |
+| `apps/backend/src/modules/**/listeners/*.listener.ts` | best-effort 도메인 동기화 리스너 (`@OnEvent({ async: true })` 패턴) |
+
+## Workflow
+
+### Step 1: 이벤트 레지스트리 커버리지 (Critical)
+
+서비스가 `emitAsync`로 발행하는 이벤트 상수가 모두 `CACHE_INVALIDATION_REGISTRY`에 등록되어 있는지 확인한다.
+
+```bash
+# 서비스에서 emitAsync 발행하는 이벤트명 추출 (NOTIFICATION_EVENTS + CACHE_EVENTS 양쪽)
+grep -rhoP 'emitAsync\((NOTIFICATION_EVENTS|CACHE_EVENTS)\.\K[A-Z_]+' \
+  apps/backend/src/modules/ | sort -u > /tmp/emitted.txt
+
+# 레지스트리에 등록된 이벤트명 추출 (NOTIFICATION_EVENTS + CACHE_EVENTS 양쪽)
+grep -oP '\[(NOTIFICATION_EVENTS|CACHE_EVENTS)\.\K[A-Z_]+' \
+  apps/backend/src/common/cache/cache-event.registry.ts | sort -u > /tmp/registered.txt
+
+# 발행은 되지만 레지스트리 누락 (dead coverage)
+comm -23 /tmp/emitted.txt /tmp/registered.txt
+```
+
+**기대 결과**: 빈 출력. 출력이 있으면 각 이벤트를 `cache-event.registry.ts`에 등록하거나 명시적 예외 주석 필요.
+
+**예외**: 스케줄러(`schedulers/`)가 발행하는 이벤트는 fire-and-forget(`emit`) 유지 의도이므로 이 검사에서 제외된다.
+
+### Step 2: 리스너 async Promise 반환 (Critical)
+
+`CacheEventListener.onModuleInit`의 `this.eventEmitter.on(eventName, ...)` 콜백이 async 함수여야 한다. 아니면 `emitAsync`가 await할 Promise 없음.
+
+```bash
+# 반드시 async 키워드 포함
+grep -A 1 "this.eventEmitter.on(eventName" \
+  apps/backend/src/common/cache/cache-event-listener.ts \
+  | grep -q "async (payload" && echo "PASS: async callback" || echo "FAIL: non-async callback"
+```
+
+**기대 결과**: `PASS: async callback`.
+
+**위반 예**: `(payload) => this.handleEvent(...).catch(...)` — callback이 undefined 반환 → emitAsync fire-and-forget 회귀.
+
+**올바른 예**:
+```typescript
+this.eventEmitter.on(eventName, async (payload) => {
+  try { await this.handleEvent(eventName, payload); }
+  catch (err) { this.logger.error(...); }  // 로그만, resolve 유지
+});
+```
+
+### Step 3: SSOT 캐시 키 패턴 빌더 사용 (Warning)
+
+`deleteByPattern`의 detail 정규식은 `buildDetailCachePattern` SSOT를 사용해야 한다. 인라인 정규식은 JSON sorted keys 함정 위험.
+
+```bash
+# helper 외부에서 인라인 detail 정규식 사용 탐지
+grep -rnP 'deleteByPattern\(`[^`]*detail:\\\\\{' \
+  apps/backend/src/ \
+  --include="*.service.ts" --include="*.helper.ts" \
+  | grep -v "cache-patterns.ts"
+```
+
+**기대 결과**: 빈 출력. 출력이 있으면 `buildDetailCachePattern(prefix, field, id)`로 교체.
+
+**근거**: `buildCacheKey({ uuid, includeTeam })`는 JSON sorted keys로 `{"includeTeam":false,"uuid":"..."}` 생성 — `uuid` 선두 가정 정규식은 매칭 실패.
+
+### Step 4: emitAsync vs emit 선택 일관성 (Info)
+
+cross-entity 캐시 무효화 필요한 이벤트는 `emitAsync` 사용 필수. 대시보드 통계만 영향 있는 이벤트는 `emit` 허용(스케줄러 계열).
+
+```bash
+# 서비스 파일에서 emit (fire-and-forget) 호출 탐지 (스케줄러 제외, NOTIFICATION/CACHE 양쪽)
+grep -rnP 'this\.eventEmitter\.emit\((NOTIFICATION_EVENTS|CACHE_EVENTS)' \
+  apps/backend/src/modules/ \
+  --include="*.service.ts" \
+  | grep -v "schedulers/"
+```
+
+**기대 결과**: 빈 출력. 있으면 `await emitAsync(...)`로 전환 여부 검토.
+
+**예외**: 리스너가 캐시 무효화 대상이 아니고 순수 알림만 발행하는 이벤트는 `emit` 허용 (주석으로 명시 권장).
+
+### Step 4a: emitAsync 발행 위치 — 서비스 계층 전용 (Warning)
+
+`emitAsync`는 서비스 계층에서만 호출되어야 한다. 컨트롤러가 `EventEmitter2`를 직접 주입하여 발행하면 도메인 이벤트 책임이 두 계층으로 분산된다.
+
+```bash
+# 컨트롤러에서 emitAsync 직접 호출 탐지 (NOTIFICATION_EVENTS + CACHE_EVENTS 양쪽)
+grep -rnP 'this\.eventEmitter\.emitAsync\((NOTIFICATION_EVENTS|CACHE_EVENTS)' \
+  apps/backend/src/modules/ \
+  --include="*.controller.ts"
+```
+
+**기대 결과**: 빈 출력. 출력이 있으면 해당 로직을 서비스 메서드로 이동 권장.
+
+**올바른 패턴**: 컨트롤러는 서비스 메서드만 호출. 서비스가 비즈니스 로직 + `emitAsync` 담당.
+```typescript
+// ✅ 서비스
+async uploadAttachment(ncId: string, ...) {
+  const doc = await this.documentService.createDocument(...);
+  await this.eventEmitter.emitAsync(CACHE_EVENTS.NC_ATTACHMENT_UPLOADED, { ... });
+  return doc;
+}
+// ✅ 컨트롤러
+@Post(':uuid/attachments')
+async uploadAttachment(...) {
+  return this.service.uploadAttachment(uuid, ...);  // emitAsync는 서비스 내부
+}
+```
+
+**재발 방지**: `.eslintrc.js` `overrides[].files = ["**/*.controller.ts"]` → `no-restricted-syntax`로 빌드 타임 차단. 예외 없음.
+
+### Step 5a: 이벤트 페이로드 완전성 — 장비 필드 하드코딩 탐지 (Warning)
+
+장비 관련 이벤트를 `emitAsync`할 때 `equipmentName`, `managementNumber`, `teamId` 필드를 `''` 빈 문자열로 하드코딩하면 알림/감사 로그에서 장비 정보가 누락된다. 반드시 DB에서 해당 필드를 SELECT한 뒤 이벤트에 전달해야 한다.
+
+```bash
+# 이벤트 페이로드에서 equipmentName/managementNumber/teamId 빈 문자열 하드코딩 탐지
+grep -rn "emitAsync" apps/backend/src/modules/ --include="*.service.ts" -A 10 \
+  | grep -E "equipmentName:\s*''|managementNumber:\s*''|teamId:\s*''" \
+  | grep -v "actorName"
+```
+
+**PASS 기준:** 빈 출력. 모든 장비 이벤트 페이로드의 `equipmentName`/`managementNumber`/`teamId`가 DB 쿼리 결과에서 채워짐.
+
+**FAIL 기준:** `equipmentName: ''` 패턴 발견 → `equip` 쿼리 select절에 `name`, `managementNumber`, `teamId` 포함 후 `equip?.name ?? ''` 형태로 전달.
+
+```typescript
+// ❌ WRONG — 빈 문자열 하드코딩
+await this.eventEmitter.emitAsync(EVENT, {
+  equipmentName: '',       // 알림에서 장비명 누락
+  managementNumber: '',
+});
+
+// ✅ CORRECT — DB에서 조회한 값 사용
+const [equip] = await tx
+  .select({ id: e.id, name: e.name, managementNumber: e.managementNumber, teamId: e.teamId })
+  .from(schema.equipment).where(eq(e.id, equipmentId));
+await this.eventEmitter.emitAsync(EVENT, {
+  equipmentName: equip?.name ?? '',
+  managementNumber: equip?.managementNumber ?? '',
+  teamId: equip?.teamId ?? '',
+});
+```
+
+**예외:** `actorName: ''` — NotificationDispatcher가 actorId로 DB에서 actorName을 조회하므로 의도된 빈 문자열. 이 검사에서 제외.
+
+### Step 5b: composite recipientStrategy ↔ payload 필드 존재 일관성 (Warning)
+
+`notification-registry.ts`에서 `{ type: 'composite', strategies }` 안에 `{ type: 'team', field: 'X' }` 전략이 선언되면,
+해당 이벤트의 `emitAsync` payload에 `X` 필드가 반드시 존재해야 한다.
+`NotificationDispatcher`가 `payload[field]` 로 teamId를 취득하므로 필드 누락 시 `undefined` 수신자 → 알림 silent drop.
+
+```bash
+# composite 전략에서 사용된 team field 이름 추출
+node -e "
+const fs = require('fs');
+const src = fs.readFileSync(
+  'apps/backend/src/modules/notifications/config/notification-registry.ts', 'utf8'
+);
+
+// 이벤트별 composite team field 추출
+const eventBlocks = src.matchAll(/\[NOTIFICATION_EVENTS\.(\w+)\][\s\S]*?recipientStrategy:\s*\{[\s\S]*?\}/g);
+for (const match of eventBlocks) {
+  const block = match[0];
+  if (!block.includes(\"type: 'composite'\")) continue;
+  const fields = [...block.matchAll(/type:\\s*'team'[^}]*field:\\s*'([^']+)'/g)].map(m => m[1]);
+  if (fields.length > 0) console.log(match[1] + ' → composite team fields: ' + fields.join(', '));
+}
+" 2>/dev/null
+
+# 해당 이벤트의 emitAsync payload에서 위 필드 존재 확인 (수동 대조)
+# 예: CHECKOUT_BORROWER_APPROVED → lenderTeamId 필드가 payload에 있어야 함
+grep -A20 "emitAsync(NOTIFICATION_EVENTS.CHECKOUT_BORROWER_APPROVED" \
+  apps/backend/src/modules/checkouts/checkouts.service.ts \
+  | grep "lenderTeamId"
+# 결과: lenderTeamId 포함 라인 1건 (PASS)
+```
+
+**PASS 기준**: composite 전략의 `team.field` 값이 `emitAsync` payload 객체에 키로 존재함.
+**FAIL 기준**: payload에 해당 필드 없음 → `NotificationDispatcher`가 `undefined` teamId로 수신자 조회 → 알림 silent drop.
+
+**적용 대상 이벤트 (2026-04-24 기준):**
+| 이벤트 | composite team field | payload 필드 |
+|---|---|---|
+| `CHECKOUT_BORROWER_APPROVED` | `lenderTeamId` | `lenderTeamId?: string` |
+| `CHECKOUT_RETURN_APPROVED` | (permission 전략) | — |
+
+**규칙**: 신규 이벤트에 `composite + team field` 전략 추가 시, `CheckoutNotificationEvent`(또는 해당 이벤트 인터페이스)에 동명 필드를 선택적(`?:`)으로 추가하고 `emitAsync` 호출부에서 값을 채워야 함.
+
+### Step 5: CacheInvalidationAction method enum 일치 (Info)
+
+`CACHE_INVALIDATION_REGISTRY`의 `method` 필드가 `CacheInvalidationHelper`에 실제 존재하는 메서드인지 확인.
+
+```bash
+# registry에서 사용된 method 이름 추출
+grep -oP "method:\s*'[^']+'" \
+  apps/backend/src/common/cache/cache-event.registry.ts \
+  | grep -oP "'[^']+'" | tr -d "'" | sort -u > /tmp/methods.txt
+
+# CacheInvalidationHelper의 public 메서드 추출
+grep -oP 'async \K[a-zA-Z]+\(' \
+  apps/backend/src/common/cache/cache-invalidation.helper.ts \
+  | tr -d '(' | sort -u > /tmp/helper_methods.txt
+
+# registry 메서드 중 helper에 없는 것
+comm -23 /tmp/methods.txt /tmp/helper_methods.txt
+```
+
+**기대 결과**: 빈 출력. 출력이 있으면 registry 오타 또는 helper 미구현.
+
+### Step 6: BFF 집계 캐시 무효화 체인 불변성 (Warning)
+
+BFF 서비스가 여러 도메인 데이터를 집계할 때, 그 도메인의 캐시를 무효화하는 helper 메서드는 **BFF 캐시도 함께 무효화**해야 한다. 누락 시 BFF가 stale 데이터를 반환한다.
+
+현재 등록된 BFF 집계 불변성:
+| helper 메서드 | 포함해야 할 BFF 프리픽스 | 근거 |
+|---|---|---|
+| `invalidateEquipmentImportsWithEquipment()` | `CACHE_KEY_PREFIXES.INBOUND_OVERVIEW` | InboundOverviewService가 equipment-imports 집계 포함 |
+
+```bash
+# invalidateEquipmentImportsWithEquipment()가 inbound-overview:* 포함하는지 확인
+awk '/invalidateEquipmentImportsWithEquipment\(\)/,/^  }$/' \
+  apps/backend/src/common/cache/cache-invalidation.helper.ts \
+  | grep -q "INBOUND_OVERVIEW" \
+  && echo "PASS: BFF cache included" \
+  || echo "FAIL: INBOUND_OVERVIEW missing from invalidateEquipmentImportsWithEquipment()"
+```
+
+**기대 결과**: `PASS: BFF cache included`.
+
+**신규 BFF 서비스 추가 시 체크리스트**:
+1. BFF가 집계하는 도메인 식별 (예: equipment-imports, checkouts)
+2. 해당 도메인의 `CacheInvalidationHelper` 메서드에 BFF prefix 삭제 추가
+3. 이 테이블에 행 추가
+
+### Step 7: dual-channel duplication 차단 (Critical)
+
+NOTIFICATION_EVENTS와 CACHE_EVENTS 채널은 책임이 분리되어 있다:
+- **NOTIFICATION_EVENTS**: 알림 발송 + SSE 푸시 + downstream side-effect (test-software 자격 부여 등) 전용
+- **CACHE_EVENTS**: 캐시 무효화 전용
+
+동일 도메인 상태 전이의 캐시 무효화가 양 채널 모두에 등록되면 `service.emitAsync(NOTIFICATION_EVENTS.X) + service.emitAsync(CACHE_EVENTS.X)` 시 동일 `invalidateAllDashboard` + 패턴 삭제가 두 번 실행 → p99 latency 증가 + 불필요한 dashboard 캐시 churn.
+
+회귀 차단은 부팅타임 `validateDualChannelExclusivity()` invariant가 담당하므로 본 Step은 (a) invariant 존재 + (b) NOTIFICATION_EVENTS.SOFTWARE_VALIDATION_* cache registry 미등록 두 가지를 확인한다.
+
+```bash
+# (a) 부팅타임 invariant 존재
+grep -nE "validateDualChannelExclusivity" apps/backend/src/common/cache/cache-event-listener.ts \
+  && echo "PASS: dual-channel invariant 존재" \
+  || echo "FAIL: validateDualChannelExclusivity 미정의"
+
+# (b) onModuleInit에서 호출됨
+awk '/onModuleInit\(\)/,/^  }$/' apps/backend/src/common/cache/cache-event-listener.ts \
+  | grep -q "validateDualChannelExclusivity" \
+  && echo "PASS: onModuleInit에서 호출" \
+  || echo "FAIL: onModuleInit에서 invariant 미호출"
+
+# (c) NOTIFICATION_EVENTS.SOFTWARE_VALIDATION_*가 registry에 등록되지 않음 (회귀 차단 baseline)
+grep -nE "\[NOTIFICATION_EVENTS\.SOFTWARE_VALIDATION_" \
+  apps/backend/src/common/cache/cache-event.registry.ts \
+  && echo "FAIL: NOTIFICATION_EVENTS.SOFTWARE_VALIDATION_* 가 양 채널 등록" \
+  || echo "PASS: SOFTWARE_VALIDATION 단일 채널 유지"
+```
+
+**기대 결과**: 모두 PASS.
+
+**위반 시 조치**:
+- (a)/(b) 위반: `cache-event-listener.ts`에서 `validateDualChannelExclusivity` 함수 + `onModuleInit()` 호출 복원.
+- (c) 위반: NOTIFICATION_EVENTS.SOFTWARE_VALIDATION_* (또는 다른 도메인) 4 entry 를 cache-event.registry에서 제거하고, 캐시 무효화 책임을 CACHE_EVENTS 채널 (예: `CACHE_EVENTS.SW_VALIDATION_*`)로 통합.
+
+**왜 양쪽 등록이 회귀하는가**: 새 알림 이벤트 추가 시 "캐시도 갱신해야지" 라는 자연스러운 추론으로 NOTIFICATION_EVENTS entry에 cache rule을 추가하는 경우 발생. calibration 도메인이 이미 채널 책임 분리를 확립했으므로(`cache-event.registry.ts:395-397` 주석 참조) 그 패턴을 따르면 충분.
+
+### Step 8: proactive dual-channel audit + pre-push 통합 (Critical, 라운드 #3 갭 K/D/O/C)
+
+Step 7의 boot-time invariant는 NestJS bootstrap에서만 트리거되는 reactive 안전망. `scripts/audit-cache-event-channels.mjs`가 동일 검출 로직(양방향 mirror + wholesale 패턴)을 수행하고, **`.husky/pre-push`에 `pnpm audit:cache-events`로 통합**되어야 한다 (ADR-0012).
+
+```bash
+# 1) script 존재 + EXIT 0
+test -f scripts/audit-cache-event-channels.mjs && \
+  node scripts/audit-cache-event-channels.mjs && \
+  echo "PASS: audit clean" || echo "FAIL: audit violation(s) detected"
+
+# 2) pre-push 통합 (갭 K)
+grep -cE "audit:cache-events" .husky/pre-push
+# >= 1
+
+# 3) package.json script alias
+grep -cE '"audit:cache-events":' package.json
+# >= 1
+
+# 4) 양방향 mirror 검사 (갭 D) — deriveCacheMirror 역추론 함수
+grep -cE "deriveCacheMirror" apps/backend/src/common/cache/cache-event-listener.ts
+# >= 2 (정의 + 사용)
+grep -cE "deriveCacheMirror" scripts/audit-cache-event-channels.mjs
+# >= 1
+
+# 5) wholesale 패턴 차단 (갭 O) + LEGACY allowlist
+grep -cE "extractWholesalePatterns|WHOLESALE_PATTERN" scripts/audit-cache-event-channels.mjs
+# >= 2
+grep -cE "CACHE_INVALIDATION_WHOLESALE_LEGACY_ALLOWLIST" apps/backend/src/common/cache/cache-event.registry.ts
+# >= 1
+
+# 6) jest-level redundant 검증 (갭 C — audit regex fragility 보강)
+grep -cE "validateDualChannelExclusivity" apps/backend/src/common/cache/__tests__/cache-events-naming.spec.ts
+# >= 1
+```
+
+**기대 결과**: 모두 PASS.
+
+**audit script violation 종류**:
+- **VIOLATION (mirror duplicate)**: 양 채널 mirror에 동일 actions+patterns — exit 1
+- **WHOLESALE_PATTERN**: `${PREFIX}*` 패턴 사용 — LEGACY allowlist 미등재 시 exit 1
+- **POTENTIAL_DIVERGENCE**: 양쪽 등록이지만 signature 다름 — review
+- **POTENTIAL_ONE_SIDED**: mirror 후보지만 한쪽만 등록 — 잠재 회귀
+- **WHOLESALE_LEGACY**: LEGACY allowlist 등재된 wholesale — 점진 마이그레이션 대상
+
+**3-layer defense (ADR-0012)**:
+1. **invariant (runtime, fail-fast)**: `validateDualChannelExclusivity()` 양방향 mirror 검사 (boot-time)
+2. **proactive audit (build/PR-level)**: `audit-cache-event-channels.mjs` — pre-push 게이트
+3. **naming spec (unit)**: `cache-events-naming.spec.ts` — 명명 규약 + wholesale 차단 + jest-level dual-channel 검증
+
+### Step 9: CACHE_KEY_PREFIXES SSOT 단일 진입점 (Warning, 2026-05-13)
+
+`CACHE_KEY_PREFIXES.X + 'literal'` 인라인 concat 패턴 차단. 동일 service prefix 가 여러 service 에 인라인 concat 으로 분산되면 `CACHE_KEY_PREFIXES.X` 값 갱신이 silent miss — `INTERMEDIATE_INSPECTIONS` SSOT mismatch 회귀 차단 (2026-05-13 `cache-wholesale-migration-inspection-templates` sprint verify-implementation 라운드에서 발견).
+
+```bash
+# 인라인 concat 패턴 0건 강제 (CACHE_KEY_PREFIXES.X + 'sub:' 형식)
+grep -rnE "CACHE_KEY_PREFIXES\.[A-Z_]+\s*\+\s*['\"][a-zA-Z][a-zA-Z0-9_-]*:" \
+  apps/backend/src/modules/ --include="*.ts" \
+  | grep -v "__tests__"
+# 결과: 빈 출력 (PASS)
+```
+
+**기대 결과**: 빈 출력. 출력이 있으면 nested namespace 가 필요한 경우 `CABLES_CACHE_PREFIX` 패턴 (cache-key-prefixes.ts:93 외부 named export) 으로 SSOT 단일 진입점 신설.
+
+**근거**: 2026-05-13 발견 `CACHE_KEY_PREFIXES.INTERMEDIATE_INSPECTIONS = 'intermediate-inspections:'` SSOT mismatch 사례 — 실제 service 들은 `CACHE_KEY_PREFIXES.CALIBRATION + 'inspections:'` 인라인 concat 사용. registry wholesale `${INTERMEDIATE_INSPECTIONS}*` 가 actual cache key 0건 매칭 (silent no-op). 같은 모듈 내 다중 service (intermediate-inspections.service.ts + result-sections.service.ts) 가 동일 패턴 분산 → 한 곳만 SSOT 정합 시 회귀 silent miss.
+
+**올바른 패턴**:
+```typescript
+// ❌ WRONG — 인라인 concat (SSOT 우회)
+private readonly CACHE_PREFIX = CACHE_KEY_PREFIXES.CALIBRATION + 'inspections:';
+
+// ✅ CORRECT — CACHE_KEY_PREFIXES 값을 nested namespace로 정의 + 상수 단일 진입점
+// cache-key-prefixes.ts
+INTERMEDIATE_INSPECTIONS: 'calibration:inspections:',  // nested namespace literal
+// 또는 CABLES_CACHE_PREFIX 패턴 (외부 const + template literal 자기참조 가능):
+export const X_CACHE_PREFIX = `${CACHE_KEY_PREFIXES.PARENT}sub:` as const;
+
+// service.ts
+private readonly CACHE_PREFIX = CACHE_KEY_PREFIXES.INTERMEDIATE_INSPECTIONS;
+```
+
+**예외**: 동적 segment 조립 (`${this.CACHE_PREFIX}${type}:${id}`) 은 buildCacheKey() 패턴 정상. 본 검사는 **class field 초기화** 의 인라인 concat 만 차단.
+
+### Step 10: DOMAIN_EVENTS 채널 — 데이터 정합성 리스너 패턴 (Critical, 2026-05-13)
+
+`DOMAIN_EVENTS` 는 캐시 무효화(CACHE_EVENTS)·알림(NOTIFICATION_EVENTS)과 다른 **3번째 채널**: 팀 삭제→orphan row 강등처럼 데이터 정합성을 유지하는 cross-domain side effect 전용. 이 채널 리스너가 잘못 구현되면 DB 불일치(unreachable rows)·stale cache 동시 발생.
+
+**검증 명령**:
+```bash
+# 1) DOMAIN_EVENTS 상수 SSOT 경유 — 인라인 string 이벤트 명 0건
+grep -rn "OnEvent(" apps/backend/src/modules --include="*.listener.ts" \
+  | grep -vE "DOMAIN_EVENTS\.|CACHE_EVENTS\.|NOTIFICATION_EVENTS\." \
+  | grep -v "\.spec\."
+# 결과: 빈 출력 (PASS) — inline string 이벤트 발견 시 FAIL
+
+# 2) DOMAIN_EVENTS 리스너는 반드시 { async: true } fire-and-forget 옵션 — 응답 경로 블로킹 방지
+grep -rn "OnEvent(DOMAIN_EVENTS\." apps/backend/src/modules --include="*.listener.ts" \
+  | grep -v "async: true"
+# 결과: 빈 출력 (PASS) — { async: true } 누락 시 FAIL
+
+# 3) DOMAIN_EVENTS 리스너 핸들러는 try/catch 필수 — fire-and-forget이어도 uncaught rejection 방지
+grep -rn "OnEvent(DOMAIN_EVENTS\." apps/backend/src/modules --include="*.listener.ts" -l \
+  | xargs -I{} grep -L "try {" {}
+# 결과: 빈 출력 (PASS) — try/catch 없는 DOMAIN_EVENTS 리스너 파일 발견 시 FAIL
+
+# 4) DOMAIN_EVENTS emit은 fire-and-forget: void emitAsync 패턴 (응답 지연 0)
+grep -rn "emitAsync(DOMAIN_EVENTS\." apps/backend/src/modules --include="*.service.ts" \
+  | grep -v "void "
+# 결과: 빈 출력 (PASS) — await emitAsync(DOMAIN_EVENTS.*) 패턴 발견 시 FAIL
+
+# 5) 다중 사용자 영향 캐시는 per-user 선택 무효화 금지 — 도메인 prefix 전체 flush 강제
+#    (팀 삭제처럼 팀원 다수의 TEAM scope 캐시가 stale 될 때 per-user loop는 불완전)
+grep -rn "DOMAIN_EVENTS\." apps/backend/src/modules --include="*.listener.ts" -l \
+  | xargs -I{} grep -n "deleteByPrefix" {} \
+  | grep -v "CACHE_KEY_PREFIXES\.[A-Z_]*)" \
+  | grep "list:"
+# 결과: 빈 출력 (PASS) — per-user sub-prefix loop 발견 시 FAIL
+```
+
+**올바른 패턴** (saved-views-team.listener.ts G-5 기준):
+```typescript
+@OnEvent(DOMAIN_EVENTS.TEAM_DELETED, { async: true })   // ← { async: true } 필수
+async handleTeamDeleted(payload: TeamDeletedPayload): Promise<void> {
+  const { teamId } = payload;
+  try {
+    const affected = await this.db.update(...)...;
+    if (affected.length > 0) {
+      // 다중 사용자 영향 → 도메인 prefix 전체 flush (per-user loop 금지)
+      this.cacheService.deleteByPrefix(CACHE_KEY_PREFIXES.SAVED_VIEWS);
+    }
+  } catch (err) {
+    this.logger.error('[G-5] cleanup 실패', err);   // ← try/catch + error log 필수
+  }
+}
+```
+
+**emit 측 패턴** (teams.service.ts):
+```typescript
+void this.eventEmitter.emitAsync(DOMAIN_EVENTS.TEAM_DELETED, { teamId });  // ← void (fire-and-forget)
+```
+
+**왜 per-user selective 무효화가 불충분한가**: 팀이 삭제되면 팀원 A, B, C가 각자 캐시한 `TEAM` scope 목록이 모두 stale. 삭제된 팀의 `teamId` → 팀원 목록 역추적은 팀 테이블이 이미 삭제된 이후 불가. 도메인 prefix 전체 flush가 유일하게 안전한 선택 (팀 삭제는 드문 이벤트 — 비용 대비 정합성).
+
+**예외**: 단일 사용자만 영향받는 side effect(예: 본인 소유 리소스 갱신)는 per-user prefix 무효화 허용.
+
+## Exceptions (리포트하지 않음)
+
+1. **스케줄러의 `emit` 유지** — `schedulers/` 하위 파일은 사용자 응답 경로가 아니므로 의도적.
+2. **NotificationDispatcher 리스너** — 순수 알림 발송, 캐시 무효화 대상 아님. 레지스트리 등록 불필요.
+3. **테스트 spec의 `eventEmitter.emit()` 호출** — 테스트 내부에서 실제 리스너 트리거 용도. 검증 대상 아님.
+4. **`NOTIFICATION_EVENTS` 상수 중 미발행 이벤트** — 단순 dead code, 본 스킬 범위 외 (verify-ssot에서 커버 가능).
+5. **SKIP_CACHE_REGISTRY 서비스/리스너의 직접 helper 호출** — 일부 `@OnEvent` 핸들러는 도메인 이벤트(checkout.return.completed 등)를 처리하며, 이 이벤트는 `CACHE_INVALIDATION_REGISTRY`에 등록하지 않는다. 대신 핸들러 본체에서 `cacheInvalidationHelper.invalidateXxx()` 를 직접 호출하고, JSDoc에 `SKIP_CACHE_REGISTRY: ...` 주석으로 의도를 명시한다.
+   - 위치: 서비스 파일(`*.service.ts`) 또는 리스너 파일(`modules/*/listeners/*.listener.ts`) 모두 허용
+   - 예: `equipment-imports.service.ts` `onReturnCompleted` / `onReturnCanceled` — `invalidateEquipmentImportsWithEquipment()` 직접 호출
+   - **요구사항**: SKIP_CACHE_REGISTRY 핸들러는 반드시 CacheInvalidationHelper 메서드를 호출해야 함. `cacheService.deleteByPattern()` 인라인 호출 금지 (SSOT 우회)
+   - Step 1 위반 아님 (Step 1은 `emitAsync` 발행자 검사, @OnEvent 핸들러 검사 아님)
+6. **도메인 리스너의 `@OnEvent({ async: true })` best-effort 동기화** — `CalibrationPlanSyncListener`처럼 `@OnEvent(EVENT, { async: true })` + `async handle(): Promise<void>` 패턴은 EventEmitter2가 내부적으로 await을 처리. 이 리스너는 캐시 무효화가 아닌 **교차 도메인 DB 동기화**(calibration 생성 → calibration_plan_items.actualCalibrationDate 갱신) 목적이며, best-effort(실패해도 원본 트랜잭션에 영향 없음)으로 설계됨. `CACHE_INVALIDATION_REGISTRY` 등록 불필요, Step 1 검사 제외. 파일: `modules/*/listeners/*.listener.ts`.
+
+## Severity
+
+| 검사 | 심각도 | 영향 |
+|---|---|---|
+| Step 1 레지스트리 누락 | **Critical** | stale cache → 사용자가 오래된 데이터 본다 |
+| Step 2 리스너 sync 콜백 | **Critical** | emitAsync가 fire-and-forget 회귀 |
+| Step 3 인라인 정규식 | **Warning** | 키 필드 추가 시 매칭 실패 회귀 위험 |
+| Step 4 emit vs emitAsync | **Info** | 개별 케이스 판단, 주석 필요 |
+| Step 5b composite ↔ payload 일관성 | **Warning** | payload 필드 누락 시 알림 silent drop |
+| Step 5 method 불일치 | **Info** | 런타임 에러 (타입 체크로 사전 방어됨) |
+| Step 6 BFF 집계 체인 누락 | **Warning** | BFF stale read — equipment-imports 변경 후 inbound-overview 갱신 안 됨 |
+| Step 8 audit + pre-push 통합 | **Critical** | audit-cache-event-channels.mjs 부재 또는 pre-push 미통합 시 build/PR-level 회귀 차단 무력화 (ADR-0012 라운드 #3 갭 K) |
+| Step 7 dual-channel duplication | **Critical** | 동일 status 전이마다 invalidateAllDashboard + 패턴 삭제 2x → p99 latency + dashboard cache churn |
+| Step 9 CACHE_KEY_PREFIXES 인라인 concat | **Warning** | SSOT 값 갱신이 silent miss — 동일 prefix 사용 service 다중 분산 시 한 곳만 정합되면 registry 패턴이 actual cache 미매칭 (2026-05-13 INTERMEDIATE_INSPECTIONS 회귀) |
+| Step 10 DOMAIN_EVENTS 채널 패턴 | **Critical** | `{ async: true }` 누락 시 응답 블로킹 / try-catch 누락 시 uncaught rejection / per-user selective flush 시 팀원 cache stale 잔존 (G-5 회귀) |
+| Step 11 service-local cross-domain wholesale | **Critical** | service.invalidateCache 가 자기 도메인 외 `deleteByPrefix(CACHE_KEY_PREFIXES.X)` 사용 시 cross-domain 캐시 폭주 + nested namespace 침범 (`calibration:cables:*` 같은) — 라운드 #5 R1 closure (audit script 자동 검출) |
+| Step 12 helper wholesale marker 부재 | **Warning** | `cache-invalidation.helper.ts` 내 `${PREFIX}*` wholesale 추가 시 `// audit-cache-wholesale-allow: <reason>` marker 누락 → 의도 불명 wholesale silent 잔존 (라운드 #5 R3 closure) |
+| Step 13 cache .get() await 누락 | **Critical** | `ICacheService.get` driver 유니언 — await 없는 동기 read 가 redis 에서 Promise(truthy)로 평가 → 잠금/블랙리스트 무력화·NotFound 우회. tsc 미검출, ts-morph audit 으로 차단 (2026-06-25) |
+
+## Step 11: service-local cross-domain wholesale 차단 (Critical, 라운드 #5)
+
+`apps/backend/src/modules/**/*.service.ts` 가 자기 도메인 외 prefix 를 wholesale 무효화하는 패턴 차단. ADR-0012 §Decision-2 — service-local 은 sub-prefix specific 만 사용, cross-domain bulk 는 `CacheInvalidationHelper` API 위임.
+
+### 검증 명령 (audit script 자동화)
+
+```bash
+# extractServiceLocalWholesaleViolations() 가 modules/**/*.service.ts 스캔
+node scripts/audit-cache-event-channels.mjs 2>&1 | grep "SERVICE_LOCAL_WHOLESALE"
+# → 0건 (자기 도메인 wholesale 만 allowed, cross-domain 은 VIOLATION)
+
+# 회귀 차단 spec
+node --test scripts/__tests__/audit-cache-event-channels.spec.mjs 2>&1 | tail -5
+```
+
+### 위반 시 수정 패턴
+
+```ts
+// ❌ cross-domain wholesale
+this.cacheService.deleteByPrefix(CACHE_KEY_PREFIXES.APPROVALS);
+
+// ✅ 옵션 A: helper SSOT API 위임 (권장)
+void this.cacheInvalidationHelper.invalidateApprovalCounts();
+
+// ✅ 옵션 B: specific sub-prefix
+this.cacheService.deleteByPrefix(`${CACHE_KEY_PREFIXES.APPROVALS}counts:`);
+```
+
+## Step 12: helper-layer wholesale marker 강제 (Warning, 라운드 #5 R3)
+
+`cache-invalidation.helper.ts` 는 ADR-0012 §Decision-2 centralized bulk API 예외 레이어 — wholesale `${PREFIX}*` 자체는 정합. 단, **암묵적 wholesale** 회귀 차단을 위해 각 wholesale 라인 직전/같은 라인에 `audit-cache-wholesale-allow: <reason>` 주석 필수.
+
+### 검증 명령 (audit script 자동화)
+
+```bash
+# extractHelperWholesaleViolations() 가 cache-invalidation.helper.ts 스캔
+node scripts/audit-cache-event-channels.mjs 2>&1 | grep "HELPER_WHOLESALE_UNMARKED"
+# → 0건 기대 (모든 wholesale 라인이 marker 보유)
+```
+
+### 위반 시 수정 패턴
+
+```ts
+// ❌ marker 없는 wholesale (의도 불명)
+async invalidateAllX(): Promise<void> {
+  await this.cacheService.deleteByPattern(`${CACHE_KEY_PREFIXES.X}*`);
+}
+
+// ✅ marker 부착 (의도 명시)
+async invalidateAllX(): Promise<void> {
+  // audit-cache-wholesale-allow: canonical bulk API for X domain (ADR-0012 §Decision-2 helper layer exception)
+  await this.cacheService.deleteByPattern(`${CACHE_KEY_PREFIXES.X}*`);
+}
+```
+
+## Step 13: ICacheService.get() await 정합 — 동기 read 차단 (Critical, 2026-06-25)
+
+`ICacheService.get<T>(key)` 반환 타입은 driver 유니언 — SimpleCacheService=`T|undefined`(동기), RedisCacheService=`Promise<T|undefined>`(비동기). 서비스가 정적으로 동기 타입을 주입받아도 DI 가 런타임에 redis 인스턴스를 제공하면 실제 반환은 Promise. **타입은 동기인데 런타임은 비동기 — tsc 가 못 잡는다.** cache `.get()` 결과를 `await` 없이 동기 값으로 바인딩/판정하면 redis 에서 Promise(truthy)로 평가되어 잠금/블랙리스트 무력화·NotFound 우회·Map 에 Promise 저장으로 조용히 깨진다 (memory: project_review_followups_cache_deprecated_godobject_20260624 Sprint A/B).
+
+### 검증 명령 (audit script 자동화 — ts-morph AST)
+
+```bash
+# cache-typed 필드(/CacheService$/)의 .get() read 를 소비 컨텍스트(부모 노드)로 분류.
+# 동기 소비(const x = / if() / && / ===) = VIOLATION, promise 전파(await/return/Promise.all/void) = SAFE.
+node scripts/audit-cache-sync-read.mjs
+# → VIOLATIONS: 0 기대 (EXIT 0). pre-push 통합 + scripts/__tests__/audit-cache-sync-read.spec.mjs 회귀 차단.
+```
+
+### 위반 시 수정 패턴
+
+```ts
+// ❌ await 없는 동기 read — redis 에서 Promise(truthy) 로 깨짐
+const cached = this.cacheService.get<Equipment>(cacheKey);
+if (cached) return cached; // cached 가 Promise → 항상 truthy → DB 폴백 skip
+
+// ✅ await 정합
+const cached = await this.cacheService.get<Equipment>(cacheKey);
+
+// ✅ promise 전파도 SAFE (배치 — Promise.all 이 await)
+const all = await Promise.all(uuids.map((u) => this.cacheService.get<Equipment>(key(u))));
+```
+
+> 왜 정규식이 아니라 AST: 실 코드는 제네릭 `get<Equipment>(` + Prettier 멀티라인 wrap + `Promise.all(map(u => get(u)))` 안전 패턴 — 직전-토큰 정규식은 오탐/누락. ts-morph 가 수신자 type annotation + 소비 컨텍스트를 정확히 분류해 오탐 0 달성.
+
+## Learning Reference
+
+- [이벤트 에미터 시맨틱](../../../.claude/skills/../memory/feedback_event_emitter_async_semantics.md)
+- [캐시 키 JSON sorted keys](../../../.claude/skills/../memory/feedback_cache_key_json_sorted.md)
+- 73차 해네스 결과: [project_73_harness_architecture_20260417.md](../../../.claude/skills/../memory/project_73_harness_architecture_20260417.md)

@@ -1,0 +1,1182 @@
+---
+name: verify-hardcoding
+description: SSOT 소스가 존재하는 값의 하드코딩을 탐지합니다. API 경로, queryKeys, 환경변수, 캐시 키, 토큰 TTL, 페이지 옵션 등. 기능 구현 후 사용.
+disable-model-invocation: true
+argument-hint: '[선택사항: 특정 검사 항목]'
+---
+
+# 하드코딩 값 탐지
+
+## Purpose
+
+SSOT 소스(중앙 상수, 유틸리티, 팩토리)가 존재하는 값이 하드코딩되어 있는지 탐지합니다:
+
+1. **API 경로** — `API_ENDPOINTS` 대신 문자열 직접 사용
+2. **queryKeys** — `queryKeys` 팩토리 대신 배열 직접 생성
+3. **환경변수** — `API_BASE_URL` 대신 `process.env` 직접 접근
+4. **서비스 반환 타입** — `Promise<unknown>` 안티패턴
+5. **토큰 TTL** — `shared-constants` 대신 매직 넘버
+6. **상수** — SITE_VALUES, PAGE_SIZE_OPTIONS, CACHE_KEY_PREFIXES 등
+7. **ErrorCode 매핑** — 백엔드 ↔ 프론트엔드 에러 코드 매핑 완전성
+8. **DTO→Entity 매핑** — `getTableColumns()` 대신 필드 목록 하드코딩
+9. **CSS easing** — `ease-[cubic-bezier(...)]` 대신 CSS 변수/TRANSITION_PRESETS
+10. **페이지네이션 매직넘버** — `.limit(20)` 대신 SSOT 상수
+
+> **임포트 소스 검증은 `/verify-ssot`에서 수행합니다.**
+
+## When to Run
+
+- 새로운 API 클라이언트 함수를 추가한 후
+- 캐시 키를 사용하는 서비스를 추가/수정한 후
+- 환경변수를 참조하는 코드를 추가한 후
+- 프론트엔드 목록/검색 기능을 구현한 후
+
+## Related Files
+
+| File | Purpose |
+|---|---|
+| `apps/frontend/lib/api/query-config.ts` | queryKeys 팩토리 |
+| `apps/frontend/lib/config/api-config.ts` | SSOT API_BASE_URL |
+| `apps/frontend/lib/config/pagination.ts` | PAGE_SIZE_OPTIONS, DEFAULT_PAGE_SIZE |
+| `apps/frontend/lib/errors/equipment-errors.ts` | ErrorCode ↔ EquipmentErrorCode 매핑 |
+| `apps/backend/src/common/cache/cache-key-prefixes.ts` | CACHE_KEY_PREFIXES SSOT |
+| `apps/backend/src/modules/equipment/utils/request-data-codec.ts` | requestData 코덱 |
+| `packages/shared-constants/src/auth-token.ts` | 토큰 TTL SSOT |
+| `packages/shared-constants/src/business-rules.ts` | 비즈니스 규칙 상수 SSOT |
+| `packages/shared-constants/src/pagination.ts` | 페이지네이션 상수 SSOT |
+| `packages/schemas/src/validation/messages.ts` | VM SSOT |
+| `apps/frontend/lib/api/utils/response-transformers.ts` | unwrapResponseData SSOT |
+| `apps/backend/src/common/base/versioned-base.service.ts` | VERSION_CONFLICT_MESSAGE SSOT |
+| `packages/shared-constants/src/form-catalog.ts` | FORM_CATALOG SSOT (양식 번호, 이름, 보존기간) |
+| `apps/frontend/lib/utils/file-url.ts` | fetchStorageFileUrl — FILES.SERVE + arraybuffer 분기 |
+| `apps/frontend/components/shared/StorageImage.tsx` | StorageImage — queryKeys.storageFiles SSOT 사용 |
+| `packages/shared-constants/src/api-endpoints.ts` | FILES.SERVE SSOT (`/api/files`) |
+| `packages/shared-constants/src/qr-config.ts` | QR_CONFIG/LABEL_CONFIG/getLabelCellDimensions SSOT (QR 생성 + 라벨 PDF 레이아웃) |
+| `apps/backend/.eslintrc.js` | ESLint `no-restricted-syntax` — domain status 리터럴 3-layer 정적 차단 (BinaryExpression / Property / CallExpression). Step 23의 배열 요소 grep 탐지와 상호 보완. |
+| `apps/frontend/lib/api/cache-invalidation.ts` | `*CacheInvalidation` 클래스 SSOT — approve/reject/create/update 도메인별 invalidation key 배열 |
+| `apps/frontend/lib/api/approvals-invalidation.ts` | `getApprovalsInvalidationKeys(activeTab)` — 파라미터 의존 함수형 SSOT 헬퍼 패턴 (activeTab별 kpi 키 포함) |
+| `docs/operations/quality-audit-routes.json` | Lighthouse/a11y 감사 대상 라우트 SSOT |
+| `apps/frontend/lib/config/data-migration-preview.ts` | Data migration preview 렌더링 window size SSOT |
+
+## Workflow
+
+각 Step의 bash 명령어, 코드 예시: [references/step-details.md](references/step-details.md) 참조
+
+### Step 1: 하드코딩된 API 경로
+
+**PASS:** API 클라이언트 및 `apps/backend/test/*.e2e-spec.ts`에서 `API_ENDPOINTS` 외 경로 0개. **FAIL:** 문자열 직접 사용.
+
+> **Backend E2E spec 경로 SSOT**: `apps/backend/test/helpers/test-paths.ts`의 `toTestPath(API_ENDPOINTS.*)` 경유 필수 (2026-04-20 추가). `.get('/api/...')` 리터럴 직접 사용은 FAIL.
+
+### Step 2: queryKeys 팩토리 사용 + view/resource 계층 준수
+
+**PASS:** 모든 queryKey가 `queryKeys` 팩토리 사용. **FAIL:** `queryKey: ['equipment', 'detail']` 하드코딩.
+
+**Step 2b: checkouts queryKeys view/resource 계층 확인 (Sprint 3.2 이후)**
+
+`queryKeys.checkouts`는 `view.*` (목록/집계 뷰)와 `resource.*` (상세/카운트)로 분리됨.
+`queryKeys.checkouts.all`을 직접 invalidate하면 뷰와 리소스 모두 무효화되는 과도한 invalidation 발생.
+
+```bash
+# checkouts.all을 직접 invalidateQueries에 사용하는 패턴 탐지 (view/resource 계층 미경유)
+grep -rn "queryKeys\.checkouts\.all\b" \
+  apps/frontend --include="*.tsx" --include="*.ts" \
+  | grep -v "query-config\|// SSOT\|\.all," | grep "invalidate\|prefetch\|queryKey:"
+```
+
+**올바른 계층:**
+- 목록/집계 무효화: `queryKeys.checkouts.view.all()` (write 후 목록 갱신)
+- 상세/카운트 무효화: `queryKeys.checkouts.resource.all()` (FSM 전이 후)
+- 전체 무효화(예: 로그아웃): `queryKeys.checkouts.all` (배열 직접 사용)
+
+```typescript
+// ❌ WRONG — 목록만 갱신하려는데 resource 캐시까지 날림
+queryClient.invalidateQueries({ queryKey: queryKeys.checkouts.all });
+
+// ✅ CORRECT — 목록만 선택적 무효화
+queryClient.invalidateQueries({ queryKey: queryKeys.checkouts.view.all() });
+```
+
+**PASS:** 캐시 무효화가 `view.all()` 또는 `resource.all()` 계층을 경유. `checkouts.all` 직접 사용은 로그아웃·전체 초기화 맥락에서만 허용.
+**근거:** Sprint 3.2 query hierarchy refactor (2026-04-26) — 3개 병렬 useQuery를 1개 BFF로 교체하면서 invalidation granularity 분리.
+
+### Step 3: Promise<unknown> 반환 타입
+
+**PASS:** public 서비스 메서드에 `Promise<unknown>` 0개. **FAIL:** 타입 명시 필요.
+
+### Step 4: 환경변수 직접 참조 + (4b) E2E Backend URL
+
+**PASS:** `api-config.ts`/`tests/e2e` 제외 `process.env.NEXT_PUBLIC_API_URL` 0개.
+
+### Step 5: 토큰 TTL 하드코딩
+
+**PASS:** auth 파일에 `15m`, `7d`, 계산식 하드코딩 0개. SSOT: `packages/shared-constants/src/auth-token.ts`.
+
+### Step 6-7: SITE_VALUES / PAGE_SIZE_OPTIONS 로컬 재정의
+
+**PASS:** SSOT 파일 외 직접 선언 0개.
+
+### Step 8: CACHE_KEY_PREFIXES SSOT
+
+**PASS:** 서비스/헬퍼에서 하드코딩 캐시 키 프리픽스 0개.
+
+### Step 9: APPROVAL_KPI 임계값 + (9b) 리포트 상수
+
+**PASS:** SSOT 파일 외 직접 선언 0개. 매직넘버 직접 사용 0개.
+
+### Step 10: ErrorCode ↔ 프론트엔드 매핑
+
+**PASS:** `ErrorCode` 주요 값이 `mapBackendErrorCode`에 매핑됨.
+
+새 서비스 추가 시 해당 서비스의 모든 에러 코드가 `mapBackendErrorCode`에 추가됐는지 확인할 것.
+
+**탐지 — 서비스별 에러 코드 추출 후 매핑 누락 확인:**
+```bash
+# 특정 모듈의 에러 코드 추출
+grep -oP "code:\s*'\K[A-Z_]+" \
+  apps/backend/src/modules/calibration-plans/calibration-plans.service.ts \
+  | sort -u
+
+# mapBackendErrorCode에 등록된 코드 추출
+grep -oP "^\s+\K[A-Z_]+(?=:\s*EquipmentErrorCode)" \
+  apps/frontend/lib/errors/equipment-errors.ts \
+  | sort -u
+```
+
+**현재 누락 목록 (2026-04-20 발견, 4차 재발):**
+- `CALIBRATION_PLAN_NOT_FOUND` → NOT_FOUND
+- `CALIBRATION_PLAN_ALREADY_EXISTS` → DUPLICATE_ERROR
+- `CALIBRATION_PLAN_ONLY_DRAFT_CAN_UPDATE` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_ONLY_DRAFT_CAN_DELETE` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_INVALID_STATUS_FOR_SUBMIT` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_ONLY_PENDING_REVIEW_CAN_REVIEW` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_ONLY_PENDING_APPROVAL_CAN_APPROVE` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_INVALID_STATUS_FOR_REJECT` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_REJECTION_REASON_REQUIRED` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_ITEM_NOT_FOUND` → NOT_FOUND
+- `CALIBRATION_PLAN_ONLY_DRAFT_CAN_UPDATE_ITEM` → VALIDATION_ERROR
+- `CALIBRATION_PLAN_ONLY_APPROVED_CAN_CREATE_VERSION` → VALIDATION_ERROR
+- `CALIBRATION_NOT_FOUND` → NOT_FOUND
+- `CALIBRATION_INVALID_STATUS_FOR_COMPLETE` → VALIDATION_ERROR
+- `CALIBRATION_ONLY_PENDING_CAN_APPROVE` → VALIDATION_ERROR
+- `CALIBRATION_ONLY_PENDING_CAN_REJECT` → VALIDATION_ERROR
+- `CALIBRATION_REJECTION_REASON_REQUIRED` → VALIDATION_ERROR
+- `CALIBRATION_NO_INTERMEDIATE_CHECK` → VALIDATION_ERROR
+
+> ⚠️ 위 목록은 2026-04-20 기준 미매핑 코드. 기능 구현 시 함께 추가할 것.
+
+### Step 11: DTO→Entity 동적 매핑
+
+**PASS:** `getTableColumns()` 기반. **FAIL:** 하드코딩 필드 배열.
+
+### Step 12: requestData 코덱
+
+**PASS:** `equipment-approval.service.ts`에 `JSON.parse/stringify` 직접 호출 0개.
+
+### Step 13: DTO 검증 메시지 VM SSOT + (13b) Test User Email
+
+**PASS:** DTO에 하드코딩 한국어 메시지 0개. E2E에 이메일 리터럴 0개.
+
+### Step 14: CALIBRATION_THRESHOLDS
+
+**PASS:** 교정 임계값(30, 7) 매직넘버 0개. SSOT: `CALIBRATION_THRESHOLDS.*`.
+
+### Step 15: VERSION_CONFLICT SSOT
+
+**PASS:** `createVersionConflictException()` 헬퍼 사용. 인라인 ConflictException 0개.
+
+### Step 16: CSS easing 하드코딩
+
+**PASS:** `ease-[cubic-bezier(...)]` 0개. `ease-[var(--ease-*)]` 또는 TRANSITION_PRESETS 사용.
+
+### Step 17: 페이지네이션 매직넘버
+
+**PASS:** `.limit(숫자)` 0개 (`.limit(1)` 제외). SSOT 상수 사용.
+
+**Step 17b: 프론트엔드 optimistic fallback `pageSize` 하드코딩 (2026-05-02 추가)**
+
+`useOptimisticMutation` 등 optimistic update fallback에서 `PaginatedResponse` 구조를 직접 생성할 때 `pageSize: N` 매직넘버 사용 금지. `DEFAULT_PAGE_SIZE`를 `@equipment-management/shared-constants`에서 import해야 한다.
+
+```bash
+# optimistic fallback PaginatedResponse 구조 내 pageSize 매직넘버 탐지
+# (meta.pagination 컨텍스트에서 pageSize에 숫자 리터럴 직접 할당)
+grep -rn "pagination.*pageSize: [0-9]\|pageSize: [0-9][0-9]*," apps/frontend --include="*.tsx" --include="*.ts" \
+  | grep "meta\|fallback\|old ??" \
+  | grep -v "node_modules\|DEFAULT_PAGE_SIZE\|\.d\.ts\|test-software-combobox\|equipment-combobox\|pageSize: 1\b\|pageSize: 5\b\|pageSize: 50\b\|pageSize: 100\b"
+# pageSize: 1 (count-only queries), 5 (notification dropdown), 50/100 (selector) 는 의도적 예외
+# 기대: 0건 — PaginatedResponse optimistic fallback의 pageSize는 DEFAULT_PAGE_SIZE SSOT 경유
+```
+
+**올바른 패턴**:
+```typescript
+import { DEFAULT_PAGE_SIZE } from '@equipment-management/shared-constants';
+
+optimisticUpdate: (old, { id }) => ({
+  ...(old ?? { data: [], meta: { pagination: { total: 0, pageSize: DEFAULT_PAGE_SIZE, currentPage: 1, totalPages: 0 } } }),
+  data: (old?.data ?? []).map((item) => item.id === id ? { ...item, status: 'approved' } : item),
+}),
+```
+
+**FAIL 패턴**: `pageSize: 10`, `pageSize: 20`, `pageSize: 50` 리터럴 직접 사용.
+
+### Step 18: unwrapResponseData SSOT
+
+**PASS:** 3개 API 클라이언트(api-client.ts, server-api-client.ts, authenticated-client-provider.tsx) 모두 `unwrapResponseData` 사용. 이 클라이언트 외에서 `'success' in response.data` 또는 `.success ==` 패턴 0개.
+
+> **`return response.data` 패턴 구분**: `apps/frontend/lib/api/**` API 함수에서 `return response.data`는 두 가지 의미를 가짐:
+> - ❌ `response.data?.data` / `response.data.data` — ApiResponse 봉투 이중 래핑 해제 시도. 인터셉터가 이미 unwrap했으므로 `.data` 중복 접근으로 `undefined` 반환 위험.
+> - ✅ `return response.data` (명시적 제네릭 사용) — axios interceptor가 `ApiResponse<T>` 봉투를 unwrap한 후 `response.data`가 실제 타입 T임. `response-transformers` 외 API 함수에서 허용.
+>
+> 핵심 금지 패턴: `response.data?.data`, `response.data.data` (이중 언래핑)
+
+### Step 19: FORM_CATALOG 양식 번호 SSOT
+
+**PASS:** 양식 번호(`UL-QP-18-XX`, `UL-QP-19-XX`)가 `FORM_CATALOG` 상수로 참조. **FAIL:** 문자열 직접 사용.
+
+### Step 19b: getTemplateBuffer 인자 SSOT
+
+`formTemplateService.getTemplateBuffer()` 호출 시 인자로 양식 번호 문자열을 직접 전달하는 대신, 레이아웃 파일에서 `export const FORM_NUMBER = 'UL-QP-18-XX'` 패턴으로 상수를 정의하고 import해야 함.
+
+**참고:** UL-QP-18-01/03/05는 이미 `REGISTRY_FORM_NUMBER`, `INTERMEDIATE_FORM_NUMBER`, `SELF_FORM_NUMBER` 상수로 처리됨. UL-QP-18-06/07/08/09/10은 문자열 직접 전달 (2026-04-19 기준 tech-debt LOW 등재).
+
+```bash
+# getTemplateBuffer에 문자열 리터럴 직접 전달 탐지
+grep -rn "getTemplateBuffer('[A-Z]" apps/backend/src/modules --include="*.ts" | grep -v "// "
+```
+
+**PASS:** 0건 (상수 변수만 사용). **WARN (현재 부채):** `form-template-export.service.ts`에서 06/07/08/09/10 문자열 리터럴 직접 전달 — 각 export 전용 layout 파일로 이관 예정.
+
+### Step 21: QR/라벨 설정 하드코딩
+
+`packages/shared-constants/src/qr-config.ts`가 QR 코드 생성 및 라벨 PDF 레이아웃의 SSOT. 인라인 매직넘버 금지.
+
+```bash
+# generate-label-pdf.ts/worker.ts 에서 QR_CONFIG/LABEL_CONFIG 미경유 매직넘버 직접 할당 탐지
+# SSOT-destructured 변수(cell., pdf.)를 통한 접근은 정상이므로 제외
+grep -n "errorCorrectionLevel\s*[:=]\s*['\"]" \
+  apps/frontend/lib/qr/generate-label-pdf.ts \
+  apps/frontend/lib/qr/generate-label-pdf.worker.ts \
+  2>/dev/null \
+  | grep -v "QR_CONFIG\|LABEL_CONFIG\|qr-config"
+grep -n "qrSizeMm\s*[:=]\s*[0-9]\|cols\s*[:=]\s*[0-9]\|rows\s*[:=]\s*[0-9]\|pageWidthMm\s*[:=]\s*[0-9]\|maxBatch\s*[:=]\s*[0-9]\|qrForegroundColor\s*[:=]\s*['\"\`]\|qrBackgroundColor\s*[:=]\s*['\"\`]\|cellBackgroundColor\s*[:=]\s*['\"\`]\|qrModuleOverlapPx\s*[:=]\s*[0-9]\|mgmtMinFontPt\s*[:=]\s*[0-9]\|nameMinFontPt\s*[:=]\s*[0-9]\|serialMinFontPt\s*[:=]\s*[0-9]\|nameMaxLines\s*[:=]\s*[0-9]\|lineHeightRatio\s*[:=]\s*[0-9]\|mgmtFontPt\s*[:=]\s*[0-9]\|nameFontPt\s*[:=]\s*[0-9]\|serialFontPt\s*[:=]\s*[0-9]\|fieldLabelFontPt\s*[:=]\s*[0-9]" \
+  apps/frontend/lib/qr/generate-label-pdf.ts \
+  apps/frontend/lib/qr/generate-label-pdf.worker.ts \
+  2>/dev/null \
+  | grep -v "QR_CONFIG\|LABEL_CONFIG\|qr-config\|// \|* "
+```
+
+**PASS:** 빈 출력. **FAIL:** `errorCorrectionLevel: 'H'`, `cols: 3`, `qrSizeMm: 25`, `mgmtMinFontPt: 8`, `nameMaxLines: 2` 등 하드코딩 리터럴 할당.
+
+**예외**: `qr-config.ts` 자체, SSOT에서 destructure한 변수를 통한 속성 접근(`cell.qrSizeMm`, `pdf.cols`)은 SSOT-compliant.
+
+### Step 21b: QR 라벨 폰트 스케일 / 단위 변환 매직넘버 탐지 (2026-04-19 추가)
+
+Worker의 `mmToPx` / `ptToPx` 변환 함수와 `heightScale` 계산이 SSOT 상수를 경유해야 한다.
+직접 DPI 숫자(`200`) / mm 변환계수(`25.4`) / pt 변환계수(`72`) 인라인 사용은 허용 (물리 표준값).
+그러나 라벨 기준 높이(`XL_LABEL_HEIGHT_MM` = 43.7)를 하드코딩하거나
+`LABEL_SIZE_PRESETS`에 등록되지 않은 임의 프리셋 치수를 인라인 사용하는 것은 FAIL.
+
+```bash
+# 43.7 하드코딩 (XL_LABEL_HEIGHT_MM 우회)
+grep -rn "43\.7" \
+  apps/frontend/lib/qr/ --include="*.ts" --include="*.tsx" \
+  | grep -v "node_modules\|qr-config.ts\|\.spec\."
+
+# LABEL_SIZE_PRESETS에 없는 임의 widthMm/heightMm 상수 직접 할당
+# (qrSizeMm는 Step 21에서 이미 커버, 여기서는 레이아웃 치수)
+grep -n "widthMm\s*[:=]\s*[0-9]\|heightMm\s*[:=]\s*[0-9]" \
+  apps/frontend/lib/qr/generate-label-pdf.ts \
+  apps/frontend/lib/qr/generate-label-pdf.worker.ts \
+  2>/dev/null \
+  | grep -v "LABEL_SIZE_PRESETS\|getLabelCellDimensions\|LABEL_SAMPLER_LAYOUT\|qr-config\|// \|* "
+```
+
+**PASS:** 모두 0건. **FAIL:** `43.7` 인라인, 또는 SSOT를 거치지 않는 임의 치수 할당.
+
+### Step 23: staleTime/gcTime 직접 지정 (QUERY_CONFIG 프리셋 우회) (2026-04-22 추가)
+
+`apps/frontend/lib/api/query-config.ts`의 `QUERY_CONFIG` 프리셋이 SSOT.
+`useQuery`에서 `staleTime: CACHE_TIMES.X`를 직접 지정하면 캐시 전략이 분산되어 일괄 변경 불가.
+
+**올바른 패턴:**
+```typescript
+// ✅ QUERY_CONFIG 프리셋 스프레드 (placeholderData 등 추가 옵션은 스프레드 후 명시)
+const { data } = useQuery({
+  queryKey: queryKeys.checkouts.list(params),
+  queryFn: () => checkoutApi.getCheckouts(params),
+  ...QUERY_CONFIG.CHECKOUT_LIST,
+  placeholderData: initialData,  // ← 스프레드 후 오버라이드 (실수로 덮힘 방지)
+});
+```
+
+**탐지 — staleTime:**
+```bash
+grep -rn "staleTime:\s*CACHE_TIMES\." \
+  apps/frontend/app apps/frontend/components apps/frontend/hooks \
+  --include="*.ts" --include="*.tsx" \
+  | grep -v "// \|node_modules"
+```
+
+**탐지 — gcTime:**
+```bash
+grep -rn "gcTime:\s*CACHE_TIMES\." \
+  apps/frontend/app apps/frontend/components apps/frontend/hooks \
+  --include="*.ts" --include="*.tsx" \
+  | grep -v "// \|node_modules"
+```
+
+**PASS:** 0건 (또는 하기 허용 목록에 있는 파일). **FAIL:** `staleTime/gcTime: CACHE_TIMES.SHORT` 등 직접 지정.
+
+**허용된 의도적 보존 (2026-04-27 전수 검증, 5건):**
+| 파일 | 설정 | 이유 |
+|---|---|---|
+| `lib/providers.tsx` | `staleTime: CACHE_TIMES.LONG` | QueryClient 전역 defaultOptions — 쿼리별 설정 아님 |
+| `hooks/use-equipment.ts:84` | `staleTime: CACHE_TIMES.SHORT` | 백엔드 캐시 협력 주석 — `useEquipmentWithInitialData` 전용 |
+| `hooks/use-management-number-check.ts:88,127` | `staleTime: SHORT, gcTime: LONG, retry:1` | 관리번호 중복체크 fetchQuery 전용 커스텀 조합 |
+| `components/shared/StorageImage.tsx` | `gcTime: CACHE_TIMES.SHORT` | Blob URL revoke lifecycle — staleTime:MEDIUM + gcTime:SHORT 비대칭 의도적 |
+
+**예외:** `staleTime: Infinity` (런타임 불변, 주석 필수), `query-config.ts` 자체 정의.
+
+### Step 20: 파일 확장자/MIME 타입 SSOT
+
+**탐지 명령어:**
+```bash
+rg "\.xlsx|\.docx" apps/frontend/lib/api/ --type ts -n | grep -v "node_modules\|\.d\.ts" | grep -v "import\|require\|Content-Type"
+```
+
+**PASS:** 파일 확장자(`.xlsx`, `.docx`)가 서버 Content-Disposition 또는 FORM_CATALOG 기반으로 결정됨. **FAIL:** 프론트엔드에서 확장자 배열(`XLSX_FORMS = [...]` 등) 하드코딩하여 서버 반환 형식과 불일치 발생 가능.
+
+### Step 25: DISPLAY_LIMITS SSOT — UI 표시 건수 매직넘버 탐지 (2026-04-27 추가)
+
+`apps/frontend/lib/config/dashboard-config.ts`의 `DISPLAY_LIMITS` 객체가 UI 컴포넌트에서 표시할 최대 항목 수의 SSOT.
+`.slice(0, 5)`, `.slice(0, 8)` 등 매직넘버 직접 사용 금지. `DISPLAY_LIMITS.myActivity`, `DISPLAY_LIMITS.calibrationDday` 등 명명 상수 경유 필수.
+
+**현재 정의된 상수 (두 SSOT 존재):**
+```typescript
+// apps/frontend/lib/config/dashboard-config.ts — 프론트엔드 전용
+export const DISPLAY_LIMITS = {
+  overdueCheckouts: 6,
+  upcomingCheckoutReturns: 6,
+  calibrationDday: 8,
+  calendarEvents: 5,
+  myActivity: 5,
+} as const;
+
+// packages/shared-constants/src/dashboard-thresholds.ts — 크로스 레이어 공유
+export const DASHBOARD_CARD_DISPLAY_LIMITS = {
+  calibrationDday: 8,           // CalibrationDdayList 1카드 내 최대 행
+  approvalHeavyMinCount: 5,     // PendingApprovalCard heavy variant 임계값
+  approvalZeroGroup: 4,         // 0건 카테고리 그룹 요약 레이블 최대 수
+} as const;
+```
+
+**탐지:**
+```bash
+# 대시보드 컴포넌트에서 .slice(0, N) 매직넘버 직접 사용 탐지 (DISPLAY_LIMITS 미경유)
+# .slice(0, 1)과 .slice(0, 10) 제외 (단건조회 및 ISO 날짜 파싱)
+grep -rn "\.slice(0,\s*[2-9][^0-9]\|\.slice(0,\s*[3-9][0-9]" \
+  apps/frontend/components/dashboard/ \
+  --include="*.tsx" --include="*.ts" \
+  | grep -v "DISPLAY_LIMITS\|node_modules\|date\|str\|string"
+```
+
+**PASS:** 0 hit (또는 DISPLAY_LIMITS/DASHBOARD_CARD_DISPLAY_LIMITS 경유). **FAIL:** `.slice(0, 5)` 등 매직넘버 → `DISPLAY_LIMITS.*` 또는 `DASHBOARD_CARD_DISPLAY_LIMITS.*` import 후 교체.
+
+**예외:**
+- `.slice(0, 1)` — 단일 항목 취득 (페이지네이션 아님)
+- `.slice(0, 10)` — ISO 날짜 문자열 파싱 (`'2026-04-27T...'.slice(0, 10)` 패턴)
+- 백엔드 코드 — 이 Step은 프론트엔드 dashboard 컴포넌트 전용
+
+**Related Files:**
+- `apps/frontend/lib/config/dashboard-config.ts` — `DISPLAY_LIMITS` SSOT (프론트엔드 전용)
+- `packages/shared-constants/src/dashboard-thresholds.ts` — `DASHBOARD_CARD_DISPLAY_LIMITS` SSOT (크로스 레이어)
+- `apps/frontend/components/dashboard/MyActivityCard.tsx` — `DISPLAY_LIMITS.myActivity` 소비처
+- `apps/frontend/components/dashboard/CalibrationDdayList.tsx` — `DISPLAY_LIMITS.calibrationDday` 소비처
+- `apps/frontend/components/dashboard/OverdueCheckoutsCard.tsx` — `DISPLAY_LIMITS.overdueCheckouts` 소비처
+- `apps/frontend/components/dashboard/PendingApprovalCard.tsx` — `DASHBOARD_CARD_DISPLAY_LIMITS.approvalZeroGroup` 소비처
+
+## Output Format
+
+```markdown
+| #   | 검사                          | 상태      | 상세                                   |
+| --- | ----------------------------- | --------- | -------------------------------------- |
+| 1   | 하드코딩 API 경로             | PASS/FAIL | 하드코딩 위치 목록                     |
+| 2   | queryKeys 팩토리              | PASS/FAIL | 하드코딩 queryKey 위치                 |
+| 3   | Promise<unknown> 반환 타입    | PASS/FAIL | unknown 반환 위치                      |
+| 4   | 환경변수 직접 참조            | PASS/FAIL | 직접 참조 위치                         |
+| 4b  | E2E Backend URL SSOT          | PASS/FAIL | 직접 env 참조 파일                     |
+| 5   | 토큰 TTL 하드코딩             | PASS/FAIL | 하드코딩 위치                          |
+| 6   | SITE_VALUES 로컬 재정의       | PASS/FAIL | 로컬 선언 위치                         |
+| 7   | PAGE_SIZE_OPTIONS 로컬 재정의 | PASS/FAIL | 직접 선언 위치                         |
+| 8   | CACHE_KEY_PREFIXES SSOT       | PASS/FAIL | 하드코딩 캐시 키 위치                  |
+| 9   | APPROVAL_KPI 임계값           | PASS/FAIL | 하드코딩 임계값 위치                   |
+| 10  | ErrorCode↔프론트엔드 매핑    | PASS/FAIL | 누락된 매핑 목록                       |
+| 11  | DTO→Entity 동적 매핑          | PASS/FAIL | 하드코딩 필드 목록 위치                |
+| 12  | requestData 코덱              | PASS/FAIL | 직접 JSON.parse 위치                   |
+| 13  | DTO 검증 메시지 VM SSOT       | PASS/FAIL | 하드코딩 한국어 메시지 위치            |
+| 13b | Test User Email SSOT          | PASS/FAIL | 하드코딩 이메일 위치                   |
+| 14  | CALIBRATION_THRESHOLDS        | PASS/FAIL | 매직넘버 위치                          |
+| 15  | VERSION_CONFLICT 일관성       | PASS/FAIL | SSOT 불일치 서비스                     |
+| 16  | CSS easing 하드코딩           | PASS/FAIL | ease-[cubic-bezier] 위치               |
+| 17  | 페이지네이션 매직넘버         | PASS/FAIL | .limit(숫자) 위치                      |
+| 18  | unwrapResponseData SSOT       | PASS/FAIL | 인라인 래핑 해제 위치                  |
+| 19  | FORM_CATALOG 양식 번호 SSOT   | PASS/FAIL | 하드코딩 양식 번호 위치                |
+| 19b | getTemplateBuffer 인자 SSOT   | PASS/WARN | 문자열 리터럴 직접 전달 위치           |
+| 20  | 파일 확장자/MIME 타입 SSOT    | PASS/FAIL | 하드코딩 확장자 배열 위치              |
+| 21b | QR 라벨 폰트 스케일 매직넘버  | PASS/FAIL | 43.7 인라인 또는 SSOT 외 치수 할당 위치 |
+| 22  | Content-Disposition 인라인 조립 | PASS/FAIL | `filename*=UTF-8''` 직접 사용 위치 |
+| 23  | export allowlist 상태 리터럴   | PASS/WARN | enum 미경유 status 배열 요소 위치 |
+| 24  | Layer 3 arbitrary 픽셀 타이포   | PASS/FAIL | `text-[Npx]` 잔존 위치 + 건수 |
+| 25  | DISPLAY_LIMITS SSOT (UI 표시 건수) | PASS/FAIL | `.slice(0, N)` 매직넘버 위치 |
+| 26  | 컴포넌트 비-JSX 함수 내 한국어 문자열 조합 | PASS/SHOULD | `parts.push('[가-힣]')` 패턴 위치 |
+| 27  | SelectItem value 속성 enum SSOT    | PASS/FAIL | 도메인 리터럴 인라인 value 위치 |
+| 28  | href 인라인 도메인 경로            | PASS/FAIL | FRONTEND_ROUTES 미경유 위치 |
+| 29  | 백엔드 시간 윈도우 상수 로컬 선언  | PASS/WARN | `*_WINDOW_MS` 로컬 const 위치 (tech-debt 여부 포함) |
+| 30  | 외부 브랜드 자산 `lib/brand-assets/` 분리 강제 | PASS/FAIL | 컴포넌트 내 외부 브랜드 SVG hex 컬러 인라인 위치 |
+```
+
+### Step 24: Design Token Layer 3 arbitrary 픽셀 타이포 탐지 (2026-04-21 추가)
+
+`apps/frontend/lib/design-tokens/components/` 하위 Layer 3 파일에서
+`text-[Npx]` arbitrary 타이포 값이 직접 사용되면 `MICRO_TYPO` SSOT 체인이 끊어진다.
+
+**SSOT 체인**: `TYPOGRAPHY_PRIMITIVES['2xs']` → `globals.css @theme --text-2xs` → `text-2xs` 유틸리티 → `MICRO_TYPO.badge/label`
+
+**허용**: `text-xs`(11px), `text-sm`, `text-base` 등 named utilities. `text-2xs`(10px SSOT).  
+**금지**: `text-[7px]`~`text-[10px]` arbitrary — WCAG SC 1.4.4 접근성 하한 위반 + SSOT 단절.
+
+```bash
+# Layer 3 파일에서 arbitrary 픽셀 텍스트 탐지 (WCAG 하한 위반 포함)
+grep -rn "text-\[[0-9]*px\]" \
+  apps/frontend/lib/design-tokens/components/ \
+  --include="*.ts"
+```
+
+**PASS:** 0 hits. **FAIL:** 도메인별 78차 스타일 패치로 순차 제거 (MICRO_TYPO.badge/label/caption 교체).
+
+**현재 잔존 목표 도메인 (79차 기준 — team/settings/approval/equipment/sidebar/calibration-plans/mobile-nav/software 제거 완료):**
+- non-conformance.ts(19), audit.ts(18), dashboard.ts(16 → `heroCount text-[56px]` 1건만 잔존) — 총 약 38건
+- team(0), settings(0), approval(0), equipment(0), sidebar(0) — 79차 세션에서 MICRO_TYPO 대체 완료
+
+**예외:** `text-[Npx]` 이외의 arbitrary 값(예: `text-[11px]` = text-xs 동등)은 WARN 처리.
+
+### Step 23: Export 허용 상태 allowlist 하드코딩 탐지 (2026-04-20 추가)
+
+백엔드 서비스에서 `export` 가능한 상태를 문자열 배열로 직접 정의하는 것은 허용되지만,
+해당 상수가 프론트엔드 `*-exportability.ts` 유틸과 동기화되지 않을 위험이 있다.
+탐지 목적은 백엔드 export-data 서비스가 `CalibrationPlanStatus`/`SoftwareValidationStatus` 등
+Schemas SSOT enum을 경유하지 않고 `'approved'` 등의 리터럴을 직접 배열 요소로 사용하는 경우를 찾는 것이다.
+
+```bash
+# export-data 서비스에서 enum 상수를 경유하지 않는 상태 리터럴 allowlist 탐지
+grep -rn "EXPORTABLE.*STATUSES\s*=\s*\['\|const.*STATUS.*=\s*\['" \
+  apps/backend/src/modules \
+  --include="*export-data*" --include="*exportability*" \
+  | grep -v "node_modules\|// "
+```
+
+**PASS:** export allowlist 상수가 SchemaEnum 상수 (`CalibrationPlanStatusValues.APPROVED` 등)를 요소로 사용.
+**WARN:** `['approved'] as const` 형태로 문자열 리터럴 직접 사용 — 프론트엔드 유틸과 sync 주석이 있으면 LOW 수준.
+
+**배경:** `calibration-plan-export-data.service.ts:8` `const EXPORTABLE_PLAN_STATUSES = ['approved'] as const` — 프론트엔드 `calibration-plan-exportability.ts`는 `CalibrationPlanStatusValues.APPROVED` SSOT를 사용하나 백엔드는 리터럴. 기능상 동등하나 enum 값이 변경될 경우 drift 위험. sync 주석 존재로 WARN 수준으로 이연 (2026-04-20 review-architecture 발견).
+
+**예외:** export allowlist가 의도적으로 enum 전체보다 좁은 명시적 subset인 경우 (allowlist 방식의 보안 설계), 리터럴 사용에 sync 주석이 있으면 WARN으로 처리. 동기화 주석 없이 리터럴만 있으면 FAIL.
+
+### Step 22: Content-Disposition 헤더 인라인 조립 금지 (2026-04-20 추가)
+
+`apps/backend/src/common/http/content-disposition.util.ts`의 `buildContentDisposition(filename)` 함수가 SSOT.
+컨트롤러/서비스에서 `filename*=UTF-8''${encodeURIComponent(...)}` 를 직접 조립하면 RFC 5987 준수 여부를
+개별 파일에서 각자 보장해야 하므로 유지보수 위험.
+
+```bash
+# 컨트롤러/서비스에서 filename*=UTF-8'' 직접 조립 탐지
+grep -rn "filename\\\*=UTF-8''" \
+  apps/backend/src/modules \
+  apps/backend/src/common \
+  --include="*.ts" \
+  | grep -v "content-disposition.util.ts"
+```
+
+**PASS:** 0건. **FAIL:** 모듈 또는 common 레이어에서 직접 조립 발견 시 `buildContentDisposition()` 로 교체.
+
+**예외:** `apps/backend/src/common/storage/s3-storage.provider.ts` — S3 Presigned URL의 `ResponseContentDisposition` 파라미터는 SDK가 직접 문자열을 요구하며, `buildContentDisposition` 반환값 형식과 호환. 동일 패턴이므로 방어적 허용.
+
+### Step 26: 컴포넌트 비-JSX 함수 내 한국어 문자열 조합 탐지 (2026-04-27 추가)
+
+컴포넌트 파일에서 JSX 반환 이외의 함수(포맷 헬퍼, 보고서 조합 함수)가 한국어 문자열을 직접 조합하면, 다국어 환경에서 항상 한국어로 고정 출력됨.
+
+**배경:** `PrintableAuditReport.tsx`의 `formatFilters()` 함수가 `대상=`, `액션=`, `사용자=`, `시작일=`, `종료일=`, `'전체'` 6개 복합 문자열을 하드코딩. 인쇄 보고서에서 en locale 사용 시 한국어 출력 버그. 2026-04-27 tech-debt LOW `formatFilters-compound-i18n` 등록.
+
+**탐지:**
+```bash
+# 컴포넌트 내 비-JSX 함수에서 한국어 문자열 push 패턴
+grep -rn "parts\.push.*['\"][가-힣]" \
+  apps/frontend/components/ \
+  --include="*.tsx" --include="*.ts" \
+  | grep -v "node_modules\|// "
+```
+
+**PASS:** 0건 (또는 tech-debt 등록 항목만).
+**SHOULD (현재 잔존):** `PrintableAuditReport.tsx:formatFilters()` — tech-debt `formatFilters-compound-i18n` LOW, audit 보고서 i18n 리뷰 시 `t('report.filterEntry', { key, value })` 패턴으로 교체 예정.
+
+**올바른 패턴:**
+```typescript
+// ❌ 비-JSX 함수에서 한국어 문자열 직접 조합 — locale 무관 출력
+const parts: string[] = [];
+if (f.entityType) parts.push(`대상=${getEntityTypeLabel(f.entityType)}`);
+
+// ✅ t() 함수 사용 — locale-aware 포맷
+if (f.entityType) parts.push(t('report.filterEntry.entityType', { value: getEntityTypeLabel(f.entityType) }));
+```
+
+### Step 27: SelectItem `value` 속성 enum SSOT 강제 — 도메인 리터럴 인라인 금지 (2026-04-27 추가)
+
+`<SelectItem value="calibration">` 같이 shadcn/ui `SelectItem`의 `value` 속성에 도메인 enum 값을 raw 문자열로 인라인 사용하면, enum 값 변경 시 TypeScript 컴파일러가 drift를 감지할 수 없다.
+
+**규칙:** 도메인 enum(CheckoutPurpose, CheckoutStatus, UserRole 등) 값을 `value` prop으로 전달할 때 반드시 SSOT 상수(CPVal.CALIBRATION, 등)를 경유해야 한다.
+
+```bash
+# SelectItem에 checkout purpose 리터럴 직접 사용 탐지
+grep -rn 'value="calibration"\|value="repair"\|value="rental"' \
+  apps/frontend/components apps/frontend/app \
+  --include="*.tsx" \
+  | grep -v "node_modules\|// "
+
+# SelectItem에 상태 리터럴 직접 사용 탐지 (일반화)
+grep -rn '<SelectItem value="[a-z_]*"' \
+  apps/frontend/components apps/frontend/app \
+  --include="*.tsx" \
+  | grep -v "node_modules\|// "
+```
+
+**PASS:** 0건 (enum SSOT 상수 경유). **FAIL:** raw 리터럴 발견 → `value={CPVal.CALIBRATION}` 등 상수로 교체.
+
+**올바른 패턴:**
+```tsx
+// ❌ enum drift 위험 — 컴파일 타임 감지 불가
+<SelectItem value="calibration">
+
+// ✅ SSOT 경유 — 컴파일 타임 보호
+<SelectItem value={CPVal.CALIBRATION}>
+```
+
+**배경:** `CreateCheckoutContent.tsx`의 purpose SelectItem 3건이 `value="calibration"|"repair"|"rental"` 리터럴 직접 사용 → `CPVal.CALIBRATION|REPAIR|RENTAL` 교체. 2026-04-27 verify-hardcoding Step 26에서 탐지됨.
+
+**예외:**
+- shadcn/ui 기본 예시나 UI 표시 전용(aria 레이블, 비도메인 옵션) — SITE_OPTIONS `value="gangnam"` 등은 로컬 정의 허용.
+- 비도메인 enum 값 — 정렬 방향(`"asc"/"desc"`), 뷰 타입(`"grid"/"list"`) 등 프레젠테이션 값.
+
+### Step 28: 인라인 도메인 경로 탐지 — `FRONTEND_ROUTES` 미경유 금지 (2026-04-27 추가, 2026-04-29 확장)
+
+`<Link href="/equipment">`, `router.push('/checkouts/id')`, `backUrl="/checkouts/id"` 같이 도메인 경로를 raw 문자열로 인라인 사용하면,
+`FRONTEND_ROUTES.EQUIPMENT.LIST` 같은 상수가 변경될 때 TypeScript 컴파일러가 drift를 감지할 수 없어 런타임 404가 발생한다.
+
+**규칙:** 도메인 경로(`/equipment`, `/checkouts`, `/calibration-plans` 등)를 `href`/`router.push`/`router.replace`/`backUrl` prop 등에 직접 사용 금지.
+반드시 `FRONTEND_ROUTES.*` 상수 또는 빌더 함수를 경유해야 한다.
+
+```bash
+# href 속성 인라인 도메인 경로 탐지
+grep -rn 'href="\/\(equipment\|checkouts\|calibration-plans\|calibration\|non-conformances\|software\|cables\|teams\|notifications\|dashboard\|approvals\)"' \
+  apps/frontend/components apps/frontend/app \
+  --include="*.tsx" --include="*.ts" \
+  | grep -v "node_modules\|// "
+
+# router.push/replace 또는 backUrl에서 template literal 경로 직접 사용 탐지
+grep -rn "router\.\(push\|replace\)(\`\/\|backUrl={\`\/" \
+  apps/frontend/components apps/frontend/app \
+  --include="*.tsx" --include="*.ts" \
+  | grep -v "node_modules\|// "
+
+# FRONTEND_ROUTES import 없이 /경로 직접 사용하는 파일 탐지
+grep -rln 'href="\/[a-z-]*"' \
+  apps/frontend/components apps/frontend/app \
+  --include="*.tsx" \
+  | xargs -I{} sh -c 'grep -l "FRONTEND_ROUTES" {} > /dev/null || echo "MISSING_ROUTES_IMPORT: {}"'
+```
+
+**PASS:** 0건 (FRONTEND_ROUTES 상수 경유). **FAIL:** raw 경로 문자열 발견 → 아래 패턴으로 교체.
+
+**올바른 패턴:**
+```tsx
+import { FRONTEND_ROUTES } from '@equipment-management/shared-constants';
+
+// ❌ 경로 변경 시 TypeScript 미탐지
+<Link href="/equipment">목록</Link>
+router.push(`/checkouts/${id}`);
+backUrl={`/checkouts/${id}`}
+
+// ✅ SSOT 경유 — 컴파일 타임 보호
+<Link href={FRONTEND_ROUTES.EQUIPMENT.LIST}>목록</Link>
+router.push(FRONTEND_ROUTES.CHECKOUTS.DETAIL(id));
+backUrl={FRONTEND_ROUTES.CHECKOUTS.DETAIL(id)}
+```
+
+**배경:** `EquipmentStickyHeader.tsx`의 `href="/equipment"`, `CreateCalibrationPlanContent.tsx`의 `href="/calibration-plans"` (2곳), `NonConformanceManagementClient.tsx`의 직접 경로 4곳이 verify-hardcoding 검증에서 FAIL로 발견됨 (2026-04-27). `ConditionCheckClient.tsx`의 `router.push('/checkouts/${id}')` 4곳도 동일 패턴으로 발견됨 (2026-04-29).
+
+**예외:**
+- `href="/"` (홈 루트), `href="/login"`, `href="/handover"` — 단일 depth 또는 인증 전용 경로는 `FRONTEND_ROUTES` 미등록 허용.
+- 동적 빌더 함수 (`FRONTEND_ROUTES.EQUIPMENT.DETAIL(id)`) 결과 인라인 저장 후 전달 — 허용.
+
+### Step 30: 외부 브랜드 자산 `lib/brand-assets/` 모듈 분리 강제 (2026-04-28 추가)
+
+Microsoft, Google, Naver 등 외부 회사의 브랜드 자산(로고 SVG 등)은 반드시 `apps/frontend/lib/brand-assets/` 디렉토리에 독립 파일로 분리해야 한다. 컴포넌트 내부에 인라인 SVG로 직접 삽입하면 (1) 라이선스 코멘트 누락 (2) ESLint HEX_COLOR_RULE이 외부 브랜드 hex 컬러를 잘못 차단 (3) 브랜드 가이드라인 준수 여부 추적 불가.
+
+**규칙:**
+- 외부 브랜드 로고/아이콘 SVG는 `apps/frontend/lib/brand-assets/<vendor>-logo.tsx` 형태로 분리
+- 파일 상단에 공식 브랜드 라이선스 참조 주석 필수 (`// 참조: https://...`)
+- `apps/frontend/eslint.config.mjs`의 HEX_COLOR_RULE ignores에 `**/lib/brand-assets/**` 등록
+- 컴포넌트는 분리된 파일에서 import해서 사용
+
+**탐지 — 컴포넌트 내 외부 브랜드 SVG 인라인 삽입:**
+```bash
+# SVG viewBox + 외부 브랜드 hex 컬러 조합이 있는 컴포넌트 파일 탐지
+# brand-assets 디렉토리 제외
+grep -rn "viewBox.*fill.*#[0-9a-fA-F]\|fill=\"#[0-9a-fA-F]" \
+  apps/frontend/components/ \
+  --include="*.tsx" \
+  | grep -v "lib/brand-assets\|node_modules\|// "
+
+# brand-assets 외 위치의 외부 브랜드 로고 패턴
+grep -rn "MicrosoftLogo\|GoogleLogo\|NaverLogo" \
+  apps/frontend/components/ \
+  --include="*.tsx" \
+  | grep -v "import\|node_modules"
+# 기대: import 라인만 (컴포넌트 정의는 lib/brand-assets 내부)
+```
+
+**PASS:** 컴포넌트 파일에 외부 브랜드 hex 컬러가 직접 사용된 SVG 0건.
+**FAIL:** 컴포넌트 내 `fill="#f25022"` 등 외부 브랜드 hex → `lib/brand-assets/` 분리 필요.
+
+**올바른 패턴:**
+```typescript
+// ✅ lib/brand-assets/microsoft-logo.tsx — 분리된 파일
+/**
+ * Microsoft 4-square logo (Official brand asset)
+ * 참조: https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general
+ */
+export function MicrosoftLogo({ className }: MicrosoftLogoProps) {
+  return <svg ... fill="#f25022" ... />; // 브랜드 hex 허용 (ESLint ignores 등록됨)
+}
+
+// ✅ AzureAdButton.tsx — 컴포넌트에서 import
+import { MicrosoftLogo } from '@/lib/brand-assets/microsoft-logo';
+<MicrosoftLogo className="size-4" />
+
+// ❌ AzureAdButton.tsx 인라인 — 라이선스 누락 + ESLint 충돌
+<svg viewBox="0 0 21 21" fill="#f25022">...</svg>
+```
+
+**예외:**
+- `apps/frontend/lib/brand-assets/` 내부 파일 — SSOT 정의 위치이므로 제외
+- 프로젝트 자체 디자인 아이콘 (도메인 UI 아이콘) — 외부 브랜드 아닌 경우
+
+**관련 파일:**
+- `apps/frontend/lib/brand-assets/microsoft-logo.tsx` — 모범 사례 (2026-04-28)
+- `apps/frontend/components/auth/AzureAdButton.tsx` — 소비처 (import 패턴)
+- `apps/frontend/eslint.config.mjs` — `**/lib/brand-assets/**` HEX_COLOR_RULE ignores 등록
+
+**발생 이력 (2026-04-28)**: `AzureAdButton.tsx` 내 Microsoft 4-square 로고 SVG를 `lib/brand-assets/microsoft-logo.tsx`로 분리. ESLint HEX_COLOR_RULE이 외부 브랜드 컬러를 차단하는 문제 해결 + 라이선스 주석 추가.
+
+---
+
+### Step 29: 백엔드 시간 윈도우 상수 `shared-constants` SSOT 승격 요구 (2026-04-27 추가)
+
+서비스 메서드 내부에서만 사용되는 시간 윈도우 상수(`*_WINDOW_MS`, `*_TTL_MS` 등)가
+`packages/shared-constants/src/business-rules.ts`에 이관되지 않고 로컬 `const`로 선언된 경우를 탐지.
+이 패턴은 동일 제약 조건이 여러 곳에서 재정의될 때 drift를 막지 못한다.
+
+**현재 알려진 tech-debt 항목:**
+- ✅ 2026-04-27 완료: `checkouts.service.ts` 로컬 `const REVOCATION_WINDOW_MS = 300_000` → `APPROVAL_REVOCATION_WINDOW_MS` SSOT 승격 (`packages/shared-constants/src/business-rules.ts`)
+- ✅ 2026-04-28 완료: `checkouts.service.ts:3209` 에러 메시지 `'within 5 minutes'` 하드코딩 → `` `within ${APPROVAL_REVOCATION_WINDOW_MS / 60_000} minutes` `` 동적 계산. 상수 변경 시 메시지 자동 동기화.
+
+```bash
+# 백엔드 서비스 내 시간 윈도우/TTL 로컬 상수 탐지
+grep -rn "const [A-Z_]*WINDOW_MS\|const [A-Z_]*TTL_MS\|const [A-Z_]*TIMEOUT_MS" \
+  apps/backend/src/modules --include="*.service.ts" \
+  | grep -v "//\|test\|spec"
+# 결과: 기대 0건 (shared-constants로 승격 완료) — 2026-04-28 기준 0건 확인
+
+# shared-constants 파일에 대응 상수 존재 확인
+grep -n "REVOCATION_WINDOW_MS\|APPROVAL_REVOCATION_WINDOW" \
+  packages/shared-constants/src/business-rules.ts
+# 결과: 1건 (APPROVAL_REVOCATION_WINDOW_MS = 300_000 정의)
+
+# 에러 메시지 등에 시간 값 문자열 하드코딩 탐지 (2026-04-28 추가)
+grep -rn "'within [0-9]\+ minute\|'[0-9]\+ minute\|\"[0-9]\+ minute" \
+  apps/backend/src/modules --include="*.ts" \
+  | grep -v "//\|test\|spec"
+# 결과: 기대 0건 — template literal로 상수에서 동적 계산해야 함
+```
+
+**올바른 패턴:**
+```typescript
+// ✅ CORRECT — shared-constants SSOT + 동적 계산 메시지
+import { APPROVAL_REVOCATION_WINDOW_MS } from '@equipment-management/shared-constants';
+
+if (Date.now() - approvedAt.getTime() > APPROVAL_REVOCATION_WINDOW_MS) {
+  throw new ForbiddenException({
+    message: `Approval can only be revoked within ${APPROVAL_REVOCATION_WINDOW_MS / 60_000} minutes of approval`,
+  });
+}
+
+// ❌ WRONG — 로컬 상수 (서비스 내 하드코딩)
+const REVOCATION_WINDOW_MS = 300_000; // 승격 전 패턴
+
+// ❌ WRONG — 메시지 시간 값 하드코딩 (상수 변경 시 메시지 stale)
+message: 'Approval can only be revoked within 5 minutes of approval',
+```
+
+**PASS:** 서비스 내 `*_WINDOW_MS` 로컬 선언 0건 + 에러 메시지 시간 값 문자열 0건 (모두 SSOT 경유).
+**WARN:** 로컬 선언 존재 + tech-debt 등록 완료 시.
+**FAIL:** 로컬 선언 존재 + tech-debt 미등록 시.
+
+**관련 파일:**
+- `packages/shared-constants/src/business-rules.ts` — 비즈니스 규칙 상수 SSOT (APPROVAL_REVOCATION_WINDOW_MS = 300_000)
+- `apps/backend/src/modules/checkouts/checkouts.service.ts:3204-3209` — SSOT 경유 + 동적 메시지 패턴 모범 사례
+
+---
+
+## Exceptions
+
+1. **프론트엔드 UI 표시용 옵션 객체** — `SITE_OPTIONS` 등 레이블+값 쌍은 로컬 정의 허용
+2. **테스트 파일의 날짜 오프셋 계산** — E2E/단위 테스트 날짜 계산은 토큰 TTL과 무관
+3. **`shared-test-data.ts`의 `BACKEND` URL** — E2E 테스트용 URL SSOT
+4. **`Promise<unknown>` private 헬퍼** — 클래스 내부 전용은 면제
+5. **response DTO의 ApiResponse 재사용** — 응답 타입 정의에서 래핑 정상
+6. **`primitives.ts`의 JSDoc 주석** — easing SSOT 정의 문서 면제
+7. **`.limit(1)` 단일 레코드 조회** — 페이지네이션이 아닌 단건 조회 면제
+8. **백엔드 서비스 서버사이드 역할 레이블** — `audit.service.ts formatLogMessage()` 및 `reports.service.ts` 보고서 행 생성에서 `AuditLogUserRole` 특수값(`'system'`, `'unknown'`)에 대한 `'시스템'`, `'알 수 없음'` 한국어 레이블 직접 사용은 허용. 백엔드 텍스트 생성 전용이며 브라우저 i18n 시스템을 경유할 수 없음. `USER_ROLE_LABELS`가 커버하지 않는 특수값이므로 인라인 처리가 정상 설계.
+
+---
+
+### Step 30: Atom 내부 사이즈 클래스 토큰 경유 — `h-3 w-3` 등 raw Tailwind 사이즈 직접 사용 금지 (2026-04-28 추가, REVIEW_RESULT.md §4.1 후속)
+
+`components/ui/` 아래의 design-token 결합 atom(예: `inline-action-button.tsx`)이 내부에서 raw Tailwind 사이즈 클래스(`h-3 w-3` / `h-3.5 w-3.5` 등)를 직접 사용하면, 디자인 토큰 변경 시 atom이 자동으로 따라가지 않는다. 모든 사이즈는 해당 토큰 그룹의 필드(예: `SURFACE_INLINE_ACTION_TOKENS.iconSize`)를 경유해야 한다.
+
+```bash
+# atom 내부 raw 사이즈 클래스 탐지 (FAIL 패턴)
+grep -nE 'className.*"h-[0-9]|w-[0-9]' \
+  apps/frontend/components/ui/inline-action-button.tsx
+# 기대: 모든 매치가 토큰 변수(SURFACE_INLINE_ACTION_TOKENS.*) 합성 결과여야 함
+
+# 토큰 정의 확인
+grep -n "iconSize" apps/frontend/lib/design-tokens/semantic.ts
+# 기대: 1건 이상 (atom이 의존하는 토큰)
+```
+
+**PASS:**
+- atom의 모든 사이즈 클래스가 토큰 그룹 필드 경유 (`SURFACE_INLINE_ACTION_TOKENS.iconSize`)
+- raw `h-N w-N` className 직접 합성 0건
+
+**FAIL:**
+- atom 내부 `<Loader2 className="h-3.5 w-3.5"/>` 같은 raw 사이즈 — 토큰 변경 시 회귀 위험
+
+**관련 파일:**
+- `apps/frontend/components/ui/inline-action-button.tsx`
+- `apps/frontend/lib/design-tokens/semantic.ts` — `SURFACE_INLINE_ACTION_TOKENS.iconSize`
+
+**발생 이력 (2026-04-28)**: Phase 3 P0-3에서 NextStepPanel floating/inline의 Loader2 `h-3.5 w-3.5` 토큰 미경유 잔존 — review-architecture FAIL-3로 검출 후 atom 통합으로 해소.
+
+---
+
+### Step 31: checkouts KPI 영역 raw `grid-cols-N` / `col-span-N` 직접 사용 금지 (2026-04-28 추가, REVIEW_RESULT.md §P1-1; 2026-07-14 대상 재정렬)
+
+반출 KPI 영역(`apps/frontend/components/checkouts/OutboundStatsGrid.tsx` — KPI grid 유일한 live 렌더 사이트)에서 grid 컬럼 클래스(`grid-cols-N`)와 hero 카드 cell 점유(`col-span-N`)를 raw className으로 합성하는 것을 금지. 모든 호출은 `getStatsGridClass(hasHero)` + `CHECKOUT_STATS_VARIANTS.hero.containerInGrid` 토큰 경유.
+
+**왜 raw 합성이 위험한가**:
+- grid를 `grid-cols-4 sm:grid-cols-6 lg:grid-cols-6`로 직접 박으면 P1-1 grid 정책 변경 시 이 파일을 놓치기 쉽고, 향후 로딩 스켈레톤이 재도입될 경우 host ↔ skeleton 비동기로 CLS(Cumulative Layout Shift) 회귀 재발 여지가 있다.
+- hero col-span을 `col-span-2`로 직접 박으면 향후 `lg:col-span-3` 같은 breakpoint 정책 변경 시 모든 호출처를 추적해야 함.
+
+```bash
+# checkouts KPI 영역 raw grid/col-span 잔존 (FAIL 패턴)
+grep -nE '\b(col-span|grid-cols)-\d' \
+  apps/frontend/components/checkouts/OutboundStatsGrid.tsx
+# 기대: 0 hits
+
+# 토큰 경유 정상 패턴 확인
+grep -n "getStatsGridClass\|containerInGrid" \
+  apps/frontend/components/checkouts/OutboundStatsGrid.tsx
+# 기대: 1건 이상 (grid 토큰 + hero containerInGrid 호출)
+```
+
+**PASS:**
+- `OutboundStatsGrid.tsx`에서 raw `grid-cols-N` / `col-span-N` 0건
+- `getStatsGridClass(hasHero)` 및 `CHECKOUT_STATS_VARIANTS.hero.containerInGrid` 호출 확인
+
+**FAIL:**
+- raw `grid-cols-4 sm:grid-cols-6 lg:grid-cols-6` 또는 `col-span-2` 잔존 → P1-1 변경 시 회귀 위험
+
+**예외:**
+- 토큰 정의 파일 자체(`apps/frontend/lib/design-tokens/components/checkout.ts`)는 grid 클래스 string 정의 — 검증 대상 외.
+
+**관련 파일:**
+- `apps/frontend/lib/design-tokens/components/checkout.ts` — `CHECKOUT_STATS_GRID_TOKENS`, `getStatsGridClass`, `CHECKOUT_STATS_VARIANTS.hero.containerInGrid` 정의
+- `apps/frontend/components/checkouts/OutboundStatsGrid.tsx` — KPI grid 렌더 (host, line 122/140/142/147)
+
+**발생 이력 (2026-04-28)**: Phase 4 P1-1 진입 시 host에 `grid-cols-4 sm:grid-cols-6 lg:grid-cols-6` raw + `col-span-2` raw 잔존 — Phase 4.B/4.C 토큰 마이그레이션으로 해소.
+
+**대상 재정렬 이력 (2026-07-14)**: KPI grid 렌더가 `OutboundCheckoutsTab.tsx` → `OutboundStatsGrid.tsx`로 이동(Phase 4 후속)했고 `HeroKPISkeleton.tsx`는 production 소비처 0건으로 삭제됨. 게이트가 옛 host + 삭제된 skeleton을 가리키던 stale 상태를 실제 생존 렌더 파일로 재정렬.
+
+---
+
+### Step 32: analytics track() 호출 시 PII 키 직접 전달 금지 (2026-04-30 추가)
+
+`track()` 호출부의 props 객체에 `userId`, `email`, `firstName`, `lastName`, `displayName`, `fullName`, `사번`, `employeeId` 키를 직접 전달하는 것을 금지. 식별자 대신 익명화된 카운터/분류값만 허용.
+
+**왜 중요한가**: `track.ts`는 dev 환경에서 PII 키 포함 시 `throw`하여 즉시 알리고, prod에서는 silent drop한다. 그러나 호출부가 PII를 props에 포함한 채 머지되면 analytics 이벤트가 무음으로 사라져 데이터 누락 버그가 된다. 정적 탐지로 호출부 자체를 차단해야 한다.
+
+**올바른 패턴**:
+```typescript
+// ✅ CORRECT — 익명화된 카운터/분류값
+track('checkout.approve', { count: 1, purposeCategory: 'calibration' });
+track('sidebar.toggle', { state: 'collapsed' });
+
+// ❌ WRONG — PII 키 직접 전달
+track('checkout.approve', { userId: currentUser.id, count: 1 });
+track('user.signin', { email: user.email });
+track('profile.view', { firstName: user.name });
+```
+
+**검증 명령어**:
+```bash
+# track() 호출부에서 PII 키 props 탐지
+grep -rn "track(.*{" apps/frontend/ \
+  --include="*.ts" --include="*.tsx" \
+  | grep -v "node_modules\|lib/analytics/track.ts\|__tests__" \
+  | grep -E "userId|email|firstName|lastName|displayName|fullName|사번|employeeId"
+# 기대: 0건
+
+# PII deny-list 자체가 track.ts에 정의되어 있는지 확인
+grep -n "PII_DENY_KEYS" apps/frontend/lib/analytics/track.ts
+# 기대: 1건 이상 (deny-list 배열 + violatesPII 함수)
+
+# 이벤트명 매직 스트링 금지 — `ANALYTICS_EVENTS` 레지스트리 경유 강제
+grep -rn "track('[a-z]" apps/frontend/ \
+  --include="*.ts" --include="*.tsx" \
+  | grep -v "node_modules\|lib/analytics/\|__tests__"
+# 기대: 0건 (모든 호출은 `track(ANALYTICS_EVENTS.X, ...)` 형태)
+
+grep -n "ANALYTICS_EVENTS\b" apps/frontend/lib/analytics/events.ts
+# 기대: ≥1 hit (레지스트리 export 존재)
+```
+
+**PASS**: `track()` 호출부 전체에 PII 키 0건, `PII_DENY_KEYS` 배열 track.ts 내 존재
+**FAIL**: `userId`, `email` 등 PII 키 발견 → 카운터/분류값으로 교체 (`{ count: 1 }` 등)
+
+**관련 파일**:
+- `apps/frontend/lib/analytics/track.ts` — `PII_DENY_KEYS` 배열 + `violatesPII()` 런타임 검증
+- `apps/frontend/lib/analytics/events.ts` — 이벤트명 SSOT (`ANALYTICS_EVENTS` 레지스트리)
+- `apps/frontend/lib/analytics/__tests__/track.test.ts` — PII throw/drop 동작 회귀 테스트
+
+**'role' 정책 (2026-04-30 명문화)**: `'role'`(admin/lab_manager/test_engineer 등) 카테고리는 `PII_DENY_KEYS`에 포함되지 않음 — 사람을 직접 식별하지 않고 권한 분포 분석에 유효. 단, 다음 가드레일 적용:
+- ✅ 단독 props로 발행 가능: `track('checkout.approve', { role: 'lab_manager', count: 1 })`
+- ❌ 다른 식별 단서와 결합 금지: `{ role: 'lab_manager', teamId: 'X', timestamp: 'Y' }` 처럼 추론 가능한 결합은 PII와 동등 위험
+- ❌ 소수 인원 역할(예: system_admin) 단독 발행 금지 — k-anonymity 위반(역할 보유자 1명이면 즉시 식별)
+- 새 호출처에서 role을 사용하면 코드 리뷰에서 카테고리화 가능 여부 확인
+
+**발생 이력 (2026-04-30 신설)**: track() 신설 시 PII deny-list에 `'name'`을 포함했다가 컴포넌트명·설정명에도 흔히 쓰이는 키라 false-positive 발견. `firstName/lastName/displayName/fullName`으로 교체. 이 교체 이력이 "사람을 직접 식별하는 구체적 키만 등록" 원칙의 근거.
+
+---
+
+### Step 33: Frontend `useOptimisticMutation` `invalidateKeys` 인라인 배열 → SSOT 강제 (2026-05-02 추가, 2026-05-09 함수형 패턴 승격)
+
+`useOptimisticMutation` 호출 시 `invalidateKeys` 인자로 queryKey 배열을 인라인으로 작성하는 것을 금지한다. 키 조합의 성격에 따라 두 가지 SSOT 패턴 중 하나를 사용해야 한다:
+
+**패턴 A — 정적 키 (파라미터 불필요)**: `*CacheInvalidation` 클래스 static 상수 → `cache-invalidation.ts`에 정의.
+**패턴 B — 파라미터 의존 키 (런타임 인자 필요)**: `getXxxInvalidationKeys(param)` 순수 함수 → `lib/api/<domain>-invalidation.ts` 파일에 정의.
+
+**왜 중요한가**: approve/reject 뮤테이션에서 같은 도메인의 키 배열을 두 곳에 인라인으로 복사하면 한쪽만 수정될 때 무효화 범위 불일치 버그 발생. 클래스 또는 함수 SSOT가 단일 수정 지점을 보장한다.
+
+**패턴 선택 기준**: `activeTab`처럼 호출 시점에만 결정되는 인자가 invalidation 키에 영향을 미치면 → 함수형 패턴 B. 모든 뮤테이션에서 동일한 키 집합을 공유하면 → 클래스형 패턴 A.
+
+**적용 범위**: 신규 도메인의 approve/reject 뮤테이션 쌍이 동일한 3개 이상의 queryKey를 포함할 때.
+
+```bash
+# 동일 파일에서 approve/reject 두 뮤테이션이 인라인 배열을 별도로 작성한 DRY 위반 탐지
+# (3개 이상 queryKeys를 포함하면서 CacheInvalidation 클래스 또는 getXxx 헬퍼 미경유)
+grep -rn "invalidateKeys: \[queryKeys\." apps/frontend --include="*.tsx" --include="*.ts" \
+  | grep -v "node_modules\|cache-invalidation.ts\|CacheInvalidation\.\|getApprovalsInvalidationKeys"
+# DRY 위반 후보: 이 목록에서 같은 파일에 2건 이상 나타나면 SSOT 승격 권고
+
+# 파라미터 의존 함수형 헬퍼 등록 현황 확인
+grep -rn "^export function get.*InvalidationKeys" apps/frontend/lib/api --include="*.ts"
+# 각 함수가 lib/api/<domain>-invalidation.ts에 정의되어 있어야 함
+```
+
+**올바른 패턴 A — 정적 클래스**:
+```typescript
+// apps/frontend/lib/api/cache-invalidation.ts
+export class EquipmentImportCacheInvalidation {
+  static readonly APPROVE_KEYS: ReadonlyArray<readonly unknown[]> = [
+    queryKeys.equipmentImports.all,
+    queryKeys.approvals.countsAll,
+    queryKeys.notifications.all,
+  ];
+}
+
+// 사용처
+useOptimisticMutation({ invalidateKeys: EquipmentImportCacheInvalidation.APPROVE_KEYS })
+```
+
+**올바른 패턴 B — 함수형 (파라미터 의존, 2026-05-09 정식 승격)**:
+```typescript
+// apps/frontend/lib/api/approvals-invalidation.ts
+export function getApprovalsInvalidationKeys(activeTab: ApprovalCategory) {
+  return [
+    queryKeys.approvals.countsAll,
+    queryKeys.approvals.kpi(activeTab),      // ← activeTab에 따라 달라짐
+    ...CheckoutCacheInvalidation.APPROVAL_KEYS,
+    queryKeys.equipment.all,
+  ] as const;
+}
+
+// 사용처 (두 훅이 동일 함수를 참조 → DRY 보장)
+useOptimisticMutation({ invalidateKeys: getApprovalsInvalidationKeys(activeTab) })
+```
+
+**SHOULD (신규 도메인)**: 같은 파일에 approve/reject 두 뮤테이션이 3개 이상 동일 queryKey를 가진 인라인 배열을 중복 작성하면 SSOT 승격 권고.
+**레거시 예외**: single-key inline(`[queryKeys.foo.lists()]`), local variable 위임(`crossInvalidateKeys`/`commonInvalidateKeys`)는 기존 패턴 유지 허용.
+
+**관련 파일**:
+- `apps/frontend/lib/api/cache-invalidation.ts` — `*CacheInvalidation` 클래스 SSOT 정의처 (패턴 A)
+- `apps/frontend/lib/api/approvals-invalidation.ts` — `getApprovalsInvalidationKeys` 함수 SSOT (패턴 B 정식 예시)
+- `apps/frontend/hooks/use-optimistic-mutation.ts` — `invalidateKeys: ReadonlyArray<readonly unknown[]>` 파라미터 타입
+
+### Step 34: Quality audit route SSOT — Lighthouse/a11y route literal 금지 (2026-05-03 추가)
+
+Lighthouse와 공개 a11y 감사 대상 라우트는 `docs/operations/quality-audit-routes.json`에서만 선언한다.
+workflow, `.lighthouserc.js`, Playwright spec, 운영 문서는 registry를 읽거나 registry를 참조해야 하며 `/login` 같은 라우트 문자열을 중복 선언하지 않는다.
+
+```bash
+# registry 외부에 audit route literal이 있으면 FAIL
+grep -rn "\"/login\"\\|'/login'\\|http://localhost:3000/login" \
+  .lighthouserc.js \
+  .github/workflows/accessibility-audit.yml \
+  .github/workflows/performance-audit.yml \
+  apps/frontend/tests/e2e/a11y/login.a11y.spec.ts \
+  docs/operations/performance-budgets.md
+# 기대: 0건
+
+# 주요 소비자가 registry를 경유하는지 확인
+grep -n "quality-audit-routes.json" .lighthouserc.js
+grep -n "quality-audit-routes.json" .github/workflows/accessibility-audit.yml
+grep -n "quality-audit-routes.json" apps/frontend/tests/e2e/shared/utils/quality-audit-routes.ts
+grep -n "quality-audit-routes.json" docs/operations/performance-budgets.md
+```
+
+**PASS:** audit route literal은 `docs/operations/quality-audit-routes.json`에만 존재.
+**FAIL:** workflow/config/spec/doc에 동일 route literal이 복제됨 → registry loader 또는 registry 참조로 교체.
+
+### Step 35: Data migration preview window size SSOT (2026-05-03 추가)
+
+Excel preview는 업로드 결과 전체 행이 클라이언트에 존재하므로 table body가 전체 `sheet.rows`를 렌더링하면 대용량 파일에서 DOM 비용이 폭증한다.
+렌더링 window 크기는 `apps/frontend/lib/config/data-migration-preview.ts`의 `DATA_MIGRATION_PREVIEW_PAGE_SIZE`만 경유해야 하며, `PreviewStep.tsx`에 숫자 리터럴을 직접 두지 않는다.
+
+```bash
+# SSOT 상수 존재
+grep -n "DATA_MIGRATION_PREVIEW_PAGE_SIZE" apps/frontend/lib/config/data-migration-preview.ts
+
+# PreviewStep은 SSOT를 import해서 사용해야 함
+grep -n "DATA_MIGRATION_PREVIEW_PAGE_SIZE" apps/frontend/components/data-migration/PreviewStep.tsx
+
+# table body에서 전체 sheet.rows 렌더링 금지
+grep -n "sheet\\.rows\\.map" apps/frontend/components/data-migration/PreviewStep.tsx
+# 기대: 0건
+```
+
+**PASS:** preview table body는 `visibleRows.map()` 등 bounded window만 렌더링하고, window size는 SSOT 상수 경유.
+**FAIL:** `sheet.rows.map()` 전체 렌더링 또는 `100` 같은 window size 리터럴이 컴포넌트에 직접 존재.
+
+---
+
+### Step 36: CSS custom property name string literal 회귀 차단 — `CSS_VAR_NAMES` SSOT 강제 (2026-05-10 추가)
+
+**배경**: `--sticky-header-height` / `--callout-hero-shadow` 같은 CSS custom property 이름이 producer
+(`element.style.setProperty(name, value)`) 와 consumer (`var(name)` / `getComputedStyle().getPropertyValue(name)` /
+inline style key) 양쪽에 string literal 로 분산 박히면, 1글자 오타가 silent 0/undefined 회귀를 유발한다.
+2026-05-10 sprint `sticky-header-css-var-ssot` 에서 `apps/frontend/lib/design-tokens/css-variables.ts` 에
+`CSS_VAR_NAMES` SSOT (+ `cssVar()` helper) 를 신설하고, 모든 runtime 호출자가 SSOT 를 경유하도록 마이그레이션했다.
+
+**Tailwind v4 JIT 정합 (해법 B 채택)**: Tailwind v4.2 의 정적 분석은 `top-[var(--sticky-header-height,0px)]`
+string literal 은 추출하지만, `` `top-[${cssVar(...)}]` `` template literal interpolation 은 추출하지 못한다 (값이 런타임 결정).
+→ **design-token 파일** (`lib/design-tokens/components/*.ts`, `lib/design-tokens/semantic.ts`) 의 Tailwind class
+문자열은 SSOT 를 import 하지 않고 string literal 을 유지하며, 위치마다 `// SSOT: CSS_VAR_NAMES.{key}` 주석으로
+참조를 명시한다 (회귀 차단은 본 Step 화이트리스트로 처리).
+
+**화이트리스트** (`'--name'` 또는 `var(--name)` literal 허용):
+- `apps/frontend/lib/design-tokens/css-variables.ts` (SSOT 정의 자체)
+- `apps/frontend/lib/design-tokens/components/*.ts` (Tailwind JIT 정적 분석 요구)
+- `apps/frontend/lib/design-tokens/semantic.ts` (Tailwind JIT 정적 분석 요구)
+
+```bash
+# (A) String literal '--name' 사용은 화이트리스트 외 0 (production + e2e)
+grep -rEn "['\"]--[a-z][a-z0-9-]*['\"]" \
+  apps/frontend --include='*.ts' --include='*.tsx' \
+  --exclude-dir=.next --exclude-dir=node_modules \
+  | grep -v "lib/design-tokens/css-variables.ts" \
+  | grep -v "lib/design-tokens/components/" \
+  | grep -v "lib/design-tokens/semantic.ts" \
+  | grep -v "process.argv.includes('--" \
+  | grep -v "^[[:space:]]*\*\|^[[:space:]]*//"
+# 기대: 0 hit. 새 CSS variable 등장 시 css-variables.ts 에 entry 추가하고 SSOT 경유.
+
+# (B) `CSS_VAR_NAMES` 에 등록된 variable name 의 var() Tailwind / CSS literal 사용은 design-token 디렉토리 내부 한정
+#     (외부 SSOT — Radix UI 자체 var, --brand-* palette, --touch-target-min 같은 globals.css :root 정의는 검사 대상 외)
+# SSOT 변수명 추출: `CSS_VAR_NAMES = { ... } as const satisfies` 객체 본체 안의 entry value 만 (JSDoc 예시 제외)
+SSOT_VARS=$(awk '/CSS_VAR_NAMES = \{/,/\} as const/' apps/frontend/lib/design-tokens/css-variables.ts \
+  | grep -oE ": '--[a-z][a-z0-9-]*'" | tr -d ": '" | paste -sd'|' -)
+grep -rEn "var\((${SSOT_VARS})[,)]" \
+  apps/frontend --include='*.ts' --include='*.tsx' \
+  --exclude-dir=.next --exclude-dir=node_modules \
+  | grep -v "lib/design-tokens/" \
+  | grep -vE "^[^:]+:[0-9]+:[[:space:]]*\*|^[^:]+:[0-9]+:[[:space:]]*//"
+# 기대: 0 hit. CSS_VAR_NAMES 등록 변수는 design-token 외부에서 var() literal 사용 금지 (해법 B 위반).
+# 신규 외부 CSS variable 은 본 SSOT 등록 후 동일 룰 적용.
+
+# (C) SSOT 정의 존재
+grep -c "CSS_VAR_NAMES" apps/frontend/lib/design-tokens/css-variables.ts
+grep -c "as const satisfies Record<string, " apps/frontend/lib/design-tokens/css-variables.ts
+# 기대: 모두 ≥ 1.
+
+# (D) barrel export (단일 진입점)
+grep -c "CSS_VAR_NAMES" apps/frontend/lib/design-tokens/index.ts
+grep -c "cssVar" apps/frontend/lib/design-tokens/index.ts
+# 기대: 모두 ≥ 1.
+```
+
+**PASS:**
+- 화이트리스트 외 production / e2e 코드에서 `'--foo'` 또는 `var(--foo)` literal 0 hit
+- `CSS_VAR_NAMES` 가 `as const satisfies Record<string, '--${string}'>` 로 정의되어 `--`-prefix 컴파일타임 강제
+- runtime 호출자(setProperty / removeProperty / getPropertyValue / inline style key)는 모두 `CSS_VAR_NAMES.<key>` 참조
+- design-token 파일은 string literal 유지하되 `// SSOT: CSS_VAR_NAMES.<key>` 주석으로 참조 명시
+
+**FAIL:**
+- 컴포넌트/훅/api/lib 코드에서 `'--sticky-header-height'` 같은 raw string literal 발견
+- design-token 디렉토리 외부에서 `var(--foo)` Tailwind class 사용
+- `cssVar()` helper 우회한 `as string` 타입 cast (예: `['--foo' as string]: ...`)
+
+**예외 인정**:
+- `process.argv.includes('--fix')` 같은 CLI flag 인자 (CSS var 아님)
+- locale message JSON 파일 안의 색상 토큰 명세 등 — `messages/**/*.json` 은 검사 대상 외
+- 주석/JSDoc 안의 변수명 reference — grep 패턴에서 `^[[:space:]]*\*` / `//` 시작 라인 제외
+
+**신규 CSS variable 추가 절차**:
+1. `apps/frontend/lib/design-tokens/css-variables.ts` `CSS_VAR_NAMES` 에 `camelCaseKey: '--kebab-name'` entry 추가
+2. `apps/frontend/styles/globals.css` `:root` (또는 `:root.dark`) 에 동일 이름 정의
+
+---
+
+## Step 37: Locale Safety — `toLocaleDateString` / `toLocaleTimeString` 호출자 locale 인자 강제
+
+> 도입: 2026-05-12 qr-visual-redesign-followups-g4-g12 sprint G-11 closure. 브라우저 locale 의존성 회귀 차단.
+
+**검증 명령**:
+```bash
+# locale-less 호출 0건 (RepairHistoryTimeline.tsx 의 의도적 ko-KR 하드코딩 allow-list)
+rg -nE "toLocaleDateString\(\)|toLocaleTimeString\(\)|\.toLocaleString\(\)" apps/frontend/components apps/frontend/app \
+  | grep -v "RepairHistoryTimeline.tsx"
+# EXIT: 결과 0 라인 expected (라운드 #3 2026-05-13 — toLocaleString(숫자 포맷) 포함)
+```
+
+**PASS:**
+- 모든 `'use client'` 컴포넌트에서 `useLocale()` 또는 `useFormatter()` (next-intl) 경유 후 `toLocaleDateString(locale)` 인자 전달
+- 서버 컴포넌트는 `getLocale()` (next-intl/server) 사용
+
+**FAIL:**
+- `new Date(x).toLocaleDateString()` (locale-less)
+- `someDate.toLocaleTimeString()` (locale-less)
+
+**예외 인정** (allow-list):
+- `RepairHistoryTimeline.tsx` — `'ko-KR'` 하드코딩 (별도 후속 sprint trigger)
+- 숫자 포맷 `.toLocaleString()` — 라운드 #3 2026-05-13 sprint 부터 본 Step 검증 범위 포함 (locale 인자 강제). 14 site 마이그레이션 완료 (AuditSummaryBar / EquipmentPagination / Monitoring / AuditLogsContent).
+
+**Why**: 한국 사용자가 브라우저 locale 을 `en-US` 로 설정 시 날짜 포맷이 `M/D/YYYY` 로 노출되어 UX 깨짐. `useLocale()` 의 명시 locale 전달로 i18n 정합성 보장.
+
+**How to apply**: 새 컴포넌트에서 날짜 표시 시:
+```typescript
+'use client';
+import { useLocale } from 'next-intl';
+
+export function MyComponent({ date }: { date: string }) {
+  const locale = useLocale();
+  return <span>{new Date(date).toLocaleDateString(locale)}</span>;
+}
+```
+
+---
+
+## Step 39: FRONTEND_ROUTES.HELP.TOPIC() SSOT 강제 — `/help#` 인라인 href 금지 (2026-05-13 추가)
+
+`/help` 앵커 URL은 반드시 `FRONTEND_ROUTES.HELP.TOPIC(topicKey: HelpTopicKey)` SSOT 빌더를 경유해야 한다.
+`href="/help#checkout"` 같은 인라인 리터럴은 TypeScript 타입 시스템이 잡지 못한다 (`href: string`이 허용).
+새 토픽 키 추가/변경 시 인라인 호출자가 drift되는 것을 방지한다.
+
+**검증 명령**:
+```bash
+# /help# 인라인 href 리터럴 — FRONTEND_ROUTES.HELP.TOPIC() 우회 금지
+grep -rn '"/help#\|'"'"'/help#' apps/frontend --include="*.tsx" --include="*.ts" \
+  | grep -v "FRONTEND_ROUTES" \
+  | grep -v "\.spec\.\|\.test\." \
+  | grep -v "^\s*//"
+# 0건이면 PASS. ≥1건이면 FRONTEND_ROUTES.HELP.TOPIC(topicKey) 로 교체.
+```
+
+**올바른 패턴**:
+```typescript
+// ✅ CORRECT — SSOT 빌더 경유
+href={FRONTEND_ROUTES.HELP.TOPIC('calibration')}
+href={FRONTEND_ROUTES.HELP.TOPIC(helpTopicKey)}
+```
+
+**금지 패턴**:
+```typescript
+// ❌ WRONG — 인라인 앵커 리터럴 (topic key 변경 시 drift)
+href="/help#calibration"
+href={`/help#${topicKey}`}  // template literal도 금지 — SSOT 빌더 경유
+```
+
+---
+
+## Step 38: useUndoToast invalidateKeys 팩토리 패턴 강제 (Warning, 2026-05-13)
+
+`useUndoToast` 호출 시 `invalidateKeys` 인라인 배열 구성 금지. `CheckoutCacheInvalidation` 클래스의 **팩토리 메서드**(`approvalWithDetailKeys(id)` / `returnApprovalWithDetailKeys(id)`)로만 제공해야 한다 (SSOT). 인라인 spread로 구성하면 `detail(id)` 추가 키 누락이나 APPROVAL_KEYS 드리프트를 컴파일타임에 잡지 못한다.
+
+**검증 명령**:
+```bash
+# 1) useUndoToast invalidateKeys 인라인 배열 전개 금지
+#    [queryKeys.checkouts.resource.detail(id), ...CheckoutCacheInvalidation.*] 패턴 0건
+grep -rn "invalidateKeys:" apps/frontend/app --include="*.tsx" \
+  | grep "CheckoutCacheInvalidation\." \
+  | grep -vE "approvalWithDetailKeys|returnApprovalWithDetailKeys|REVOCATION_KEYS"
+# 결과: 빈 출력 (PASS) — 인라인 spread 발견 시 FAIL
+
+# 2) 팩토리 메서드 SSOT 정의 존재
+grep -n "approvalWithDetailKeys\|returnApprovalWithDetailKeys" \
+  apps/frontend/lib/api/cache-invalidation.ts
+# 결과: ≥ 2줄 (정의 2건)
+
+# 3) CheckoutDetailClient 3 호출 모두 팩토리 경유
+grep -c "approvalWithDetailKeys\|returnApprovalWithDetailKeys" \
+  "apps/frontend/app/(dashboard)/checkouts/[id]/CheckoutDetailClient.tsx"
+# 결과: ≥ 3
+```
+
+**올바른 패턴**:
+```typescript
+// ✅ CORRECT — 팩토리 메서드 SSOT
+invalidateKeys: CheckoutCacheInvalidation.approvalWithDetailKeys(checkout.id),
+invalidateKeys: CheckoutCacheInvalidation.returnApprovalWithDetailKeys(checkout.id),
+```
+
+**금지 패턴**:
+```typescript
+// ❌ WRONG — 인라인 spread (키 드리프트 silent miss)
+invalidateKeys: [
+  queryKeys.checkouts.resource.detail(checkout.id),
+  ...CheckoutCacheInvalidation.APPROVAL_KEYS,
+],
+```
+
+**왜**: `useUndoToast`는 낙관적 업데이트 롤백 후 서버 데이터로 re-fetch할 키 목록. `detail(id)` + `APPROVAL_KEYS` 조합이 변경될 때 인라인 호출자를 모두 찾아 갱신해야 하는 유지보수 부담. 팩토리 메서드가 단일 진입점이 되면 키 집합 변경이 자동 전파된다.
+
+**REVOCATION_KEYS 예외**: `CheckoutCacheInvalidation.REVOCATION_KEYS`는 단독 사용(취소 승인 전용)이므로 `static readonly` 직접 참조가 SSOT 패턴. 팩토리 메서드 불필요.

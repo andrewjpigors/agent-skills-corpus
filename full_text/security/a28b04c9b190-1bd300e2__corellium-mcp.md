@@ -1,0 +1,711 @@
+---
+name: corellium-mcp
+description: Perform mobile penetration testing using Corellium virtual iOS/Android devices (corellium-mcp), device control with UI automation and Frida instrumentation (device-control-mcp), Parley active traffic interception proxy (parley-mcp), and forensic data analysis (analysis-mcp). Covers OWASP Mobile Top 10, MASVS-aligned testing, MATRIX automated assessments, active MITM with on-the-fly Python rewriting modules, filesystem data extraction, network interception, SSL pinning bypass, FRIDA dynamic analysis, accessibility tree dumping, ADB device control, findings ledger management, CoreTrace syscall tracing, and hypervisor hooks. Use when the user asks about mobile security testing, app pentesting, Corellium device management, traffic interception, or mobile vulnerability assessment.
+---
+
+# Corellium-MCP: Mobile Penetration Testing
+
+Four MCP servers working together — **Corellium-MCP** (72 tools) controls virtual iOS/Android devices with SSH shell access via paramiko, CoreTrace data retrieval, and automatic app data container discovery, **Device-Control-MCP** (31 tools) provides session management, coordinate-based UI automation (tap/swipe/type), Frida instrumentation (attach, spawn, script injection, accessibility tree dumps), ADB device control for Android (shell, pull, UI dump, intent fuzzing, logcat streaming), iOS bundle inspection, preference extraction with pattern scanning, and a findings ledger for progressive report building, **Parley-MCP** (23 tools) provides active MITM traffic interception with AI-authored Python rewriting modules, built-in HTTP request/scan/replay capabilities, automatic certificate generation, cookie jar management, and traffic export, and **Analysis-MCP** (22 tools) provides forensic decoding/parsing and encoding for mobile app data formats including keychain dumps, Akamai sensor data, plist encoding, screenshot metadata, and base64-to-file saving. The AI agent uses all four simultaneously for closed-loop automated penetration testing.
+
+For detailed filesystem paths, OWASP mappings, and technique deep-dives, see [pentest-reference.md](pentest-reference.md).
+
+## How They Work Together
+
+| Layer | Parley-MCP | Corellium-MCP | Device-Control-MCP | Analysis-MCP |
+|-------|-----------|---------------|-------------------|--------------|
+| **Network** | Active MITM — intercept, rewrite, search, scan, replay traffic; auto-cert CA for full TLS MITM; upstream proxy chaining | Passive PCAP download, Network Monitor with auto SSL bypass | Logcat streaming/grep for network-related log output (Android) | — |
+| **Application** | HTTP request/scan/replay tools; WebSocket detection; structured HTTP parsing | Sees app internals — filesystem, syscalls, crashes, panics | Frida attach/spawn/script injection; accessibility tree dumps (iOS); UI hierarchy dumps (Android); intent fuzzing with logcat watch; app state checks | — |
+| **Data** | Cookie jar management; HAR export for Burp/ZAP interop; pre-built security modules | Raw base64 file downloads; CoreTrace data retrieval with PID filtering | Bulk preference extraction with pattern scanning (`pull_nsuserdefaults`/`pull_shared_prefs`); iOS bundle inspection; ADB file pulls; artifact directory with evidence chain | Decode AND encode plists, cookies, JWTs, provisioning profiles, SQLite, AEP configs, keychain dumps, Akamai sensor data, screenshot metadata |
+| **Control** | Modify what the app **receives** from its backend; replay/scan endpoints directly | Modify what the app **contains** on the device | Pixel-precise tap/swipe/type; hardware button presses; human-tap fallback for CAPTCHAs; Frida method hooking and spawn-gating; findings ledger (add/list/export) | Parse, analyze, AND re-encode what the app **stores** (download → decode → modify → encode → upload) |
+
+Parley lets the AI **cause** things (tamper with traffic, send HTTP requests, scan endpoints, replay captured traffic). Corellium lets the AI **observe** and **extract** (how the app reacts internally, raw file downloads, CoreTrace syscall data). Device-Control-MCP lets the AI **interact** and **instrument** (tap through UI flows, run Frida scripts, dump accessibility trees, fuzz intents, stream logcat, and track findings). Analysis-MCP lets the AI **understand** and **re-encode** extracted data (decode proprietary formats, modify, and encode back for upload). Together: closed-loop automated testing.
+
+## Quick Start
+
+```
+# Corellium: Connect and provision device
+corellium_connect(api_endpoint="https://app.corellium.com/api", api_token="...")
+corellium_create_instance(project_id="...", flavor="iphone16pm", os_version="18.0", name="pentest")
+corellium_agent_ready(instance_id="...")
+corellium_create_snapshot(instance_id="...", name="clean-state")
+
+# Device-Control: Establish session (resolves serviceIp, creates artifact dirs, probes capabilities)
+session_set(instance_id="...", bundle_id="com.target.app", platform="ios", engagement="target-app-2025")
+
+# Parley: Stand up MITM proxy for the target backend
+web_proxy_setup(target_domain="api.targetapp.com", listen_port=8080)
+
+# Corellium: Install proxy CA cert, then install and run target app
+corellium_install_profile(instance_id="...", base64_profile="<parley-ca-cert>")
+corellium_upload_file(instance_id="...", device_path="/tmp/target.ipa", base64_content="...")
+corellium_install_app(instance_id="...", file_path="/tmp/target.ipa")
+corellium_run_app(instance_id="...", bundle_id="com.target.app")
+
+# Device-Control: Automate UI flows
+screenshot()                              # See current screen state
+tap(x=645, y=1400)                        # Tap login button (physical pixels)
+type_text(text="user@example.com")        # Type into focused field
+
+# Parley: Analyze intercepted traffic
+traffic_summary(instance_id="...")
+traffic_search(instance_id="...", pattern="password|token|Bearer|api_key")
+
+# Device-Control: Record findings as you go
+finding_add(severity="High", owasp="M9", title="JWT stored in plaintext NSUserDefaults",
+            evidence="decode_plist output showing auth_token key")
+findings_export()                          # Generate markdown report skeleton
+```
+
+## Pentesting Methodology
+
+### Phase 1: Reconnaissance & Setup
+
+**Goal**: Provision device, set up proxy, install target, baseline snapshot.
+
+```
+# Corellium: Device setup
+corellium_connect()
+corellium_list_models()
+corellium_get_model_software(model="...")
+corellium_create_instance(project_id="...", flavor="...", os_version="...", name="pentest-target")
+corellium_agent_ready(instance_id="...")    # WAIT — required before all agent ops
+corellium_create_snapshot(instance_id="...", name="pre-app-clean")
+
+# Device-Control: Establish session (CALL BEFORE any tap/screenshot/ssh/frida/ax_dump/ui_dump)
+session_set(instance_id="...", bundle_id="com.target.app", platform="ios", engagement="client-pentest")
+# Returns: serviceIp, artifact dirs, capabilities (agent, ssh, frida, adb availability)
+
+# Android only: connect ADB before other ADB tools
+adb_connect()    # adb connect + adb root + reconnect
+
+# Parley: Start proxy targeting the app's backend API
+web_proxy_setup(target_domain="api.targetapp.com", listen_port=8080)
+# OR for non-HTTP protocols:
+proxy_start(target_host="api.targetapp.com", target_port=443, use_tls_server=True, listen_port=8080)
+
+# Corellium: Install Parley's proxy CA cert on the device
+corellium_install_profile(instance_id="...", base64_profile="<parley-ca-cert>")
+```
+
+Upload and install the target app:
+
+```
+# iOS: upload IPA to /tmp/
+corellium_upload_file(instance_id="...", device_path="/tmp/target.ipa", base64_content="...")
+corellium_install_app(instance_id="...", file_path="/tmp/target.ipa")
+
+# Android: upload APK to /data/local/tmp/
+corellium_upload_file(instance_id="...", device_path="/data/local/tmp/target.apk", base64_content="...")
+corellium_install_app(instance_id="...", file_path="/data/local/tmp/target.apk")
+```
+
+Snapshot after install: `corellium_create_snapshot(instance_id="...", name="app-installed")`
+
+### Phase 1.5: Static Analysis of App Bundle (CRITICAL — do this BEFORE launching)
+
+**Goal**: Extract maximum intelligence from the app binary and config files before any dynamic analysis. This often produces high-severity findings with zero risk of detection.
+
+**iOS App Bundle — Fast Path** (Device-Control-MCP):
+
+```
+# One-call bundle inspection: Frameworks, Info.plist, mobileprovision, root listing, security flags
+inspect_ios_bundle()    # Auto-finds bundle by session bundle_id
+# Returns: info_plist, mobileprovision, frameworks list, flagged test frameworks,
+#          flagged bundle files, ATS analysis, jailbreak detection analysis, summary
+```
+
+`inspect_ios_bundle` does a single SSH round-trip and returns structured security analysis. Use this first, then drill into specific files with manual steps below for deeper analysis.
+
+**iOS App Bundle — Manual Deep Dive** (at `/private/var/containers/Bundle/Application/[UUID]/[AppName].app/`):
+
+```
+# Step 1: List installed apps and find the target
+corellium_list_apps(instance_id="...")
+# Or faster: get_app_state()  — returns installed/running/frontmost/paths for session bundle_id
+
+# Step 2: Browse the app bundle directory
+corellium_list_files(instance_id="...", path="/private/var/containers/Bundle/Application/")
+# Find the UUID, then:
+corellium_list_files(instance_id="...", path="/private/var/containers/Bundle/Application/[UUID]/[App].app/")
+
+# Step 3: Download and analyze key files (prioritize these)
+```
+
+| Priority | File / Pattern | What to Extract |
+|----------|---------------|-----------------|
+| **P0** | `Info.plist` | URL schemes, ATS config (`NSAppTransportSecurity`), permissions, bundle ID, `LSApplicationQueriesSchemes` (jailbreak detection) |
+| **P0** | `embedded.mobileprovision` | Entitlements (`get-task-allow`, keychain-access-groups), team ID, capabilities, associated domains, profile expiry |
+| **P0** | `Frameworks/` (directory listing) | Complete SDK/library inventory — reveals security stack |
+| **P0** | `GoogleService-Info.plist` | Firebase API keys, project ID, storage bucket, GCM sender ID — enables backend enumeration |
+| **P0** | `*.momd/` (Core Data model) | Database schema with entity names and attribute types — reveals sensitive field storage (e.g., credit card, password columns) before any data is written |
+| **P1** | `*.plist` (non-Info) | Host allowlists, environment configs, pre-prod endpoints |
+| **P1** | `*.json` | Service configs, feature flags, analytics endpoints, menu/product data with internal references |
+| **P1** | `env.txt` or similar | Internal environment names (dev/staging/prod) |
+| **P1** | `*.js` files | JavaScript bridges (native<->web API), test harnesses |
+| **P2** | `*.html` | Test pages, debug interfaces shipped in production |
+| **P2** | Main binary (strings) | Hardcoded URLs, API keys, debug strings |
+
+**Key analysis techniques:**
+
+1. **Framework inventory**: List `Frameworks/` to identify the full security stack:
+   - Certificate pinning libs (TrustKit, etc.) — primary bypass target
+   - Anti-fraud/bot detection (Akamai, ArkoseLabs, etc.)
+   - Behavioral biometrics (BioCatch, NuDetect, etc.)
+   - Testing frameworks in production (OHHTTPStubs, etc.) — **Critical finding**
+   - GraphQL clients (Apollo) — indicates GraphQL API surface
+   - Analytics suites — supply chain risk surface
+
+2. **JavaScript bridge analysis**: Many apps use WebView bridges for native<->web communication. Bridge files reveal the complete native API surface, URL schemes, auth mechanisms, and available commands.
+
+3. **Test artifact detection**: Look for test harnesses, stub libraries, commented-out debug functions, and cross-platform code leakage (e.g., Android paths in iOS builds).
+
+4. **Binary plist decoding**: Use `decode_plist(data_base64, keys_of_interest="token,password,key")` from Analysis-MCP. It handles both binary and XML plists and can highlight security-relevant keys.
+
+5. **Core Data model analysis**: The `.momd/` directory contains `.mom` plist files (NSKeyedArchiver format) that define the complete database schema — entity names, attribute types, and relationships. This reveals sensitive field storage (plaintext credit card columns, password fields, PII) before any user data exists. Core Data prefixes SQL columns with `Z` (e.g., `creditCardNumber` → `ZCREDITCARDNUMBER`). If `decode_plist` fails with "UID is not JSON serializable", the partial output before the error often contains the critical schema info.
+
+6. **Firebase/Google Service config analysis**: `GoogleService-Info.plist` contains API keys, project IDs, storage bucket names, and GCM sender IDs. Use these to enumerate Firebase Realtime Database/Firestore, test Cloud Storage bucket access rules, and probe for misconfigured security rules. Always check if the Firebase project is publicly accessible.
+
+7. **Pre-production endpoint discovery**: Use `extract_strings(data_base64, keywords="dev,staging,test,preprod,uat")` or `binary_search(data_base64, keywords="staging,preprod,internal,dev")` from Analysis-MCP to find internal hostnames in any binary data.
+
+8. **Cookie analysis**: Use `decode_binarycookies(data_base64)` from Analysis-MCP to parse iOS `Cookies.binarycookies` into structured JSON with domains, names, values, flags, and expiry.
+
+9. **JWT token analysis**: Use `decode_jwt(token)` from Analysis-MCP to decode tokens found in plists or traffic. Shows header, claims, expiry status, and lifetime.
+
+10. **Provisioning profile analysis**: Use `decode_mobileprovision(data_base64)` from Analysis-MCP to extract entitlements, team info, and capabilities from `embedded.mobileprovision`. Key checks: `get-task-allow` (debug entitlement — Critical if true in distribution), keychain-access-groups (wildcard = Medium), profile expiry, payment entitlements (`com.apple.developer.in-app-payments`).
+
+11. **Adobe AEP config analysis**: Use `decode_aep_config(data_base64)` from Analysis-MCP to expand nested JSON in Adobe Experience Platform files and highlight security-relevant fields (environment, config IDs, org IDs).
+
+12. **SQLite database analysis**: Use `summarize_sqlite_strings(data_base64, keywords="password,token,key,credit,card,ssn")` from Analysis-MCP to extract schemas and search for sensitive data in SQLite files without needing a full SQL client. For Core Data databases, look for `Z`-prefixed column names matching the `.mom` schema.
+
+**OWASP Classification**: Static bundle findings map to **M7 — Insufficient Binary Protections** (binary/code exposure), **M1 — Improper Platform Usage** (ATS disabled, debug entitlements, Firebase misconfiguration), and **M9 — Insecure Data Storage** (Core Data schema revealing plaintext sensitive fields).
+
+### Phase 2: Automated Security Assessment (MATRIX)
+
+MATRIX tests 7 MASVS-aligned categories: Authentication, Code, Cryptography, Network, Platform, Storage, Resilience. Reports map to OWASP MASTG, MASWE, CVE, CWE, GDPR, PCI, HIPAA.
+
+**Run MATRIX while Parley captures all traffic simultaneously** — this gives you both the automated findings AND the raw traffic for manual analysis.
+
+```
+corellium_create_assessment(instance_id="...", bundle_id="com.target.app")
+corellium_start_monitoring(instance_id="...", assessment_id="...")
+corellium_run_app(instance_id="...", bundle_id="com.target.app")
+# Exercise all app features — login, data entry, payments, settings
+corellium_stop_monitoring(instance_id="...", assessment_id="...")
+corellium_run_security_tests(instance_id="...", assessment_id="...")
+corellium_download_security_report(instance_id="...", assessment_id="...")
+
+# Parley: Analyze the traffic captured during the MATRIX session
+traffic_summary(instance_id="...")
+traffic_search(instance_id="...", pattern="password|secret|token|Authorization")
+traffic_query(instance_id="...", decode_as="utf8")
+```
+
+### Phase 3: Data Storage Analysis (MASVS-STORAGE)
+
+**Maps to OWASP M9 (Insecure Data Storage)**. Extract files from known sensitive locations.
+
+**Fast Path** (Device-Control-MCP) — one call pulls ALL preferences with optional pattern scanning:
+
+```
+# iOS: Pull all NSUserDefaults plists, auto-decode nested binary plists
+pull_nsuserdefaults(scan=True, expected_domains=["api.target.com", "cdn.target.com"])
+# Returns: all parsed plists, saved artifacts, and flagged items (env/debug keys,
+#          cleartext URLs, unexpected domains, long base64 blobs, boolean debug flags)
+
+# Android: Pull all SharedPreferences XML, auto-parse to key/value dicts
+pull_shared_prefs(scan=True, expected_domains=["api.target.com"])
+# Returns: all parsed prefs, saved artifacts, and flagged items
+```
+
+These replace 8+ individual file pulls with one tool call. The scanner flags env/debug key patterns, cleartext HTTP URLs, unexpected HTTPS domains, long base64 blobs (auto-decoded), and boolean debug flags. Always re-pull after UI interaction — behavioral SDKs write fingerprints on interaction, not on launch.
+
+**iOS** (jailbroken, sandbox at `/var/mobile/Containers/Data/Application/[APP-ID]/`):
+
+**IMPORTANT**: The Data Container UUID is DIFFERENT from the Bundle UUID. To find it:
+1. **Use `corellium_find_app_data_container(instance_id, bundle_id)`** — automatically scans all containers and returns the UUID, full path, and common sub-paths (Preferences, Caches, Documents, SplashBoard). This is the recommended approach.
+2. **`pull_nsuserdefaults`** resolves the data container automatically via the Corellium agent or SFTP fallback — no manual UUID hunting needed.
+
+| Path | What to look for | Analysis-MCP Tool |
+|------|-----------------|-------------------|
+| `Library/Preferences/*.plist` | NSUserDefaults — plaintext keys, tokens, passwords, analytics config | `pull_nsuserdefaults` (bulk) or `decode_plist` (individual) |
+| `Library/Preferences/[bundleId].plist` | Main app prefs — often contains auth tokens, device IDs, environment flags | `pull_nsuserdefaults` with `scan=True` |
+| `Library/Cookies/Cookies.binarycookies` | Session cookies, HttpOnly/Secure flag analysis | `decode_binarycookies` |
+| `Documents/*.sqlite` / `*.db` | SQLite databases — user data, cached content, analytics events | `summarize_sqlite_strings` |
+| `Library/com.adobe.aep.datastore/` | Adobe AEP config files — environment IDs, staging mode indicators | `decode_aep_config` |
+| `Library/WebKit/WebsiteData/HSTS.plist` | HSTS-enforced domains — reveals the app's complete network contact map | `decode_plist` |
+| `Library/Caches/` | HTTP cache, WebKit data, CMS content | `extract_strings` |
+| `tmp/` | Temp files, cached downloads, analytics rule ZIPs | varies |
+
+**Android** (rooted, internal at `/data/data/[package]/`):
+
+| Path | What to look for |
+|------|-----------------|
+| `shared_prefs/*.xml` | SharedPreferences — use `pull_shared_prefs` to extract all at once |
+| `databases/*.db` | SQLite databases — use `adb_pull` to extract |
+| `cache/` | WebView cache, temp data |
+| `/sdcard/Android/data/[package]/` | World-readable external storage |
+
+```
+# iOS (fast path): One-call preference extraction with scanning
+pull_nsuserdefaults(scan=True, expected_domains=["api.target.com"])
+
+# iOS (manual): Download and decode individual files
+corellium_download_file(instance_id="...", device_path="/var/mobile/Containers/Data/Application/[UUID]/Library/Preferences/com.target.app.plist")
+decode_plist(data_base64="...", keys_of_interest="token,password,key,session,auth,jwt")
+
+# iOS: Analyze cookies
+corellium_download_file(instance_id="...", device_path="/var/mobile/Containers/Data/Application/[UUID]/Library/Cookies/Cookies.binarycookies")
+decode_binarycookies(data_base64="...")
+
+# Android (fast path): One-call preference extraction with scanning
+pull_shared_prefs(scan=True)
+
+# Android (manual): Pull individual files via ADB
+adb_pull(device_path="/data/data/com.target.app/databases/app.db")
+```
+
+**Key analysis patterns from real-world testing:**
+- **Core Data SQLite databases**: Check `Library/Application Support/*.sqlite` for Core Data databases. Cross-reference column names against the `.mom` schema from the app bundle. Core Data prefixes columns with `Z` — look for `ZCREDITCARDNUMBER`, `ZPASSWORD`, `ZSSN`, etc. as plaintext `VARCHAR` columns. Also check `Documents/*.sqlite`.
+- **JWT tokens in NSUserDefaults**: Apps commonly store long-lived JWT auth tokens in plaintext plists. Decode with `decode_jwt` to check expiry (90-day tokens are common and exploitable).
+- **Analytics SDKs store sensitive data**: Glassbox, Adobe AEP, Tealium, and AppDynamics all create their own plist/JSON/SQLite files with session IDs, device fingerprints, and sometimes captured user input.
+- **Session replay analytics**: Some analytics SDKs (e.g., Glassbox) capture unmasked usernames and report to pre-production (UAT) environments — Critical finding when data hardening is disabled.
+- **HSTS plist as recon**: The WebKit HSTS plist contains every domain the app enforces HTTPS on, including internal/pre-production domains the app contacted.
+- **100-year tracking IDs**: Analytics SDKs often store persistent visitor/device IDs with extremely long expiry (100 years) — a privacy finding.
+- **Data container UUIDs change across reboots**: Always use `corellium_find_app_data_container` at the start of each session — never cache a UUID from a previous session. UUIDs regenerate on device reboot/state changes, and stale UUIDs produce silent 400 errors on every file operation.
+- **Virtual environment detection keys**: Apps may detect they are running on a virtual device and write platform-specific keys to NSUserDefaults (e.g., keys prefixed with `Corellium.`). Check for these — if the app adjusts behavior based on environment detection, pentest results may differ from physical devices. This maps to MASVS-RESILIENCE.
+- **Debug features active in production**: Look for diagnostic flags in NSUserDefaults like cookie loggers, debug modes, or introspection flags that should be disabled in release builds. These are M9/M8 findings.
+- **AppDynamics screenshot capture**: AppDynamics creates `Library/Caches/com.appdynamics.screenshots/` with `Upload/`, `ScreenshotCache/`, `ScreenshotDemandCache/`, and `ScreenshotCrash/` directories. Even if empty, this infrastructure means the SDK can capture and upload screenshots of app screens — a data leakage vector for sensitive financial or personal data.
+
+**Cross-reference with Parley**: Compare credentials found in storage against credentials seen in network traffic. If the same token appears in both NSUserDefaults/SharedPreferences AND HTTP headers, it's being stored insecurely.
+
+### Phase 4: Active Network Testing (MASVS-NETWORK) — Parley + Corellium
+
+**Maps to OWASP M5 (Insecure Communication)**. This is where the combined stack is most powerful.
+
+**Two strategies** — use both:
+
+#### Strategy A: Direct Backend Probing (No Device Traffic Routing)
+
+Extract tokens/cookies/endpoints from the device (Phase 3), then use Parley to probe backends directly from the local machine. This is faster and avoids tunneling complexity.
+
+```
+# 1. Start separate proxy instances for each backend discovered in static analysis
+proxy_start(target_host="auth.target.com", target_port=443, use_tls_server=True, no_verify=True, listen_port=8081, name="auth-probe")
+proxy_start(target_host="api.target.com", target_port=443, use_tls_server=True, no_verify=True, listen_port=8082, name="api-probe")
+proxy_start(target_host="cdn.target.com", target_port=443, use_tls_server=True, no_verify=True, listen_port=8083, name="cdn-probe")
+
+# 2. Deploy security analysis modules on all proxies
+module_deploy_template(template_name="security_header_audit")
+module_deploy_template(template_name="auth_token_extractor")
+
+# 3. Probe endpoints with extracted JWT/cookies
+http_request(instance_id="abc123", method="GET", path="/api/v1/profile",
+    headers='{"Authorization": "Bearer <extracted-jwt>"}')
+
+# 4. Scan for common paths
+http_scan(instance_id="abc123",
+    paths='["/", "/api", "/admin", "/graphql", "/.env", "/robots.txt", "/sitemap.xml", "/.well-known/openid-configuration"]')
+
+# 5. Check CDN for information disclosure (404 pages leak CSP headers)
+http_request(instance_id="cdn123", path="/nonexistent-path-12345")
+
+# 6. Test JWT replay
+http_request(instance_id="abc123", path="/api/v1/session",
+    headers='{"Authorization": "Bearer <jwt-from-plist>"}')
+```
+
+**Key probing patterns discovered through real-world testing:**
+- **Pre-production endpoints are often internet-accessible** — protected only by WAF, not network segmentation
+- **404 error pages return CSP headers** that expose the complete third-party service map (40+ services in real tests)
+- **Server headers leak infrastructure** — look for `Server:`, `X-Powered-By:`, custom headers revealing CDN/WAF/framework info
+- **WAFs may return 200 for blocked requests** — always inspect response bodies, not just status codes
+- **CDN-hosted analytics configs** (Adobe Launch rules, etc.) may be publicly downloadable without authentication
+
+#### Strategy B: Device Traffic Interception (Full MITM)
+
+```
+# 1. Start Parley with auto-cert for device MITM
+cert_generate_ca()
+proxy_start(target_host="api.target.com", target_port=443, use_tls_server=True, no_verify=True,
+    auto_cert=True, listen_port=8080)
+
+# 2. Install Parley CA cert on device
+corellium_install_profile(instance_id="...", base64_profile="<parley-ca-cert>")
+
+# 3. Run app and analyze
+corellium_run_app(instance_id="...", bundle_id="com.target.app")
+traffic_summary(instance_id="...")
+traffic_search(instance_id="...", pattern="password|token|Bearer|api_key")
+traffic_query(instance_id="...", decode_as="http")
+```
+
+**Step 2 — Active testing with rewriting modules** (Parley modifies, Corellium observes):
+```
+# IDOR test: swap user IDs in requests
+module_create(name="IDOR_Probe", direction="client",
+    code="def module_function(n, si, sp, di, dp, data):\n    return data.replace(b'user_id=123', b'user_id=456')")
+
+# Response tampering: bypass client-side checks
+module_create(name="Admin_Bypass", direction="server",
+    code='def module_function(n, si, sp, di, dp, data):\n    return data.replace(b\'"isAdmin":false\', b\'"isAdmin":true \')')
+
+# Observe app reaction via Corellium
+corellium_start_core_trace(instance_id="...")
+# Exercise the app through the modified proxy
+corellium_stop_core_trace(instance_id="...")
+corellium_download_file(instance_id="...", device_path="...")  # Check what got persisted
+
+# Compare original vs modified traffic
+traffic_query(instance_id="...", show_modified=True)
+```
+
+**Step 3 — SSL pinning validation**:
+Corellium's Network Monitor bypasses boringssl pinning transparently. To test if the app actually *implements* pinning, route through Parley instead — if traffic flows, there's **no pinning**.
+
+**Step 4 — Also grab Corellium's passive PCAP** for offline Wireshark analysis:
+```
+corellium_download_network_capture(instance_id="...", capture_type="netdump")
+```
+
+### Phase 5: Dynamic Analysis with CoreTrace + Frida + UI Automation
+
+**Maps to OWASP M1, M3, M8**. CoreTrace monitors syscalls at the hypervisor level — undetectable.
+
+```
+corellium_start_core_trace(instance_id="...")
+corellium_run_app(instance_id="...", bundle_id="com.target.app")
+# Retrieve trace data (with optional PID filtering)
+corellium_get_core_trace(instance_id="...", lines=2000)
+corellium_get_core_trace(instance_id="...", pid_filter="1234")
+corellium_stop_core_trace(instance_id="...")
+```
+
+**UI automation** (Device-Control-MCP) — pixel-precise tap/swipe/type using physical pixel coordinates from screenshots:
+
+```
+# Take screenshot — dimensions in response ARE the tap coordinate space
+screenshot()                                  # Returns: path, width, height
+screenshot(grid=True, grid_step=50)           # Overlay coordinate grid for picking targets
+
+# Tap at physical pixel coordinates (NOT iOS logical points)
+tap(x=645, y=1400)                            # Tap login button
+tap(x=645, y=1400, duration_ms=500)           # Long press
+
+# Swipe gestures
+swipe(x1=645, y1=2000, x2=645, y2=500)       # Scroll up
+swipe(x1=645, y1=500, x2=645, y2=2000, duration_ms=500)  # Slow scroll down
+
+# Type text — bypasses soft keyboard, injected directly to focused responder
+type_text(text="user@example.com")
+
+# Hardware buttons
+press_button(name="home")
+press_button(name="power", duration_ms=3000)   # Long press power
+
+# Human fallback — when automation is blocked (CAPTCHA, ambiguous UI)
+request_human_tap(reason="CAPTCHA dialog", suggested_target="Verify button at bottom of screen")
+```
+
+**iOS UI automation — accessibility tree** (Device-Control-MCP + Frida):
+
+```
+# Connect Frida (auto-detects: direct → rebind → tunnel strategies)
+frida_connect()
+
+# List processes to find target PID
+frida_ps()
+
+# Dump iOS accessibility tree — elements with labels, bounds, tap coordinates
+ax_dump()                                      # Attach to session bundle_id
+ax_dump(target_pid=1234)                       # Specific PID
+ax_dump(spawn=True)                            # Spawn mode for anti-attach apps (PT_DENY_ATTACH)
+# Returns: elements with labels, pixel coordinates, scale factor, count
+```
+
+**Android UI automation** (Device-Control-MCP + ADB):
+
+```
+# Dump UI hierarchy — all nodes with bounds, resource IDs, text, content descriptions
+ui_dump()
+# Returns: node_count, nodes with center coordinates ready for adb input tap
+
+# Tap by attribute (fresh dump → first match → adb shell input tap)
+ui_tap(resource_id="com.target:id/login_button")
+ui_tap(text="Sign In")
+ui_tap(content_desc="Menu")
+```
+
+**Frida instrumentation** (Device-Control-MCP):
+
+```
+# Connect to Frida server on device
+frida_connect()
+# Strategy cascade: direct (port 27042) → rebind (SSH kill+restart) → tunnel (SSH port-forward)
+
+# List running processes
+frida_ps()
+
+# Run a Frida script from frida_scripts/ directory
+frida_run_script(script_name="dump_ax_tree")
+frida_run_script(script_name="ssl_bypass", target_pid=1234)
+frida_run_script(script_name="custom_hook", args={"class_name": "LoginManager", "method": "authenticate"})
+
+# Spawn app with script (lands BEFORE anti-attach code runs)
+frida_spawn(bundle_id="com.target.app", script_name="jb_bypass")
+
+# Resume a spawned PID after script loads
+frida_run_script(script_name="monitor_crypto", resume_pid=5678, timeout=60.0)
+```
+
+**Android intent fuzzing and logcat** (Device-Control-MCP):
+
+```
+# Send intents to exported components — auto-captures logcat for verdict
+intent_send(component="com.target.app/.DeepLinkActivity",
+            data_uri="scheme://evil-payload",
+            watch_logcat_for="DeepLink|error|exception")
+# Returns: verdict (reached/silent/rejected), am_result, logcat matches
+
+# Persistent logcat streaming
+logcat_start(package="com.target.app")          # Background capture with UID filter
+# ... exercise app ...
+logcat_grep(pattern="password|token|secret")    # Search captured output
+logcat_stop()                                    # Stop and get line count
+```
+
+**SSH shell access** — when `run_app` returns 400 or you need direct shell control:
+
+```
+# iOS SSH via Device-Control-MCP (uses session serviceIp)
+ssh(command="uiopen com.target.app")
+ssh(command="ps aux")
+ssh(command="strings /path/to/AppBinary | grep -iE 'password|key|token'")
+
+# Android ADB shell via Device-Control-MCP
+adb_shell(command="pm dump com.target.app")
+adb_shell(command="logcat -d --pid=$(pidof com.target.app)")
+
+# Or via Corellium-MCP directly (requires instance_id)
+corellium_ssh_exec(instance_id="...", command="keychain-dumper")
+```
+
+**Combine with Parley**: Start CoreTrace, then trigger specific app behavior by modifying API responses via Parley modules. CoreTrace reveals exactly what the app does internally when it receives tampered data.
+
+### Phase 6: Fuzzing with Crash Correlation — Parley + Corellium
+
+Parley injects malformed data, Corellium detects crashes. Full cause-and-effect.
+
+```
+# Parley: Deploy a fuzzing module
+module_create(name="Fuzz_Responses", direction="server",
+    code="import random\ndef module_function(n, si, sp, di, dp, data):\n    if b'Content-Type: application/json' in data:\n        data = data.replace(b'\"name\":', b'\"name\":' + b'A'*10000 + b'//')\n    return data")
+
+# Corellium: Monitor for crashes
+corellium_get_kernel_panics(instance_id="...")
+corellium_console_log(instance_id="...")
+
+# Iterate: clear traffic, adjust module, re-test
+traffic_clear(instance_id="...")
+module_update(name="Fuzz_Responses", code="...")
+```
+
+### Phase 7: Hypervisor Hooks (Advanced)
+
+Kernel hooks intercept execution at specific addresses without pausing the VM. Written in `csmfcc` or `csmfvm`. Run lockless across cores.
+
+```
+corellium_create_hook(instance_id="...", hook_json='{"address":"0x100abc", "patch":"...", "enabled":true}')
+corellium_execute_hooks(instance_id="...")
+corellium_clear_hooks(instance_id="...")
+```
+
+### Phase 8: Cleanup & Reporting
+
+```
+proxy_stop(instance_id="...")                                   # Stop Parley proxy
+corellium_restore_snapshot(instance_id="...", snapshot_id="...") # Reset device
+corellium_delete_instance(instance_id="...")                      # Release resources
+corellium_disconnect()
+```
+
+## OWASP Mobile Top 10 → Tool Mapping
+
+| # | OWASP Risk | Corellium Tools | Device-Control Tools | Parley Tools | Technique |
+|---|-----------|----------------|---------------------|--------------|-----------|
+| M1 | Improper Credential Usage | `download_file`, `core_trace` | `pull_nsuserdefaults`/`pull_shared_prefs` (scan), `inspect_ios_bundle` | `traffic_search` | Bulk pref extraction with pattern scanning + traffic search |
+| M2 | Inadequate Supply Chain | `list_apps`, `download_file` | `inspect_ios_bundle` (framework inventory) | — | Enumerate libs, flag test frameworks, check CVEs |
+| M3 | Insecure Authentication | `create_assessment`, `core_trace` | `frida_run_script`, `tap`/`type_text` (exercise login) | `module_create`, `traffic_query` | MATRIX auth checks + Frida hook auth + tamper tokens via Parley |
+| M4 | Insufficient Validation | `create_hook`, `get_kernel_panics` | `intent_send` (fuzz exported components) | `module_create` | Parley injects payloads, intent fuzzing, Corellium detects crashes |
+| M5 | Insecure Communication | `download_network_capture`, `install_profile` | `logcat_grep` (network log leaks) | `web_proxy_setup`, `traffic_search` | Parley active MITM + Corellium passive PCAP + logcat analysis |
+| M6 | Inadequate Privacy | `download_file` | `pull_nsuserdefaults`/`pull_shared_prefs`, `ax_dump` | `traffic_search` | Bulk pref scan for PII + accessibility tree for visible data |
+| M7 | Insufficient Binary Protections | `create_hook` | `inspect_ios_bundle` (test frameworks), `frida_spawn` (bypass anti-attach) | `module_create` | Bundle inspection + Frida spawn-gating + response tampering |
+| M8 | Security Misconfiguration | `console_log`, `get_assessment` | `inspect_ios_bundle` (ATS, debug flags), `pull_nsuserdefaults`(scan) | `traffic_query` | Bundle analysis + pref scanning + HTTP header inspection |
+| M9 | Insecure Data Storage | `download_file`, `create_assessment` | `pull_nsuserdefaults`/`pull_shared_prefs`, `finding_add` | `traffic_search` | Bulk extraction + cross-reference with network credentials |
+| M10 | Insufficient Cryptography | `core_trace`, `create_assessment` | `frida_run_script` (hook crypto APIs) | `traffic_search` | Frida crypto hooks + trace syscalls + search for plaintext |
+
+## Tool Quick Reference
+
+### Device-Control-MCP (31 tools)
+
+**Session**: `session_set` (establish session — resolves serviceIp, creates artifact dirs, probes capabilities; **CALL FIRST**), `session_get` (dump current session state), `session_clear` (clear session, artifacts stay on disk)
+
+**UI Automation — Corellium API**: `tap` (x, y, duration_ms — physical pixel coordinates from screenshot), `swipe` (x1, y1, x2, y2, duration_ms), `type_text` (injected to focused responder, bypasses keyboard animation), `press_button` (home, power, vol-up, vol-down, ringer)
+
+**Screenshot**: `screenshot` (PNG to artifact dir; optional `grid=True` overlay for coordinate picking — returns path, width, height), `request_human_tap` (L4 fallback for CAPTCHAs or ambiguous UI — saves screenshot and returns instruction for human)
+
+**Findings Ledger**: `finding_add` (severity, owasp, title, evidence, notes; `supersedes` for audit trail retraction; IDs: F-001, F-002...), `findings_list` (grouped by severity), `findings_export` (markdown report skeleton; filter by platform/bundle_id)
+
+**iOS Tools**: `ssh` (shell via paramiko, uses session serviceIp; default root/alpine), `get_app_state` (installed/running/frontmost/paths — faster than `list_apps`), `pull_nsuserdefaults` (all plists under Library/Preferences/; agent preferred, SFTP fallback; `scan=True` for pattern scanning; `expected_domains` filters URL flags), `inspect_ios_bundle` (one SSH round-trip: Frameworks, Info.plist, mobileprovision, root listing; flags test frameworks, ATS issues, jailbreak detection)
+
+**Android Tools**: `adb_connect` (connect + root + reconnect; **call after session_set, before other ADB tools**), `adb_shell` (shell on device as root), `adb_pull` (pull file to artifacts/files/), `pull_shared_prefs` (all shared_prefs XML for package; `scan=True` for pattern scanning), `ui_dump` (uiautomator dump — nodes with bounds, centers, resource_ids; centers are tap-ready), `ui_tap` (fresh dump → match by resource_id/text/content_desc → `input tap`), `intent_send` (am start + logcat capture → verdict: reached/silent/rejected), `logcat_start` (background streaming with UID filter), `logcat_stop`, `logcat_grep` (search captured logcat)
+
+**Frida Tools**: `frida_connect` (strategy cascade: direct → rebind → tunnel; caches device handle), `frida_ps` (enumerate processes), `frida_run_script` (load from frida_scripts/*.js; `__ARG_KEY__` substitution; `resume_pid` for spawn-gating; hooks persist after return), `frida_spawn` (spawn + optional script + resume), `ax_dump` (iOS accessibility tree via Frida; `spawn=True` for anti-attach; returns elements with labels and pixel coordinates)
+
+### Corellium-MCP (72 tools)
+
+**Connection**: `corellium_connect`, `corellium_disconnect`, `corellium_connections`, `corellium_list_projects`, `corellium_get_project`
+
+**Devices**: `corellium_list_models`, `corellium_get_model_software`, `corellium_create_instance`, `corellium_list_instances`, `corellium_get_instance`, `corellium_start_instance`, `corellium_stop_instance`, `corellium_reboot_instance`, `corellium_pause_instance`, `corellium_unpause_instance`, `corellium_delete_instance`, `corellium_screenshot`, `corellium_console_log`, `corellium_agent_ready`
+
+**Apps**: `corellium_list_apps`, `corellium_install_app`, `corellium_uninstall_app`, `corellium_run_app`, `corellium_kill_app`
+
+**Filesystem**: `corellium_list_files`, `corellium_upload_file`, `corellium_download_file`, `corellium_delete_file`, `corellium_find_app_data_container` (find data container UUID by bundle ID — essential first step for any app data analysis)
+
+**Snapshots**: `corellium_list_snapshots`, `corellium_create_snapshot`, `corellium_restore_snapshot`, `corellium_delete_snapshot`
+
+**Network**: `corellium_start_network_monitor`, `corellium_stop_network_monitor`, `corellium_download_network_capture`, `corellium_get_network_info`
+
+**SSL**: `corellium_disable_ssl_pinning`, `corellium_enable_ssl_pinning` (note: jailbroken devices have SSL pinning disabled by default; these are WebSocket-based agent ops and may require the JS SDK)
+
+**SSH**: `corellium_ssh_exec` — execute shell commands on the device via SSH (paramiko). **Preferred method** for shell access since REST `shell_exec` uses WebSocket protocol. Auto-exposes port 22. Unlocks `strings` on large binaries, keychain-dumper, FRIDA, objection, class-dump, process enumeration, `fs_usage`, app launching via `uiopen`, and arbitrary device commands. Default creds: `root`/`alpine`.
+
+**UI Automation**: `corellium_inject_input` — inject touch/keyboard/text input events for UI automation during dynamic testing
+
+**MATRIX**: `corellium_create_assessment`, `corellium_get_assessment`, `corellium_start_monitoring`, `corellium_stop_monitoring`, `corellium_run_security_tests`, `corellium_download_security_report`, `corellium_delete_assessment`
+
+**Hooks**: `corellium_list_hooks`, `corellium_create_hook`, `corellium_delete_hook`, `corellium_execute_hooks`, `corellium_clear_hooks`
+
+**CoreTrace**: `corellium_start_core_trace`, `corellium_stop_core_trace`, `corellium_get_core_trace` (retrieve trace data with optional PID filter — avoids needing UI access for large trace files), `corellium_clear_core_trace`
+
+**System**: `corellium_lock_device`, `corellium_unlock_device`, `corellium_get_system_property`, `corellium_set_device_peripherals`, `corellium_get_device_peripherals`, `corellium_get_kernel_panics`, `corellium_clear_kernel_panics`, `corellium_set_hostname`, `corellium_system_shutdown`
+
+**Ports/Profiles**: `corellium_enable_port`, `corellium_disable_port`, `corellium_list_profiles`, `corellium_install_profile`, `corellium_uninstall_profile`
+
+### Parley-MCP (23 tools)
+
+**Proxy**: `web_proxy_setup`, `proxy_start` (now with `auto_cert` and `upstream_proxy` params), `proxy_stop`, `proxy_list`, `proxy_status`
+
+**Modules**: `module_create`, `module_update`, `module_delete`, `module_set_enabled`, `module_list`, `module_deploy_template` (pre-built security modules)
+
+**Traffic**: `traffic_query` (now with `decode_as="http"` for parsed HTTP), `traffic_summary`, `traffic_connections`, `traffic_clear`, `traffic_search`, `traffic_export` (HAR format), `traffic_replay` (replay captured requests with modifications)
+
+**HTTP Tools**: `http_request` (send HTTP through proxy with auto cookie jar; structured error handling for timeouts/TLS/connection failures), `http_scan` (multi-path endpoint scanning with security header audit; use `include_headers=True` for full response headers per request)
+
+**Certificates**: `cert_generate_ca` (generate MITM root CA; per-host certs auto-generated via `auto_cert=True` on `proxy_start`)
+
+**Cookie Jar**: `cookie_jar_show`, `cookie_jar_clear` (automatic cross-request cookie persistence)
+
+**Templates**: 5 pre-built security modules via `module_deploy_template`: `security_header_audit`, `cors_tester`, `auth_token_extractor`, `response_scanner`, `request_logger`
+
+### Analysis-MCP (22 tools)
+
+**Plist/Config**: `decode_plist` (binary + XML plists with key highlighting), `encode_plist` (JSON → binary/XML plist as base64; enables download → decode → modify → encode → upload workflow), `decode_mobileprovision` (iOS provisioning profiles with entitlement extraction)
+
+**Data Formats**: `decode_base64_json` (base64 JSON with nested expansion), `decode_binarycookies` (iOS Cookies.binarycookies parser), `decode_jwt` (JWT decode with expiry analysis), `decode_aep_config` (Adobe AEP identity/config with security highlights)
+
+**Binary Analysis**: `extract_strings` (ASCII string extraction with keyword filtering), `binary_search` (keyword search with byte-offset context), `summarize_sqlite_strings` (SQLite schema + string extraction)
+
+**Keychain**: `decode_keychain_dump` — parse iOS keychain-dumper output (XML plist or text). Extracts service names, accounts, access groups, data values, accessibility flags. Provides a security summary with counts by class and items with dangerous accessibility (e.g., `kSecAttrAccessibleAlways`). Use with `corellium_ssh_exec` to run keychain-dumper and pipe output here.
+
+**Anti-Bot**: `decode_akamai_sensor` — decode Akamai BMP sensor payloads from `com.akamai.botman.defaults.sensor_data`. Auto-detects delimiter format (semicolon, dollar, or comma). Extracts timestamps, URLs, encoded blocks, and payload statistics. Used for understanding device fingerprint data and preparing sensor replay attacks.
+
+**Screenshots**: `analyze_screenshot` — analyze PNG/JPEG screenshots or SplashBoard snapshots. Extracts dimensions, format, PNG text chunks, EXIF metadata, sensitive content keywords, and blank screen detection. Use for SplashBoard data leakage analysis.
+
+**File Utility**: `save_base64_to_file` — save base64-encoded data to a local file. Handles padding correction automatically. Use to save Corellium screenshots as viewable PNGs, downloaded binaries/databases locally, or any base64 content for external tool analysis. Eliminates the need for ad-hoc Python/shell scripts to decode base64.
+
+**Usage pattern**: Corellium downloads raw base64 files → pass directly to Analysis-MCP tools → get structured JSON back. No temp scripts needed. For saving files locally: `corellium_screenshot` or `corellium_download_file` → `save_base64_to_file(data_base64, "output.png")`. For keychain analysis: `corellium_ssh_exec` runs `keychain-dumper` → pass output to `decode_keychain_dump`. For config modification: `decode_plist` → modify JSON → `encode_plist` → `corellium_upload_file`.
+
+## Critical Rules
+
+1. **Always** call `corellium_agent_ready` before any agent operation (apps, files, system). After `corellium_start_instance`, the agent can take **2-3 minutes** to become ready — poll every 20-30 seconds. If not ready, the tool returns `Agent ready: False` with the error details (e.g., 503).
+2. **Always** call `session_set` before any Device-Control-MCP operation (tap, screenshot, ssh, frida, ax_dump, ui_dump). It resolves `serviceIp`, creates artifact directories, and probes capabilities (agent, SSH, Frida, ADB availability).
+3. **Always** call `adb_connect` after `session_set` and before other Android ADB tools (adb_shell, adb_pull, pull_shared_prefs, ui_dump, ui_tap, intent_send, logcat_start).
+4. **Always** snapshot before destructive testing
+5. **Always** perform static analysis of the app bundle BEFORE launching the app — use `inspect_ios_bundle` for a one-call security assessment, then drill deeper with manual steps. This phase alone often produces Critical/High findings.
+6. **Always** check `get_app_state()` or `corellium_list_apps` before `corellium_run_app` — if the app shows `"running": true`, skip launching entirely and go straight to data extraction
+7. **Always** use `finding_add` to record findings progressively — the findings ledger provides audit trail, supersession tracking, and markdown export
+8. MATRIX monitoring (`start_monitoring`/`stop_monitoring`) requires an `assessment_id` — it is separate from the network monitor (sslsplit). Create the assessment first.
+9. Network Monitor uses sslsplit endpoints (`/sslsplit/enable`, `/sslsplit/disable`) and requires both Wi-Fi and cellular enabled
+10. iOS filesystem access requires jailbroken device; Android requires root
+11. SSH default credentials: `root` / `alpine` (iOS jailbroken). Device-Control-MCP's `ssh` tool uses the session serviceIp automatically.
+12. Common exposed ports: SSH=22, FRIDA=27042, ADB=5001 (Corellium serviceIp)
+13. Binary data (files, screenshots, PCAPs, reports) is base64-encoded in Corellium tool responses. Use **Analysis-MCP** tools (`decode_plist`, `decode_binarycookies`, `decode_jwt`, etc.) to decode — pass the base64 string directly.
+14. Jailbroken devices have iOS SSL pinning disabled by default — no need to call `disableSSLPinning` unless re-enabled
+15. Some agent operations (`shellExec`, `disableSSLPinning`, `runFrida`, `runFridaPs`) use the WebSocket agent protocol, not REST. They may require the Corellium JS SDK or SSH access instead.
+16. CoreTrace is hypervisor-level — **undetectable** by the target app
+17. Parley modules are Python functions: `def module_function(msg_num, src_ip, src_port, dst_ip, dst_port, data)` → return modified `data` (bytearray)
+18. Use `traffic_clear` between test iterations to isolate results
+19. Use `show_modified=True` in `traffic_query` to compare original vs rewritten traffic
+20. iOS app bundles are at `/private/var/containers/Bundle/Application/[UUID]/[App].app/` — use `inspect_ios_bundle` for one-call analysis or `corellium_list_files` to browse manually
+21. Document findings progressively using `finding_add` with OWASP Mobile Top 10 classifications. Use `findings_export` for markdown report skeleton. The ledger supports supersession (`supersedes` param) for audit trail when retracting or revising findings.
+22. **iOS Data Container** path is `/var/mobile/Containers/Data/Application/[UUID]/` (NOT `/private/var/containers/Data/Application/` — the latter returns 400). The Data UUID is **different** from the Bundle UUID — use `pull_nsuserdefaults` (auto-resolves container) or `corellium_find_app_data_container(instance_id, bundle_id)` to find it.
+23. **Parley can probe backends independently** — extract tokens/cookies from the device, then use `http_request` or `http_scan` to test backend endpoints directly from the local machine without routing device traffic through the proxy.
+24. **Re-pull preferences after EVERY UI interaction** — behavioral SDKs (Akamai BMP, BioCatch, NuDetect) write fingerprints on interaction events, not on launch. Pull → interact → re-pull → diff. The diff IS the finding.
+25. **Frida connect strategy cascade** — `frida_connect` tries: (1) direct port 27042, (2) SSH kill+restart frida-server binding 0.0.0.0, (3) SSH tunnel to localhost:27042. Check `session_set` capabilities output to see which path is available.
+26. **`ax_dump` with `spawn=True` bypasses anti-attach** — when Frida attach fails with "unexpected error while probing dyld" (PT_DENY_ATTACH), use spawn mode to inject the script before anti-attach code runs.
+27. **`intent_send` is an active fuzzing tool** — it fires `am start` + captures logcat for the specified timeout. The `watch_logcat_for` pattern determines the `verdict` (reached/silent/rejected). Use for exported component testing.
+28. **Artifact directories persist across sessions** — same engagement ID reuses the same findings ledger. Same day + same bundle reuses the latest matching session dir. Evidence accumulates across tool invocations.
+29. **Deploy multiple Parley proxies** for different backend endpoints (auth server, CDN, API gateway, etc.) — each gets its own instance ID and traffic database.
+30. **CDN/404 pages leak CSP headers** — even error responses often include Content-Security-Policy headers that expose the complete third-party service map. Always request a non-existent path.
+31. **WAFs return misleading status codes** — some WAFs (e.g., Akamai) return HTTP 200 for blocked requests instead of 403/405, which can confuse automated scanners. Always inspect response bodies, not just status codes.
+32. **Use `ssh` (Device-Control) or `corellium_ssh_exec` (Corellium) for shell commands** — the REST API's `shell_exec` uses WebSocket protocol and fails with 404. Device-Control's `ssh` tool uses the session serviceIp automatically; `corellium_ssh_exec` requires `instance_id`. Both use paramiko. VPN access is required to reach the device's `serviceIp`.
+33. **Keychain analysis requires SSH** — iOS keychain databases (`keychain-2.db`) are encrypted SQLite and cannot be parsed by `sqlite3` directly. Use `ssh(command="keychain-dumper")` or `corellium_ssh_exec` on the device, then pass the output to `decode_keychain_dump` in Analysis-MCP.
+34. **UI automation tiering** — Device-Control-MCP provides a 4-level UI automation stack: (L1) `tap`/`swipe`/`type_text` for coordinate-based input, (L2) `ax_dump` for iOS accessibility tree with semantic labels, (L3) `ui_dump`/`ui_tap` for Android UI hierarchy with resource IDs, (L4) `request_human_tap` for CAPTCHAs and ambiguous UI. Use `screenshot(grid=True)` for coordinate picking. If `corellium_inject_input` returns 400 on enterprise instances, Device-Control tools use the same underlying API — fall back to Frida or human tap.
+35. **SplashBoard snapshots leak data** — iOS caches app screenshots in SplashBoard directories for the task switcher. These often contain sensitive data visible on screen at the time of backgrounding. **Confirmed limitation**: While `corellium_list_files` can list the SplashBoard parent directory (proving snapshots exist), the Corellium agent cannot access subdirectories with colons in their names (e.g., `sceneID:com.example.app-default`) — all attempts return 504/500 regardless of URL encoding. **However, the existence of the directory alone is a valid finding**: it proves the app does NOT implement `applicationDidEnterBackground` screenshot protection. Document as M1 — Improper Platform Usage. To extract actual snapshot images, use SSH or the Corellium UI.
+36. **Akamai sensor data in NSUserDefaults** — `pull_nsuserdefaults(scan=True)` auto-flags long base64 blobs including Akamai sensor data. Use `decode_akamai_sensor` from Analysis-MCP to decode. The presence and contents of this data reveals which endpoints are fingerprint-protected.
+37. **Proxy instances with TLS** — when the target backend uses HTTPS, ensure `use_tls_server=True` on `proxy_start`. For full client-side TLS wrapping (needed when `http_request`/`http_scan`/`traffic_replay` connect to the proxy's local port), the proxy engine now supports TLS client wrapping based on the instance's `use_tls_client` setting.
+38. **Plist modification workflow** — use `encode_plist` from Analysis-MCP to modify app configuration on-device: `corellium_download_file` → `decode_plist` → modify JSON → `encode_plist(json_data, output_format="binary")` → `corellium_upload_file`. Supports both binary and XML output formats.
+39. **CoreTrace data retrieval** — use `corellium_get_core_trace` to download trace data directly via the API. Supports `lines` parameter (default 1000) and `pid_filter` to isolate a specific process. **Known limitation**: On some enterprise Corellium instances, `start_core_trace` and `stop_core_trace` work correctly, but the data retrieval endpoint (`/strace`) returns 404. In this case, CoreTrace data must be accessed through the Corellium web UI or VPN.
+40. **`http_scan` with full headers** — use `include_headers=True` on `http_scan` to see complete response headers for each probed path. Essential for discovering CSP, Set-Cookie, X-Powered-By, and other security-relevant headers across multiple endpoints in one pass.
+41. **File path URL encoding** — Corellium file operations (`list_files`, `download_file`, `upload_file`, `delete_file`) now URL-encode paths automatically. Paths containing colons, spaces, or other special characters (common in iOS SplashBoard scene IDs) no longer cause 504 errors.
+42. **MATRIX enterprise restrictions** — On enterprise Corellium instances, MATRIX security assessments (`corellium_create_assessment`) may return 400 Bad Request. This is an enterprise policy restriction, not a code error. Document as a test limitation and rely on manual testing phases instead.
+43. **WAF cookie naming conventions leak info** — Akamai cache directive cookies (e.g., `akacd_*`) often embed environment identifiers in their names (e.g., `m2eve` = Mobile v2 + EVE environment). These reveal internal naming conventions and confirm which environment the app connects to. Always inspect `Set-Cookie` names in WAF responses.
+44. **`corellium_find_app_data_container` or `pull_nsuserdefaults` for data containers** — Before manual data container analysis, call `corellium_find_app_data_container` with the target's bundle ID, or use `pull_nsuserdefaults` which resolves the container automatically. Both replace the error-prone manual approach of listing hundreds of UUIDs and guessing timestamps.
+45. **ATS (App Transport Security) is a P0 check** — `NSAppTransportSecurity` in `Info.plist` with `NSAllowsArbitraryLoads: true` is a **Critical** finding (M3 — Insecure Communication). `inspect_ios_bundle` flags this automatically. When combined with sensitive data storage (plaintext credentials, credit cards in Core Data), it creates a scenario where sensitive data may be both stored and transmitted without protection.
+46. **Core Data schema reveals sensitive storage before data exists** — The `.momd/` directory in the app bundle contains `.mom` plist files defining the complete database schema. Download and decode these to identify sensitive attributes (credit card numbers, passwords, SSNs) stored as plaintext `VARCHAR` — a Critical M9 finding even if the database is empty at analysis time.
+47. **`get-task-allow` entitlement in distribution builds** — This debug entitlement in `embedded.mobileprovision` permits debugger attachment (`lldb`, `dtrace`), runtime memory inspection, method swizzling, and encryption key extraction. `inspect_ios_bundle` extracts this automatically. It should never appear in App Store or Ad Hoc distribution builds. **High** severity (M1).
+48. **Jailbreak detection strength assessment** — Check `LSApplicationQueriesSchemes` in `Info.plist` for `cydia` URL scheme checks. `inspect_ios_bundle` flags this. This is a single-point detection method trivially bypassed by removing Cydia, hooking `canOpenURL:`, or using rootless jailbreaks. Classify as **Medium** (M8).
+49. **Keychain access group scope** — Check entitlements for wildcard keychain access groups (e.g., `TEAMID.*`). A wildcard allows any app signed by the same Team ID to read keychain items, which expands the attack surface if any app from that developer is compromised. Recommend restricting to the specific app identifier. **Medium** (M9).
+50. **SplashBoard scene ID format varies** — Not all apps use colons in SplashBoard scene IDs. Some use formats like `{DEFAULT GROUP}` with braces and spaces, which the Corellium agent CAN access (unlike colon-based `sceneID:...` paths). Always attempt to list and download SplashBoard snapshots — the accessibility depends on the app's scene naming convention.
+51. **Large binary files require SSH for string extraction** — App binaries over ~1MB produce base64 output that exceeds API character limits. Use `ssh(command="strings /path/to/binary | grep -iE 'password|key|token|http|secret|admin|credential'")` via Device-Control or `corellium_ssh_exec` via Corellium-MCP. This is one of the highest-yield dynamic analysis steps. Always pipe through `grep` to filter for security-relevant strings.
+52. **`corellium_run_app` 400 is OS-version-specific, not enterprise-specific** — The 400 correlates with bleeding-edge iOS where the agent isn't fully deployed (see rule #1 — same root cause). On supported OS versions, `run_app` works; on bleeding-edge, fall back to `ssh(command="uiopen <bundleid>")` (note: `open` is NOT a valid iOS command). If both fail, check `get_app_state()` — the app may already be running (rule #64).
+53. **Frida is pre-installed on Corellium jailbroken devices** — `session_set` probes Frida availability automatically (check `capabilities.frida` in the response). Use `frida_connect` to establish the connection. Frida server typically runs as root on PID ~200, listening on `127.0.0.1:27042`.
+54. **`fs_usage` as CoreTrace fallback** — When `corellium_get_core_trace` returns 404 (enterprise restriction), use `ssh(command="fs_usage -w -f filesys <AppName>")` to monitor file and network I/O in real-time. Less comprehensive than CoreTrace but available via SSH.
+55. **Enterprise `corellium_inject_input` 400** — On enterprise instances, `corellium_inject_input` (and Device-Control's `tap`/`swipe`/`type_text` which use the same API) may return HTTP 400 for all input types. Fallbacks: `ax_dump` + `frida_run_script` for iOS, `ui_tap` (uses ADB `input tap`) for Android, or `request_human_tap` as L4 fallback.
+56. **Process enumeration via SSH** — `ssh(command="ps aux")` reveals all running processes including security-relevant services. `netstat -an` shows listening ports. `lsof -i` shows network sockets. These provide runtime context that static analysis cannot — always run at the start of a dynamic analysis session.
+57. **Keychain analysis without keychain-dumper** — If `keychain-dumper` is not installed on the device, query `keychain-2.db` metadata via `ssh(command="sqlite3 /var/Keychains/keychain-2.db 'SELECT agrp, srvr, sdmn FROM inet'")`. The data column is encrypted, but metadata (access groups, server names, domains) reveals which services the app stores credentials for.
+58. **Binary string categories to search** — When running `strings` on app binaries via SSH, search for these categories with separate grep passes: credentials (`grep -iE 'password|credential|secret|admin|login'`), URLs (`grep -iE 'https?://'`), XSS/injection (`grep -iE 'script|xss|inject|alert'`), jailbreak detection (`grep -iE 'cydia|jailbreak|/Applications/'`), debug messages (`grep -iE 'debug|test|TODO|FIXME|HACK'`), and developer info (`grep -iE '/Users/|DerivedData|Xcode'`). Each category frequently yields different finding severities.
+59. **iOS Frida touch simulation is unreliable — call handlers directly** — On iOS, Frida cannot reliably simulate coordinate-based taps. Instead: (a) For UIKit buttons, use `sendActionsForControlEvents_(1 << 6)`. (b) For tab navigation, use `UITabBarController.setSelectedIndex_(n)` via `frida_run_script`. (c) For Firebase Auth, call the REST API directly with the embedded API key. (d) For SwiftUI buttons with no ObjC bridge, use `request_human_tap` or `tap` at pixel coordinates.
+60. **Authorization bypass via UITabBarController** — On apps with tabbed navigation, test if all tabs are accessible without login by running `frida_run_script` to call `UITabBarController.setSelectedIndex_(n)`. Classify as **High** (M6: Insecure Authorization) if sensitive functionality is accessible.
+61. **SwiftUI apps have limited Frida ObjC bridge access** — Pure Swift classes have `$ownMethods: []` and `$ownProperties` throws `TypeError`. The ObjC bridge only sees methods annotated with `@objc` or inherited from NSObject. For SwiftUI text input, use `becomeFirstResponder()` + `insertText:` via `frida_run_script`. For navigation, target UIKit hosting controllers.
+62. **Firebase REST API for credential verification** — When you have an app's Firebase API key (from `GoogleService-Info.plist`), test the credentials directly via the identitytoolkit API. If the backend returns `CONFIGURATION_NOT_FOUND`, the Firebase project is decommissioned/misconfigured — note as Informational finding.
+63. **Ask the human to tap on iOS when programmatic touch fails** — iOS SwiftUI apps resist programmatic touch simulation. Use `request_human_tap(reason="...", suggested_target="...")` from Device-Control-MCP — it saves a screenshot and returns instructions. The human taps in the Corellium web console, then take another screenshot to verify and continue analysis.
+64. **Check `get_app_state()` first — `running:true` short-circuits the launch phase entirely.** Use Device-Control's `get_app_state()` (faster than `corellium_list_apps`) to check. If running, skip launch — go straight to data extraction. The data container is already populated.
+65. **Cookie domains are backend-env evidence — more reliable than config files.** The `Cookies.binarycookies` domains tell you which backend the app *actually reached*, not which one it was *configured* to reach. Check cookies after every dynamic phase — they're ground truth.
+66. **AEP `build.environment` is the one-key analytics-env-mismatch tell.** In `Library/com.adobe.aep.datastore/com.adobe.module.configuration.json`, `build.environment != "prod"` means real user analytics flow to a non-prod Adobe property. Single key, High finding (pentest-ref pattern #6). Also check `consent.default.collect.val` — `"y"` means collection on by default before any user interaction.
+67. **Don't extrapolate SDK storage behavior across platforms — OR across interaction states.** The same Akamai BMP SDK on iOS shows only an NSDate in NSUserDefaults at *first launch* — but writes the full 3.6KB sensor blob *after the user interacts with the login form*. Use `pull_nsuserdefaults(scan=True)` before and after interaction — the diff is the finding. This is a special case of rule #71 but worth its own warning.
+68. **Retest behavioral conclusions on a known-good OS before attributing them to the app.** An app silent-exiting on iOS 26.4 looked like working JB detection. Retesting on iOS 18.2 showed the app runs fine — the 26.4 failure was OS incompatibility. **OS bleeding-edge ≠ app resilience.** Confirm any "the app blocked X" finding on a stable OS.
+69. **`META-INF/*.kotlin_module` filenames leak gradle build flavors — check on every APK.** `adb_shell(command="unzip -l /path/to/app.apk | grep kotlin_module")` or `apk_kotlin_modules` in analysis_mcp. Suffixes other than `_release` are findings: `Dast`, `CertPinningOff`, `selectableEnvironment`, `Debug`, `Test`, `Mock`. Five-second check, Critical-finding payoff.
+70. **Use `pull_shared_prefs` (Android) / `pull_nsuserdefaults` (iOS) as the first dynamic step.** One call returns every preference file as a parsed dict, with nested binary plists auto-decoded on iOS. The env-selector key, the Akamai sensor, the Adobe ECID, the debug flags — they're all in there. This replaces 8+ individual file pulls with one tool call.
+71. **Re-pull storage after EVERY UI interaction — first-launch state ≠ post-interaction state.** A live engagement shipped a "POSITIVE: no Akamai sensor leak on iOS" finding based on a pre-login storage pull. After tapping the login form and re-pulling: 3KB sensor blob in plaintext, same as Android. The positive was retracted in the same session (`finding_add` with `supersedes="F-003"`). Pull → interact → re-pull → diff. The diff IS the finding.
+72. **Corellium `/input` coordinates are physical pixels (screenshot resolution), NOT iOS logical points.** iPhone 14 Pro Max = 1290×2796, not 430×932. **Read `width`/`height` from `screenshot()`'s return — that IS the tap coordinate space.** Use `screenshot(grid=True)` for visual coordinate picking.
+73. **`type_text` bypasses the soft keyboard — measured Y coords stay valid through typing.** Hypervisor text injection goes straight to the focused responder; the keyboard never animates up, so the form layout doesn't shift. Tap username → measure password Y → type username → tap password at the *same* Y → it works. Same on Android.
+74. **`tap` returns `{"status":"ok"}` whether it hit a target or empty space — screenshot-after is the only verify.** Three "successful" taps in a row may produce zero visible change. **Build the screenshot-after into the workflow, not as a debug step but as the routine.** For Android, `ui_tap` is more reliable (matches by resource_id/text/content_desc). For iOS, use `ax_dump` to get semantic element bounds.
+75. **WebView vs native error handling is often inconsistent — test both paths.** Native paths get error handlers; WebViews load whatever HTML the server returns. Always trigger at least one WebView-loaded feature with a backend you know will fail — the contrast is the finding.
+76. **`inspect_ios_bundle` is the iOS kotlin_module check — one call, same payoff.** It flags test frameworks (`OHHTTPStubs.framework`, `RxBlocking.framework`, `XCTest`-anything, `*Mock*`) automatically in the `flagged_frameworks` list. Critical-tier static finding.
+77. **Akamai `server_signal` is more replayable than `sensor_data`.** The sensor is the device fingerprint the app *submits*. The server_signal is Akamai's *acceptance*. If both are persisted in plaintext (check via `pull_nsuserdefaults`), the signal is the higher-value exfil target — it's the validation token, not the input. iOS stores both; Android stores only the sensor.
+78. **Frida dyld-probe failure on attach = resilience finding + spawn-instead hint.** When `frida_ps` works but `ax_dump(target_pid=N)` fails with "unexpected error while probing dyld," that's PT_DENY_ATTACH. Document as M8 resilience (positive). Then try `ax_dump(spawn=True)` or `frida_spawn(bundle_id, script_name=...)` — spawn suspends at entry, the script lands *before* the anti-attach code runs.
+79. **A debug flag set to `False` is still a finding.** `pull_nsuserdefaults(scan=True)` flags boolean debug keys automatically. `enableCookieLogger: false` proves the cookie-logging code path *ships* — it's just gated on a writable bool. The finding is "this can be flipped," not "this is on."
+80. **Cross-platform SDK divergence is intelligence about the org.** Same app using NuDetect (ROT13 storage) on Android and BioCatch (plaintext storage) on iOS tells you: different platform teams, different security review depth. Compare `inspect_ios_bundle` Frameworks/ ↔ `adb_shell("unzip -l ...")` kotlin_module + native libs across platforms early — the asymmetries are leads.
+81. **The Info.plist `Configuration` key is the iOS env tell.** Custom `Configuration` key with values like `UAT`/`Staging`/`Test`/`EnterpriseDistribution` is the iOS analogue of the gradle flavor in kotlin_module. `inspect_ios_bundle` returns this in `info_plist`. Check alongside `CFBundleIdentifier` suffixes (`.uat`, `.qa`, `.internal`).
+82. **`logcat_grep` after the fact misses what `intent_send` catches in-flight.** The okhttp body-logging finding was missed by `logcat_grep("okhttp")` (capture started after bootstrap) but caught by `intent_send`'s embedded logcat watch (which fires the intent then captures for `timeout` seconds). For "is X logging" questions, use `intent_send` to *cause* the activity then watch — don't grep historical logs and assume silence means absence.

@@ -1,0 +1,839 @@
+---
+name: pr-watch
+description: PR のレビューコメントと CI 失敗を監視し、ユーザー確認なしで自動で修正・コミット・プッシュ・返信を行う。Monitor ツール利用可能時はイベント駆動 (最大 60 分)、利用不可時は 2 分間隔ポーリング (最大 120 分) にフォールバックする。pr-fix と pr-ci を統合し自律実行する。Use when PR の監視、自動修正、ウォッチを求められた際に使用する。
+argument-hint: '[<pr-number>]'
+allowed-tools:
+  - Bash
+  - Read
+  - Edit
+  - Glob
+  - Grep
+  - Write
+  - Monitor
+  - Task
+  - TaskCreate
+  - TaskUpdate
+  - TaskList
+  - TaskStop
+---
+
+# PR 監視・自動修正ワークフロー
+
+PR のレビューコメントと CI 失敗を監視し、検出次第自動で修正・コミット・プッシュ・返信を実行する。Monitor ツールが利用可能な環境ではバックグラウンドのイベント駆動で監視し、利用できない環境では agent 自身がフォアグラウンドの 2 分間隔ループを駆動するポーリングモードにフォールバックする。
+
+**Monitor 利用不可時のフォールバックに関する重要な注意:** Monitor ツールが使えない環境で `Bash run_in_background` を使ってループスクリプトを背景化することは禁止する。背景プロセスの stdout に書き出されるイベントは agent が能動的に読み出さない限り検知できないため、イベントが発生しても処理が進まなくなる (本 skill の過去の運用で実際に発生した既知の落とし穴)。フォールバック時は必ずポーリングモード (ステップ 2B) を採用し、agent 自身が個別の Bash 呼び出しでサイクルを駆動する。
+
+## 重要な原則
+
+1. **ユーザー確認は一切行わない** - 全ステップを自律的に実行する。修正ファイル数や変更規模に関わらず確認をスキップする
+2. **レビュー修正を CI 修正より優先する** - 同時に検出した場合はレビューを先に処理する。レビュー修正のプッシュ後、CI 結果が更新されるのを待ってから CI 修正に取りかかる
+3. **修正は最小限に留める** - レビュー指摘・CI エラーの修正に必要な変更のみ
+4. **コミットメッセージは commit-proposer subagent で生成する** - Conventional Commits / commitlint 設定に準拠
+5. **コミットメッセージ・返信コメントの言語は対象リポジトリに従う** - 既存の PR やコミット履歴を確認し、使用されている言語に合わせる
+6. **日本語でコミットメッセージ・返信コメントを書く場合は `japanese-text-style` スキルに従う**
+7. **対応不要と判断したレビューコメントは理由を返信して resolve する**
+8. **コンフリクトを検出したら自動で解消して監視を継続する**
+9. **修正で PR の実態が変わった場合のみ、タイトル・description を自動更新する** - 軽微な修正 (typo、lint、フォーマット) では更新しない。テンプレートや既存フォーマットを維持する
+
+## 監視パラメータ
+
+Monitor ツールの利用可否によって監視方式を切り替える。
+
+### Monitor モード (Monitor ツール利用可能時)
+
+| パラメータ     | 値                                                                              |
+| -------------- | ------------------------------------------------------------------------------- |
+| 監視方式       | バックグラウンドスクリプト (`persistent: true`)                                 |
+| ポーリング間隔 | 60 秒                                                                           |
+| アイドル上限   | 30 分 (レビュー/CI 失敗/コンフリクト等の活動が一度も検出されなかった場合に終了) |
+| 絶対上限       | 60 分 (活動有無に関わらず強制終了)                                              |
+| 即時終了条件   | PR クローズ/マージ済み                                                          |
+
+### ポーリングモード (Monitor ツール利用不可時のフォールバック)
+
+| パラメータ     | 値                                                                              |
+| -------------- | ------------------------------------------------------------------------------- |
+| 監視方式       | フォアグラウンド `sleep` ループ                                                 |
+| ポーリング間隔 | 120 秒                                                                          |
+| アイドル上限   | 30 分 (レビュー/CI 失敗/コンフリクト等の活動が一度も検出されなかった場合に終了) |
+| 絶対上限       | 120 分 (`HAD_ACTIVITY` に関わらず強制終了)                                      |
+| 即時終了条件   | PR クローズ/マージ済み                                                          |
+| 修正発生時     | `START_TIME` をリセットせず引き続き監視を継続                                   |
+
+## イベント一覧
+
+Monitor スクリプトが stdout に出力するイベント。各行が 1 イベント。
+
+| イベント                             | 意味                                                      | 対応                        |
+| ------------------------------------ | --------------------------------------------------------- | --------------------------- |
+| `NEW_REVIEWS\|thread_id1,thread_id2` | 新しい未解決レビュースレッドを検出                        | レビュー修正を実行 (3a)     |
+| `CI_FAIL\|run_id1,run_id2`           | CI 失敗を検出 (全 run 完了後、run ID のみ)                | CI 修正を実行 (3b)          |
+| `PR_MERGED`                          | PR がマージされた                                         | 監視終了 → 完了報告 (4)     |
+| `PR_CLOSED`                          | PR がクローズされた                                       | 監視終了 → 完了報告 (4)     |
+| `PR_CONFLICT`                        | コンフリクトが発生した                                    | コンフリクト解消を実行 (3d) |
+| `TIMEOUT_IDLE\|Xmin`                 | アイドルタイムアウト (30 分)                              | 監視終了 → 完了報告 (4)     |
+| `TIMEOUT_ABS\|Xmin`                  | 絶対タイムアウト (60 分) または API エラー 3 サイクル連続 | 監視終了 → 完了報告 (4)     |
+
+## 状態管理
+
+監視全体で以下の状態を管理する:
+
+- `WATCH_MODE`: 監視方式 (`monitor` または `polling`)
+- `PR_NUMBER`: PR 番号
+- `OWNER`, `REPO`: リポジトリ情報
+- `MY_LOGIN`: 自分の GitHub ユーザー名 (`gh api user --jq '.login'` で取得、自分のコメントを除外するため)
+- `MONITOR_ID`: Monitor のタスク ID (Monitor モードのみ、TaskStop で終了するため)
+- `START_TIME`: 監視開始時刻 (UNIX タイムスタンプ、ポーリングモードのみ)
+- `HAD_ACTIVITY`: false (レビュー/CI 失敗/コンフリクト等の活動を一度でも検出したら true。ポーリングモードでアイドルタイムアウト判定に使用)
+- `CYCLE_COUNT`: 実行サイクル数 (ポーリングモードのみ)
+- `PREV_THREADS`: 前回サイクルで観測した未解決スレッドのスナップショット (ポーリングモードのみ。`"<thread_id>:<comment_count>"` をカンマ区切りで保持。各サイクルで現在のスナップショットと差分を取り、新規/コメント追加されたスレッド ID のみをステップ 3a の処理対象として渡す)
+- `API_ERROR_STREAK`: gh CLI / GitHub API の連続エラー回数 (ポーリングモードのみ。各サイクルで API 呼び出しが 1 つでも失敗したら +1、全成功したら 0 にリセット。3 に達したらネットワーク障害と判断して監視終了)
+- `PREV_CONFLICT`: 前回サイクルでコンフリクト検出済みかを示すフラグ (ポーリングモードのみ。`true` の間はステップ 3d を再実行しない。`mergeable != CONFLICTING` を観測したサイクルで `false` にリセット)
+- `UNFIXABLE_RUNS`: 修正不可能と判断した CI run ID のリスト (以降の処理で同じ失敗の再処理をスキップする)
+- `REVIEW_COMMITS`: レビュー修正コミット数
+- `CI_COMMITS`: CI 修正コミット数
+- `REPLIED_COMMENTS`: 返信済みコメント数
+- `RESOLVED_THREADS`: resolve 済みスレッド数
+- `PR_UPDATES`: PR タイトル・description の更新回数
+- `CONFLICT_RESOLVES`: コンフリクト解消回数
+- `RE_REQUESTED_REVIEWERS`: レビュー再リクエスト済みユーザーのリスト
+
+## 作業開始前の準備
+
+**必須:** 作業開始前に TaskList で残存タスクを確認し、存在する場合は全て TaskUpdate({ status: "deleted" }) で削除する。その後、TaskCreate ツールで以下のタスクを登録する:
+
+```
+TaskCreate({ subject: "PR の特定", description: "引数または現在のブランチから PR を特定", activeForm: "PR を特定中" })
+TaskCreate({ subject: "監視方式の決定とセットアップ", description: "Monitor 利用可否を判定し、Monitor またはポーリングをセットアップ", activeForm: "監視をセットアップ中" })
+TaskCreate({ subject: "監視・イベント対応", description: "監視を継続し、検出したレビュー/CI 失敗/コンフリクトに対応", activeForm: "PR を監視中" })
+TaskCreate({ subject: "監視終了・完了報告", description: "監視結果を集計して報告", activeForm: "完了報告を作成中" })
+```
+
+各ステップの開始時に TaskUpdate で `in_progress` に、完了時に `completed` に更新する。
+
+## 実行手順
+
+### 1. PR の特定
+
+引数で PR 番号が指定されていない場合、現在のブランチから PR を特定する:
+
+```bash
+gh pr view --json number,title,headRefName,state --jq '{number, title, headRefName, state}'
+```
+
+- PR が `MERGED` または `CLOSED` の場合は監視を開始せず終了する
+- PR が見つからない場合は「現在のブランチに紐づく PR が見つかりません。PR 番号を指定して再実行してください。」と報告して終了する
+
+状態変数を初期化する。初期化時に `MY_LOGIN=$(gh api user --jq '.login')` で自分の GitHub ユーザー名を取得する。
+
+### 2. 監視方式の決定
+
+Monitor ツールが利用可能か判定する。判定は以下の手順で行う:
+
+1. ステップ 2A (Monitor モード) のセットアップを試行する
+2. 起動成功 (Monitor がタスク ID を返す) → `WATCH_MODE = "monitor"` とし、Monitor モードで継続する
+3. 起動失敗 (ツールが見つからない、Permission Denied、起動コマンドが即座にエラー終了する等) → Monitor タスクが残っていれば TaskStop で停止し、`WATCH_MODE = "polling"` としてステップ 2B (ポーリングモード) にフォールバックする
+
+**判定の早期切り上げ:** allowed-tools に `Monitor` が含まれていても、ツール呼び出し自体が `tool not found` のようなエラーで弾かれる場合は試行を 1 回で打ち切り、ポーリングモードへ移行する。リトライしない。
+
+判定後、ユーザーに採用した監視方式を一行で報告する:
+
+```
+監視方式: Monitor モード (バックグラウンドイベント駆動)
+```
+
+または
+
+```
+監視方式: ポーリングモード (Monitor ツールが利用できないため、2 分間隔のフォアグラウンド監視にフォールバック)
+```
+
+### 2A. Monitor モード セットアップ
+
+以下の要件でバックグラウンド監視スクリプトを作成し、Monitor ツールで起動する。
+
+**スクリプトの要件:**
+
+1. 60 秒間隔で PR 状態・レビュースレッド・CI ステータスをチェックする
+2. 状態変化を検出した場合のみ stdout にイベントを出力する (変化がなければ何も出力しない)
+3. 終了条件 (マージ/クローズ/タイムアウト) を満たしたら対応イベントを出力して exit する。コンフリクト検出時はイベントを出力するが exit しない (監視を継続する)
+4. API エラー時はスキップして次のサイクルに進む (3 サイクル連続失敗で `TIMEOUT_ABS` を出力して exit)
+
+**スクリプトテンプレート:**
+
+`<OWNER>`, `<REPO>`, `<PR_NUMBER>`, `<MY_LOGIN>` はステップ 1 で取得した値で置き換える。
+
+```bash
+#!/bin/bash
+set -uo pipefail
+
+OWNER="<OWNER>"; REPO="<REPO>"; PR_NUMBER=<PR_NUMBER>; MY_LOGIN="<MY_LOGIN>"
+START=$(date +%s)
+IDLE_LIMIT=1800; ABS_LIMIT=3600
+PREV_THREADS=""; PREV_FAILS=""; PREV_SHA=""
+HAD_ACT=false; API_ERRORS=0; PREV_CONFLICT=false
+
+while true; do
+  NOW=$(date +%s); ELAPSED=$(( (NOW - START) / 60 ))
+
+  # タイムアウト判定
+  [ $((NOW - START)) -ge $ABS_LIMIT ] && echo "TIMEOUT_ABS|${ELAPSED}min" && exit 0
+  [ "$HAD_ACT" = false ] && [ $((NOW - START)) -ge $IDLE_LIMIT ] && echo "TIMEOUT_IDLE|${ELAPSED}min" && exit 0
+
+  API_FAIL=false
+
+  # PR 状態チェック
+  PRI=$(gh pr view "$PR_NUMBER" -R "$OWNER/$REPO" --json state,mergeable,headRefOid 2>/dev/null) || API_FAIL=true
+
+  if [ "$API_FAIL" = false ]; then
+    ST=$(echo "$PRI" | jq -r '.state')
+    MG=$(echo "$PRI" | jq -r '.mergeable')
+    SHA=$(echo "$PRI" | jq -r '.headRefOid')
+
+    [ "$ST" = "MERGED" ] && echo "PR_MERGED" && exit 0
+    [ "$ST" = "CLOSED" ] && echo "PR_CLOSED" && exit 0
+    if [ "$MG" = "CONFLICTING" ]; then
+      [ "$PREV_CONFLICT" = false ] && echo "PR_CONFLICT" && HAD_ACT=true
+      PREV_CONFLICT=true
+    else
+      PREV_CONFLICT=false
+    fi
+
+    # 新コミット検出時: CI 失敗トラッキングをリセット
+    if [ "$SHA" != "$PREV_SHA" ]; then
+      PREV_SHA="$SHA"
+      PREV_FAILS=""
+    fi
+
+    # 未解決レビュースレッド取得
+    TJ=$(gh api graphql -f query='
+      query {
+        repository(owner: "'"$OWNER"'", name: "'"$REPO"'") {
+          pullRequest(number: '"$PR_NUMBER"') {
+            reviewThreads(first: 100) {
+              nodes {
+                id
+                isResolved
+                comments(first: 100) {
+                  totalCount
+                  nodes { author { login } }
+                }
+              }
+            }
+          }
+        }
+      }' 2>/dev/null) || API_FAIL=true
+
+    if [ "$API_FAIL" = false ]; then
+      # フィルタ: 未解決 かつ 自分以外のコメント (スレッド ID + コメント数で変化を検出)
+      CT=$(echo "$TJ" | jq -r --arg m "$MY_LOGIN" \
+        '[.data.repository.pullRequest.reviewThreads.nodes[]
+          | select(.isResolved == false)
+          | select(.comments.nodes[0].author.login != $m)
+          | .id + ":" + (.comments.totalCount | tostring)] | sort | join(",")')
+
+      # 新規または変化のあるスレッドを抽出 (PREV_THREADS に含まれないエントリ)
+      # エントリは "thread_id:comment_count" 形式。コメント追加時も変化を検出する
+      if [ -n "$CT" ]; then
+        NEW_T=""
+        IFS=',' read -ra CUR_ARR <<< "$CT"
+        for entry in "${CUR_ARR[@]}"; do
+          case ",$PREV_THREADS," in
+            *",$entry,"*) ;; # 既知 (ID もコメント数も同一)
+            *) tid="${entry%%:*}"; NEW_T="${NEW_T:+$NEW_T,}$tid" ;;
+          esac
+        done
+        [ -n "$NEW_T" ] && echo "NEW_REVIEWS|$NEW_T" && HAD_ACT=true
+      fi
+      PREV_THREADS="$CT"
+    fi
+
+    # CI ステータスチェック
+    if [ -n "$SHA" ]; then
+      CI_API_OK=true
+      RJ=$(gh run list --commit "$SHA" -R "$OWNER/$REPO" --json databaseId,status,conclusion,name -L 50 2>/dev/null) || CI_API_OK=false
+
+      if [ "$CI_API_OK" = true ]; then
+        # in_progress / queued があれば CI 確定待ち → スキップ
+        IP=$(echo "$RJ" | jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+
+        if [ "$IP" -eq 0 ] && [ "$(echo "$RJ" | jq 'length')" -gt 0 ]; then
+          CF=$(echo "$RJ" | jq -r '[.[] | select(.conclusion == "failure") | (.databaseId | tostring)] | sort | join(",")')
+
+          # 新しい失敗のみ検出 (PREV_FAILS に含まれない run ID のみ抽出)
+          if [ -n "$CF" ]; then
+            NEW_F=""
+            IFS=',' read -ra CUR_FAIL_ARR <<< "$CF"
+            IFS=',' read -ra PRV_FAIL_ARR <<< "$PREV_FAILS"
+            for fid in "${CUR_FAIL_ARR[@]}"; do
+              IS_KNOWN=false
+              for pfid in "${PRV_FAIL_ARR[@]}"; do
+                [ "$fid" = "$pfid" ] && IS_KNOWN=true && break
+              done
+              [ "$IS_KNOWN" = false ] && NEW_F="${NEW_F:+$NEW_F,}$fid"
+            done
+            [ -n "$NEW_F" ] && echo "CI_FAIL|$NEW_F" && HAD_ACT=true
+          fi
+          PREV_FAILS="$CF"
+        fi
+      else
+        API_FAIL=true
+      fi
+    fi
+  fi
+
+  # サイクル単位の API エラー判定
+  if [ "$API_FAIL" = true ]; then
+    API_ERRORS=$((API_ERRORS + 1))
+    [ $API_ERRORS -ge 3 ] && echo "TIMEOUT_ABS|${ELAPSED}min" && exit 0
+  else
+    API_ERRORS=0
+  fi
+
+  sleep 60
+done
+```
+
+**Monitor 起動:**
+
+```
+Monitor({
+  description: "PR #<PR_NUMBER> 監視",
+  persistent: true,
+  command: "bash /tmp/pr-monitor-<PR_NUMBER>.sh"
+})
+```
+
+起動前にスクリプトを `/tmp/pr-monitor-<PR_NUMBER>.sh` に書き出す。Monitor が返すタスク ID を `MONITOR_ID` として保持する。
+
+起動後、ユーザーに監視開始を報告する:
+
+```
+PR #<number> (<title>) の監視を開始しました。
+60 秒間隔でレビューコメントと CI 失敗を監視します。
+検出次第自動で修正・コミット・プッシュ・返信を行います。
+```
+
+`WATCH_MODE = "monitor"` の場合はステップ 3 (イベント対応) に進む。
+
+### 2B. ポーリングモード (Monitor 利用不可時のフォールバック)
+
+Monitor ツールが利用できない場合、**agent 自身がフォアグラウンドでループを駆動する**。各サイクルは「個別の Bash ツール呼び出しによる状態チェック → 検出したイベントへの対応 → フォアグラウンドの `sleep 120` によるスリープ」の繰り返しで構成する。
+
+**重要 (絶対遵守):**
+
+- **`run_in_background: true` でループスクリプトを起動してはならない**。Monitor を模した bash ループスクリプトを `run_in_background` で起動すると、バックグラウンド Bash の標準出力に書き出されたイベント (`NEW_REVIEWS|...` など) を agent が能動的に取得しない限り検知できず、イベントが発生しても処理が進まない。フォアグラウンドのポーリングモードでは「agent が次のサイクルを能動的に開始する」セマンティクスを崩してはならない
+- **ループ全体を 1 つの bash スクリプトにまとめてはならない**。状態管理 (`PREV_THREADS` 等) は agent 側の変数として保持し、各サイクルの API 呼び出し・差分計算・イベント対応・スリープを個別の Bash 呼び出しに分割する。これにより agent はサイクル間で状態を直接観測し、検出したイベントに対して 3a / 3b / 3c / 3d の手順を即座に実行できる
+- **`sleep 120` だけは単独の Bash 呼び出しで実行する**。スリープ中に他の処理を挟まず、終了次第 2B-1 に戻る
+
+以下の変数で初期化する:
+
+- `START_TIME=$(date +%s)`
+- `HAD_ACTIVITY=false`
+- `CYCLE_COUNT=0`
+- `PREV_THREADS=""` (前回観測した未解決スレッドのスナップショット。`"<thread_id>:<comment_count>"` 形式のエントリをカンマ区切りで保持)
+- `PREV_SHA=""` (前回観測した PR の `headRefOid`。新コミット検出時に `PREV_CI_FAILS` をリセットする判定に使用)
+- `PREV_CI_FAILS=""` (前回観測した CI 失敗 run ID のカンマ区切りスナップショット。サイクル間での重複処理を防ぐ)
+- `API_ERROR_STREAK=0` (gh CLI / GitHub API の連続エラー回数)
+- `PREV_CONFLICT=false` (前回サイクルでコンフリクト検出済みフラグ)
+
+ユーザーに監視開始を報告する:
+
+```
+PR #<number> (<title>) のポーリング監視を開始しました。
+2 分間隔でレビューコメントと CI 失敗をチェックします。
+検出次第自動で修正・コミット・プッシュ・返信を行います。
+```
+
+#### 2B-1. サイクル先頭の経過時間チェック
+
+各サイクルの先頭で経過時間を確認する:
+
+- 経過 120 分超過 → 監視終了 (絶対上限到達) → ステップ 4 へ
+- 経過 30 分超過 かつ `HAD_ACTIVITY = false` → 監視終了 (アイドルタイムアウト) → ステップ 4 へ
+
+#### 2B-2. PR 状態チェック
+
+```bash
+gh pr view <number> --json state,mergeable,headRefOid --jq '{state, mergeable, headRefOid}'
+```
+
+取得した値を以下の通り扱う:
+
+- `state` が `MERGED` / `CLOSED` → 監視終了 → ステップ 4 へ
+- `mergeable` が `CONFLICTING` かつ `PREV_CONFLICT == false` → `HAD_ACTIVITY = true`、`PREV_CONFLICT = true` とし、ステップ 3d (コンフリクト解消) を実行。解消成功時は次サイクルへ継続、解消失敗時のみユーザー通知して監視終了
+- `mergeable` が `CONFLICTING` かつ `PREV_CONFLICT == true` → 直前サイクルで既に処理済みのためステップ 3d をスキップ (重複処理回避)
+- `mergeable` が `CONFLICTING` 以外 → `PREV_CONFLICT = false` にリセット (次回 `CONFLICTING` を観測したら再度 3d を実行可能にする)
+- `headRefOid` を当該サイクル中の `CURRENT_SHA` 変数として保持する (2B-3 の CI クエリで使用)
+- `CURRENT_SHA` が `PREV_SHA` と異なる (初回サイクルで `PREV_SHA` が空文字の場合も含む) → 新コミット検出として `PREV_CI_FAILS = ""` にリセットしてから 2B-3 へ進む。`PREV_SHA` の更新はサイクル末尾 (2B-4) で `PREV_SHA = CURRENT_SHA` を実行
+
+#### 2B-3. レビュー/CI チェック
+
+ステップ 3a の冒頭にある未解決レビュースレッド取得と、ステップ 3b の CI 失敗確認を実行する。
+
+**レビュースレッド差分計算 (Monitor 側 `PREV_THREADS` ロジックの再現):**
+
+1. 未解決スレッドのうち、最初のコメントが `MY_LOGIN` 以外のものを抽出し、`<thread_id>:<comment_count>` 形式のエントリのカンマ区切り文字列 (現在スナップショット `CURRENT_THREADS`) を作る
+2. 現在スナップショットの各エントリが `PREV_THREADS` に含まれていないものを「新規/コメント追加されたスレッド」とし、その thread_id のみをステップ 3a の処理対象として渡す (Monitor の `NEW_REVIEWS` と同等のセマンティクス)
+3. 処理対象が 1 件以上あれば `HAD_ACTIVITY = true` とし、ステップ 3a を実行する
+4. サイクル末尾で `PREV_THREADS = CURRENT_THREADS` に更新する (3a の実行可否や成功可否に関わらず、観測した最新スナップショットを保存。次サイクル以降の重複処理を防ぐ)
+
+**CI 失敗チェック (Monitor 側 `PREV_FAILS` ロジックの再現):**
+
+1. `gh run list --commit "$CURRENT_SHA" -R "$OWNER/$REPO" --json databaseId,status,conclusion,name -L 50` で当該サイクルの head commit に紐づく CI run を取得する (Monitor スクリプトの `gh run list --commit "$SHA"` と同等。常に 2B-2 で取得した `CURRENT_SHA` を渡し、`PREV_SHA` は新コミット検出のための比較専用とする)
+2. `in_progress` / `queued` の run が 1 件でもあれば確定待ちとして CI チェックをスキップ (次サイクルへ)
+3. 全 run が完了している場合、`conclusion == "failure"` の run ID をソート済みカンマ区切りで抽出し、現在スナップショット `CURRENT_CI_FAILS` を作る
+4. 現在スナップショットの各 run ID が `PREV_CI_FAILS` に含まれず、かつ `UNFIXABLE_RUNS` にも含まれないものを「新規 CI 失敗」とし、その run ID のみをステップ 3b の処理対象として渡す (Monitor の `CI_FAIL` と同等のセマンティクス)
+5. 処理対象が 1 件以上あれば `HAD_ACTIVITY = true` とし、ステップ 3b を実行する
+6. サイクル末尾で `PREV_CI_FAILS = CURRENT_CI_FAILS` に更新する (3b の実行可否や成功可否に関わらず、観測した最新スナップショットを保存)
+7. 修正コミットが発生した場合は ステップ 3c (PR タイトル・description 更新判断) を実行
+
+**SHA 変化時の `PREV_CI_FAILS` リセット:** ステップ 2B-2 で新コミット検出時 (`CURRENT_SHA != PREV_SHA`) に `PREV_CI_FAILS = ""` を実行済みのため、新コミット後の最初のサイクルでは全失敗 run が新規として処理対象となる。これは Monitor スクリプトの SHA 変化時 `PREV_FAILS=""` リセット (テンプレート参照) と同等の挙動。
+
+**優先順位:** 同一サイクル内でレビューと CI の両方を検出した場合、レビュー修正を先に実行する。
+
+#### 2B-4. 次のサイクルへ
+
+サイクル末尾でスナップショット類を最新値に更新する (次サイクルの差分計算基準):
+
+- `PREV_THREADS = CURRENT_THREADS`
+- `PREV_CI_FAILS = CURRENT_CI_FAILS` (CI チェックがスキップされた場合は更新しない)
+- `PREV_SHA = CURRENT_SHA`
+
+レビュー修正・CI 修正のいずれも不要だった場合、120 秒スリープする。**スリープは agent が単独の Bash 呼び出しとして実行する** (`run_in_background: false`)。`run_in_background: true` でスリープをバックグラウンド化すると以降のサイクル制御が崩れるため絶対に行わない:
+
+```bash
+# Bash ツールの timeout パラメータ (ミリ秒) は安全マージンとして 180000 (180 秒) に設定し、実際のスリープは 120 秒とする
+# run_in_background は必ず false (デフォルト)
+sleep 120
+```
+
+修正を行った場合はスリープせず即座に次のサイクルへ進む (プッシュ直後の CI 結果を早く確認するため)。
+
+`CYCLE_COUNT` をインクリメントしてステップ 2B-1 に戻る (agent 自身が次のサイクルの先頭処理を能動的に開始する)。
+
+#### 2B エラーハンドリング
+
+- gh CLI エラー時:
+  - 当該サイクル中の API 呼び出しが 1 つでも失敗したら `API_ERROR_STREAK = API_ERROR_STREAK + 1` とし、当該サイクルはスキップして次のサイクルに進む
+  - 当該サイクル中の API 呼び出しが全て成功したら `API_ERROR_STREAK = 0` にリセットする
+  - `API_ERROR_STREAK >= 3` (3 サイクル連続エラー) でネットワーク障害と判断して監視終了 (API エラー絶対上限) → ステップ 4 へ
+- プッシュ失敗時: `git pull --rebase origin <branch>` → `git push`。rebase 失敗時はコンフリクトとして扱い、ステップ 3d (コンフリクト解消) を実行。3d も失敗した場合はユーザーに通知して監視終了
+
+### 3. イベント対応 (両モード共通)
+
+修正・返信処理は Monitor モード/ポーリングモード共通のロジックを使用する:
+
+- **Monitor モード:** Monitor からの通知 (`NEW_REVIEWS` / `CI_FAIL` / `PR_CONFLICT`) を受信したら、対応するサブセクションを実行する
+- **ポーリングモード:** ステップ 2B-2 / 2B-3 のチェックで検出された項目に対して、対応するサブセクション (3a / 3b / 3c / 3d) を実行する
+
+**優先順位:** 同一通知/同一サイクル内に NEW_REVIEWS と CI_FAIL が含まれる場合、レビュー修正を先に処理する。
+
+#### 3a. NEW_REVIEWS イベント
+
+通知に含まれるスレッド ID (Monitor モード) または、ステップ 2B-3 の差分計算で抽出された thread_id (ポーリングモード) を処理対象とする。
+
+**重複排除:**
+
+- **Monitor モード:** Monitor スクリプトの `PREV_THREADS` で重複排除済み。イベントハンドラ側での追加フィルタは不要
+- **ポーリングモード:** ステップ 2B-3 の差分計算 (現在スナップショットと状態管理の `PREV_THREADS` の比較) で重複排除済み。3a 側での追加フィルタは不要
+
+**詳細取得:**
+
+処理対象のスレッドについて、完全なコメント情報を取得する:
+
+```bash
+# <owner>, <repo>, <number> は実際の値に置き換える
+gh api graphql -F query='
+query {
+  repository(owner: "<owner>", name: "<repo>") {
+    pullRequest(number: <number>) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 10) {
+            nodes {
+              databaseId
+              body
+              path
+              line
+              author { login }
+            }
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+取得したスレッドのうち、処理対象の ID に一致するもののみ使用する。
+
+**妥当性判断の基準:**
+
+| 指摘の種類                       | 判断       | 対応                                       |
+| -------------------------------- | ---------- | ------------------------------------------ |
+| コードの正確性に関する指摘       | 修正が必要 | コードを修正                               |
+| セキュリティに関する指摘         | 修正が必要 | コードを修正                               |
+| パフォーマンスに関する指摘       | 修正が必要 | コードを修正                               |
+| スタイルや好みの問題 (`nits:`)   | 内容次第   | コードを修正または、理由を返信して resolve |
+| 誤解に基づく指摘                 | 対応不要   | 説明を返信して resolve                     |
+| 既に別のコミットで対応済みの指摘 | 対応不要   | 対応済みの旨を返信して resolve             |
+
+**ファクトチェック (必須):**
+
+レビューの指摘を鵜呑みにせず、技術的な主張や根拠が正しいか検証する。特に以下のケースでは必ずファクトチェックを行う:
+
+- 言語仕様・ランタイムの挙動に関する指摘
+- フレームワーク・ライブラリの API や推奨パターンに関する指摘
+- セキュリティに関する指摘
+- パフォーマンスに関する指摘
+- 「〜すべき」「〜は非推奨」など規範的な主張
+
+**ファクトチェックのソース優先順位:**
+
+| 優先度 | ソース          | 用途                                                         |
+| ------ | --------------- | ------------------------------------------------------------ |
+| 1      | LSP             | コードベース内の定義・参照・型情報の確認                     |
+| 2      | deepwiki MCP    | OSS リポジトリの Wiki・ドキュメント                          |
+| 3      | Antigravity MCP | Web 検索による最新情報の取得 (Gemini の検索グラウンディング) |
+| 4      | context7 MCP    | ライブラリの公式ドキュメントとコード例                       |
+| 5      | WebFetch        | 公式サイト・GitHub・特定 URL の確認                          |
+| 6      | WebSearch       | 最新情報・ブログ・リリースノートの検索                       |
+
+**例外 (上記の優先順位より優先):**
+
+- terraform に関する内容は terraform MCP (`mcp__terraform__*`) が最優先
+- Google Cloud に関する内容は google-developer-knowledge MCP (`mcp__google-developer-knowledge__*`) が最優先
+- Claude Code に関する内容は claude-code-guide agent (`subagent_type: "claude-code-guide"`) が最優先
+
+ファクトチェックの結果、指摘が誤りだった場合はその根拠をソース付きで返信コメントに記載する。
+
+**処理フロー:**
+
+1. 各未解決コメントの妥当性を上記基準で判断し、ファクトチェックで検証する
+2. 修正が必要なコメントに対してコードを修正する
+3. 修正したファイルをステージングする: `git add <修正ファイル>`
+4. commit-proposer subagent でコミットメッセージを生成する:
+
+   ```
+   Task({
+     subagent_type: "git:commit-proposer",
+     description: "コミットメッセージ候補の生成",
+     prompt: "ステージング済みの変更に対してコミットメッセージ候補を提案してください。コンテキスト: レビュー指摘に基づく修正です。subject には「レビュー指摘に基づく修正」のような汎用的な表現ではなく、実際に何を変更したかを具体的に記述してください。"
+   })
+   ```
+
+   subagent がエラーを返した場合は、変更差分から Conventional Commits 形式のメッセージを自前で生成する。その際も subject には実際の変更内容を具体的に記述し、「レビュー指摘に基づく修正」のような汎用表現は使わない。
+
+5. 推奨メッセージ (候補 1) でコミットする
+
+   ```bash
+   # <type>, <scope>, <subject>, <body> は commit-proposer の出力で置き換える
+   git commit -m "$(cat <<'EOF'
+   <type>(<scope>): <subject>
+
+   <body>
+   EOF
+   )"
+   ```
+
+6. `git push` でリモートに反映する
+7. 各コメントに返信・リアクション・resolve を実行する:
+
+   ```bash
+   # 元のコメントに +1 リアクション (databaseId 使用)
+   gh api repos/{owner}/{repo}/pulls/comments/<databaseId>/reactions -f content="+1"
+
+   # スレッドに返信 (GraphQL mutation、thread id 使用)
+   # <thread_id>, <body> は実際の値に置き換える
+   gh api graphql -F query='
+   mutation {
+     addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "<thread_id>", body: "<body>"}) {
+       comment { id body }
+     }
+   }'
+
+   # スレッドを resolve
+   # <thread_id> は実際の値に置き換える
+   gh api graphql -F query='
+   mutation {
+     resolveReviewThread(input: {threadId: "<thread_id>"}) {
+       thread { isResolved }
+     }
+   }'
+   ```
+
+**処理順序:** リアクション追加 → 返信投稿 → resolve。エラーが発生しても続行し、失敗を記録する。
+
+**返信テンプレート:**
+
+| 対応タイプ | 返信例                                        |
+| ---------- | --------------------------------------------- |
+| 修正完了   | `修正しました。ご指摘ありがとうございます。`  |
+| 対応しない | `[理由] のため、現状のままとさせてください。` |
+| 対応済み   | `[コミット hash] で対応済みです。`            |
+
+**ソース参照ルール:**
+
+理由を添えて返信する場合 (対応しない、内容次第で対応不要と判断した場合など)、信頼できるソースの情報を参照できるときはコメントにも記載する。
+
+- 公式ドキュメント (言語仕様、フレームワーク公式ドキュメント等) の URL
+- プロジェクト内の既存コード・設定ファイルのパスと行番号
+- lint ルールやコーディング規約の該当セクション
+- RFC やセキュリティアドバイザリ等の公的な技術文書
+
+**例:**
+
+```
+Go の仕様上、nil map への読み取りはゼロ値を返すためパニックしません。
+ref: https://go.dev/ref/spec#Index_expressions
+
+現状のままとさせてください。
+```
+
+カウンタを更新: `REVIEW_COMMITS`, `REPLIED_COMMENTS`, `RESOLVED_THREADS`。
+
+**レビュー再リクエスト:**
+
+返信・resolve の完了後、対応したスレッドの投稿者に対してレビューの再リクエストを送信する。
+
+1. 返信・resolve したスレッドの投稿者 (最初のコメントの `author.login`) を重複なしで収集する
+2. PR のレビュー一覧を取得し、再リクエスト対象の判定に必要な情報 (ユーザー種別・レビュー状態) を収集する:
+
+   ```bash
+   gh api repos/{owner}/{repo}/pulls/<number>/reviews \
+     --jq '[.[] | {login: .user.login, type: .user.type, state: .state}]'
+   ```
+
+3. 取得したレビュー情報をもとに、以下の条件で再リクエスト対象を判定する:
+
+   | 条件                                                               | 再リクエスト |
+   | ------------------------------------------------------------------ | ------------ |
+   | `user.type` が `Bot` (bot アカウント)                              | スキップ     |
+   | 同一ユーザーの最新レビューが `APPROVED`                            | スキップ     |
+   | `RE_REQUESTED_REVIEWERS` に含まれる (同一監視内で再リクエスト済み) | スキップ     |
+   | 上記に該当しない (人間のレビュワーで未 approve)                    | **送信**     |
+
+   **approve 判定:** 同一ユーザーが複数回レビューしている場合、最新のレビュー状態で判断する。
+
+4. 対象ユーザーがいる場合、再リクエストを送信する:
+
+   ```bash
+   gh api repos/{owner}/{repo}/pulls/<number>/requested_reviewers \
+     -f "reviewers[]=<login1>" -f "reviewers[]=<login2>"
+   ```
+
+5. 送信成功したユーザーを `RE_REQUESTED_REVIEWERS` に追加する。エラーが発生しても続行し、失敗を記録する
+
+#### 3b. CI_FAIL イベント
+
+通知に含まれる run ID を `UNFIXABLE_RUNS` に含まれないものでフィルタし、処理対象とする。
+
+**処理フロー:**
+
+1. ci-analyzer subagent で失敗原因を調査する:
+
+   ```
+   Task({
+     subagent_type: "git:ci-analyzer",
+     description: "CI 失敗原因の調査",
+     prompt: "PR #<number> (ブランチ: <branch>) の CI 失敗を調査してください。"
+   })
+   ```
+
+   subagent がエラーを返した場合は、直接 `gh run view <run-id> --log-failed` でログを取得して分析する。
+
+2. 自動修正可能なエラーのみ修正する
+
+   | エラー種別             | 自動修正 |
+   | ---------------------- | -------- |
+   | Lint/フォーマット      | 可能     |
+   | 型エラー・ビルドエラー | 可能     |
+   | テスト失敗             | 可能     |
+   | 依存関係               | 可能     |
+   | 環境変数・secret       | **不可** |
+   | 権限・認証             | **不可** |
+
+3. 修正不可能なエラーの run ID を `UNFIXABLE_RUNS` に追加し、以降のイベントで再処理をスキップする。完了報告で通知する
+4. 修正したファイルをステージング: `git add <修正ファイル>`
+5. commit-proposer subagent でコミットメッセージを生成する (エラー時は自前生成にフォールバック)
+6. 推奨メッセージでコミットする
+7. `git push` でリモートに反映する
+
+カウンタを更新: `CI_COMMITS`。
+
+#### 3c. 修正後の PR タイトル・description 更新判断
+
+レビュー修正 (3a) または CI 修正 (3b) でコミットをプッシュした場合のみ実行する。コミットがなかった場合はスキップする。
+
+**判断手順:**
+
+1. PR の全 diff と現在のタイトル・description を取得する:
+
+   ```bash
+   gh pr view <number> --json title,body,commits,files,additions,deletions
+   gh pr diff <number> --stat
+   ```
+
+2. 以下の基準で更新の要否を判断する:
+
+   | 条件                                                       | 判断 |
+   | ---------------------------------------------------------- | ---- |
+   | 修正で PR の type/scope が変わった (例: `feat` → `fix`)    | 更新 |
+   | description に記載の変更内容が実態と矛盾している           | 更新 |
+   | 修正で新しい機能追加や破壊的変更が加わった                 | 更新 |
+   | 軽微な修正のみ (typo、lint、フォーマット、変数名変更)      | 不要 |
+   | description が元々空、または情報量が少なく更新の意味がない | 不要 |
+   | 既に同じサイクルの修正内容を反映済み                       | 不要 |
+
+3. 更新不要と判断した場合はスキップする
+
+**更新処理:**
+
+1. PR テンプレートを確認する:
+
+   ```bash
+   ls -la .github/PULL_REQUEST_TEMPLATE.md 2>/dev/null || \
+   ls -la .github/PULL_REQUEST_TEMPLATE/ 2>/dev/null
+   ```
+
+   - テンプレートが存在する → テンプレートに準拠
+   - テンプレートがない → 既存の description のフォーマットに準拠
+
+2. コミット履歴に基づいてタイトルと description を作成する:
+
+   ```bash
+   git log origin/<base>..HEAD --pretty=format:"%h %s%n%b" --reverse
+   ```
+
+   - タイトルは Conventional Commits 形式。commitlint 設定があれば準拠する
+   - description はコミットメッセージのコピーではなく、変更内容を要約・整理する
+   - ユーザーが手動で追加した情報 (関連 Issue、スクリーンショット等) は保持する
+
+3. 更新を実行する:
+
+   ```bash
+   gh pr edit <number> \
+     --title "新しいタイトル" \
+     --body "$(cat <<'EOF'
+   [新しい description の内容]
+   EOF
+   )"
+   ```
+
+カウンタを更新: `PR_UPDATES`。
+
+#### 3d. PR_CONFLICT イベント / コンフリクト検出
+
+コンフリクトを検出した場合、自動で解消して監視を継続する (Monitor モード/ポーリングモード共通)。
+
+**処理フロー:**
+
+1. ベースブランチ名を取得し、最新を取得してリベースする:
+
+   ```bash
+   BASE=$(gh pr view "$PR_NUMBER" -R "$OWNER/$REPO" --json baseRefName --jq '.baseRefName')
+   git fetch origin "$BASE"
+   git rebase "origin/$BASE"
+   ```
+
+2. コンフリクトが発生した場合、各ファイルのコンフリクトを解消する:
+   - コンフリクトマーカー (`<<<<<<<`, `=======`, `>>>>>>>`) を含むファイルを特定する
+   - 各ファイルの変更内容と PR の意図を考慮して適切に解消する
+   - `git add <解消したファイル>` でステージングする
+   - `git rebase --continue` でリベースを継続する
+
+3. リベース完了後、フォースプッシュする:
+
+   ```bash
+   git push --force-with-lease
+   ```
+
+4. 解消できないコンフリクト (バイナリファイル、大規模な構造変更等) がある場合:
+   - `git rebase --abort` でリベースを中断する
+   - **Monitor モード:** ユーザーに通知して監視を継続する (手動解消を待つ)
+   - **ポーリングモード:** ユーザーに通知して監視を終了する (旧版同等の動作。フォアグラウンドのため手動解消の介在余地が小さい)
+
+カウンタを更新: `CONFLICT_RESOLVES` (解消成功時)。
+
+#### 3e. 終了イベント
+
+**Monitor モード:** `PR_MERGED`, `PR_CLOSED`, `TIMEOUT_IDLE`, `TIMEOUT_ABS` を受信した場合:
+
+1. Monitor を TaskStop で停止する (既に exit 済みの場合もあるが、念のため実行する)
+2. 完了報告 (ステップ 4) に進む
+
+**ポーリングモード:** ステップ 2B-1 / 2B-2 で終了条件を満たした場合、または 2B エラーハンドリングで API エラー連続上限・コンフリクト・rebase 失敗が発生した場合に完了報告 (ステップ 4) に進む。
+
+### 4. 監視終了・完了報告
+
+```
+## PR 監視完了
+
+- PR: #<number> (<title>)
+- 監視方式: <Monitor モード / ポーリングモード>
+- 監視時間: <elapsed> 分
+- 監視サイクル数: N (ポーリングモードのみ。Monitor モードでは省略)
+
+### レビュー修正
+- 修正コミット数: X
+- 返信済みコメント数: Y
+- resolve 済みスレッド数: Z
+- レビュー再リクエスト: L 人 (該当がない場合は省略)
+
+### CI 修正
+- 修正コミット数: A
+- 修正不可能だったエラー: (該当する場合のみ記載)
+
+### PR タイトル・description 更新
+- 更新回数: B (0 の場合はこのセクションを省略)
+
+### コンフリクト解消
+- 解消回数: C (0 の場合はこのセクションを省略)
+
+### 終了理由
+<アイドルタイムアウト (30 分) / 絶対上限到達 (Monitor: 60 分 / ポーリング: 120 分) / API エラー 3 サイクル連続 / PR マージ済み / PR クローズ済み / コンフリクト解消失敗 (ポーリングモード時のみ終了理由となる)>
+
+PR URL: <url>
+```
+
+**初回チェックでレビュー/CI 失敗がなく、全 CI が成功している場合:**
+
+Monitor がイベントを出力せずに動作し続けている状態。ユーザーへの報告は不要 (Monitor の起動報告で十分)。新しいレビューや CI 失敗が発生次第、自動修正する。
+
+## エラーハンドリング
+
+### Monitor 停止時 (Monitor モード)
+
+Monitor が予期せず停止した場合 (スクリプトエラー等)、状態を確認して再起動するか、完了報告して終了する。再起動時にも失敗が続く場合はポーリングモードへフォールバックする選択肢を取る。
+
+**Monitor → ポーリングへ移行する場合の状態遷移:**
+
+- 引き継ぐ状態: `PR_NUMBER`, `OWNER`, `REPO`, `MY_LOGIN`, `UNFIXABLE_RUNS`, `REVIEW_COMMITS`, `CI_COMMITS`, `REPLIED_COMMENTS`, `RESOLVED_THREADS`, `PR_UPDATES`, `CONFLICT_RESOLVES`, `RE_REQUESTED_REVIEWERS` (累積カウンタ・処理済みリストはセッション通算で維持)
+- 再初期化する状態: `WATCH_MODE = "polling"`、`MONITOR_ID = null`、`START_TIME = $(date +%s)` (ポーリング側のタイムアウト基準を移行時点にリセット)、`HAD_ACTIVITY = false`、`CYCLE_COUNT = 0`、`API_ERROR_STREAK = 0`、`PREV_CONFLICT = false` (ポーリング固有の状態を新規開始)
+- 移行直前にスナップショットを取得して初期化する状態 (Monitor モードで処理済みのスレッド/CI/コミットを再処理しないため):
+  - `PREV_THREADS`: 移行直前に `gh api graphql` で現在の未解決スレッドを取得し、`<thread_id>:<comment_count>` 形式でカンマ区切り文字列として設定する。これにより Monitor モードで対応済みだが resolve 失敗で残っているスレッドは初回ポーリングサイクルで「既知」として重複処理を回避できる (resolve はステップ 3a 内で再試行)。新規スレッドやコメント追加されたスレッドのみが差分として検出される
+  - `PREV_SHA`: 移行直前に `gh pr view --json headRefOid` で取得して設定 (新コミット検出基準を移行時点に揃える)
+  - `PREV_CI_FAILS`: 移行直前に `gh run list --commit "$PREV_SHA" --json databaseId,status,conclusion -L 50` で取得し、全 run 完了済みなら `conclusion == "failure"` の run ID をソート済みカンマ区切りで設定。`in_progress` / `queued` が含まれる場合は空文字のままとする
+- 移行をユーザーに一行で報告した後、ステップ 2B のサイクルに合流する
+
+### gh CLI エラー時
+
+- **Monitor モード:** Monitor スクリプト内で 3 サイクル連続の API エラーが発生した場合、ネットワーク障害と判断して `TIMEOUT_ABS` イベントを出力して終了する
+- **ポーリングモード:** 個別の API エラーは当該サイクルをスキップして継続。3 サイクル連続で失敗した場合、ネットワーク障害と判断して監視終了
+
+### プッシュ失敗時
+
+```bash
+git pull --rebase origin <branch>
+git push
+```
+
+rebase が失敗した場合は両モードともコンフリクト解消フロー (3d) を実行する。3d 内の解消失敗時の挙動 (Monitor は継続、ポーリングは終了) に従う。
+
+### subagent エラー時
+
+- **commit-proposer エラー:** 変更差分から Conventional Commits 形式のメッセージを自前で生成する。`git diff --cached --stat` と `git log --oneline -5` を参考にする。subject には実際の変更内容を具体的に記述し、汎用的な表現は使わない
+- **ci-analyzer エラー:** 直接 `gh run view <run-id> --log-failed` でログを取得し、エラーメッセージを分析して修正を試みる

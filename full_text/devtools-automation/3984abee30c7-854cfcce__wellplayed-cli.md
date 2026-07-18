@@ -1,0 +1,553 @@
+---
+name: wellplayed-cli
+description: Use when working with the `@well-played.gg/cli` (`wellplayed`) tool — scaffolding apps, authenticating, running GraphQL operations, and deploying to the WellPlayed Marketplace. Activate whenever the user mentions `wellplayed`, the WellPlayed CLI, marketplace apps, app extensions, platform modules, or wants to query the WellPlayed API outside of the console.
+---
+
+# WellPlayed CLI skill
+
+This skill loads when an agent is using the `@well-played.gg/cli` (`wellplayed`) developer tool. It covers the canonical workflow, every subcommand, and the most useful tips and gotchas — including the new `wellplayed graphql` subcommand that lets you make ad-hoc GraphQL calls (modeled on `gh api graphql`).
+
+## Install
+
+```bash
+npm install -g @well-played.gg/cli
+wellplayed --version
+```
+
+The binary is `wellplayed`. Node ≥ 18 is required.
+
+## Authentication
+
+Run `wellplayed login` once per machine. It uses the OAuth 2.0 Device Flow (RFC 8628):
+
+1. The CLI requests a device code from Hydra.
+2. A short user code + verification URL are printed and your browser is opened automatically.
+3. After you approve, the CLI receives access + refresh tokens and stores them at `~/.wellplayed/credentials.json` (mode `0600`).
+4. Every other CLI command (`graphql`, `deploy`, `create-app`) reuses these credentials and refreshes them transparently on `401`.
+
+Run `wellplayed logout` to revoke the refresh token at Hydra and clear local credentials.
+
+**Tip:** if a command says `Session expired. Run \`wellplayed login\`` even though you logged in recently, your refresh token was rotated by another session — just log in again.
+
+## Subcommands at a glance
+
+| Command | Purpose |
+|---------|---------|
+| `wellplayed init [name]` | Scaffold a new marketplace app (extensions + platform modules) |
+| `wellplayed create-app [name]` | Scaffold a full Vite+React app **and** create the OAuth app on the platform |
+| `wellplayed login` | Authenticate via device flow |
+| `wellplayed logout` | Revoke + clear credentials |
+| `wellplayed dev` | Start a local Vite dev server for your app |
+| `wellplayed graphql [query]` | Run a GraphQL operation against the WellPlayed API (see below) |
+| `wellplayed deploy --app-id <id>` | Build, upload, and submit a release to the Marketplace |
+| `wellplayed install-skills` | Copy bundled SDK skills into `<project>/.claude/skills/` |
+| `wellplayed upgrade` | Upgrade installed `@well-played.gg/*` packages and refresh skills / `.mcp.json` / `CLAUDE.md` (use `--latest` for cross-major bumps; `--rewrite-claude-md` / `--rewrite-mcp-json` for non-interactive overwrites; `-y` to skip prompts) |
+
+## `wellplayed graphql` — the agent's best friend
+
+Modeled on `gh api graphql`. Use it for: ad-hoc API exploration, writing scripts, checking schema-level facts, debugging from the terminal, and pasting output into bug reports.
+
+### Query input (pick exactly one)
+
+| Form | When to use |
+|------|-------------|
+| Positional `[query]` | Quick one-off queries |
+| `-f, --file <path>` | Reusable operations stored in `.graphql` files |
+| `--stdin` (or pipe) | Building queries dynamically in shell scripts |
+
+### Variables
+
+| Flag | Behavior |
+|------|----------|
+| `-F, --field key=value` | JSON-coerces the RHS: `null`, `true`, `false`, integers, floats, and `{...}`/`[...]` literals are parsed. Everything else is a string. **Repeatable.** |
+| `-F key=@file.json` | Inlines a JSON file as the value (typed-field semantics) |
+| `--raw-field key=value` | Same as `-F`, but the value is *always* a string (no coercion) |
+| `--variables <path>` | Loads a JSON object from a file. Merged underneath `-F`/`--raw-field`, which win on conflicts |
+| Dotted keys | `-F input.name=Foo -F input.size=10` builds `{ input: { name: 'Foo', size: 10 } }` |
+
+### Headers / context
+
+| Flag | Behavior |
+|------|----------|
+| `-o, --org <shortId>` | Sets the `organization-id` header. **Required for any operation that isn't decorated `@WithoutOrganization` on the backend.** Validated to match `[A-Za-z0-9_-]+`. |
+| `-H, --header "Key: value"` | Adds an extra HTTP header. Repeatable. `Authorization` and `Content-Type` are reserved. CR/LF and non-ASCII are rejected. |
+
+### Output
+
+By default, `wellplayed graphql` prints the **full GraphQL envelope** (`{ data, errors, extensions }`) and exits with code `1` if `errors[]` is non-empty. This matches `gh api graphql` and preserves the GraphQL "partial data + errors" pattern.
+
+| Flag | Output |
+|------|--------|
+| (default) | `{ "data": ..., "errors": [...]?, "extensions": ...? }` — exit `1` on errors |
+| `--data-only` | Just the `data` payload — throws on any GraphQL error |
+
+### Examples (copy-paste ready)
+
+```bash
+# Quick: who am I?
+wellplayed graphql 'query { currentAccount { id email } }'
+
+# Pipe into jq
+wellplayed graphql 'query { currentAccount { id email } }' --data-only | jq -r '.currentAccount.email'
+
+# Org-scoped mutation with typed nested variables
+wellplayed graphql --org my-org -F input.name=Phoenix -F input.players=10 \
+  'mutation($input: CreateTeamInput!) { createTeam(input: $input) { id } }'
+
+# Operation from file + variables file
+wellplayed graphql -f ./operations/list-tournaments.graphql --variables ./vars.json --org my-org
+
+# Stdin (great for heredocs in shell scripts)
+wellplayed graphql --org my-org <<'GQL'
+  query Tournaments {
+    tournaments(first: 5) { edges { node { id title } } }
+  }
+GQL
+
+# Use it as a typed introspection helper
+wellplayed graphql 'query { __schema { queryType { fields { name } } } }' --data-only \
+  | jq -r '.__schema.queryType.fields[].name'
+```
+
+## Tips and tricks for AI agents
+
+**1. Always set `--org` for org-scoped operations.** If a query/mutation requires it on the backend, you'll get a clear error otherwise. The org is your *short* id — find it via `wellplayed graphql 'query { myOrganizations { shortId name } }' --data-only`.
+
+**2. Default output is the envelope.** When parsing JSON output programmatically, default to handling `{ data, errors }`. If you only care about success-path data and want a clean throw, pass `--data-only`.
+
+**3. Use `-F` over `--raw-field` unless you specifically need the value to stay a string.** `gh`-style coercion is what most users expect — `count=0` should be a number, not the string `"0"`.
+
+**4. Prefer query files for anything non-trivial.** `wellplayed graphql -f ./op.graphql -F input.x=...` is far easier to maintain than a 20-line single-quoted heredoc.
+
+**5. The CLI's `WELLPLAYED_API_URL` env var overrides the API base URL** — point it at staging when you need to: `WELLPLAYED_API_URL=https://api.warrior.stg.well-played.gg/ wellplayed graphql ...`.
+
+**6. Don't paste credentials.json or auth headers into bug reports.** The CLI never echoes your access or refresh tokens, but third-party scripts piping the response should be careful.
+
+**7. Combine with the MCP server for schema lookups.** When you need to check a type's exact shape, the MCP at `https://mcp.well-played.gg/mcp` exposes the schema — the CLI is for *running* operations, not browsing types.
+
+**8. Common gotcha — quoting.** In bash, `-F input.name='Phoenix Rising'` works because the shell strips the outer quotes. But `-F "input.name=Phoenix Rising"` puts a literal space in the value. Both work, but pick a style and stick to it.
+
+**9. Forbidden variable keys.** `__proto__`, `constructor`, and `prototype` are rejected to prevent accidental prototype pollution. If you really need those keys server-side, raise it as a backend issue — the CLI won't let them through.
+
+## Full developer workflow
+
+```bash
+# One-time
+npm install -g @well-played.gg/cli
+wellplayed login
+
+# Per-app
+wellplayed init my-app                 # or: wellplayed create-app my-app --framework vite-react
+cd my-app
+npm install
+wellplayed dev                         # local Vite dev server
+wellplayed graphql ...                 # check things while you build
+wellplayed deploy --app-id <appId>     # ship to the Marketplace
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `Not authenticated. Run \`wellplayed login\` first.` | No credentials, or expired and unrefreshable | `wellplayed login` |
+| `Session expired. Run \`wellplayed login\`` | Refresh token rejected by Hydra | `wellplayed login` |
+| `Header "X" is reserved by the CLI` | Trying to override `Authorization` or `Content-Type` via `-H` | Don't — auth is handled by `wellplayed login` |
+| `Forbidden key "__proto__" in variable path` | `-F __proto__.x=1` or similar | Pick a different key |
+| `Field "x" looks like a JSON literal but failed to parse` | Mistyped JSON in `-F`, e.g. `-F input={key:1}` (missing quotes) | Quote keys, or use `--raw-field` to keep as a string |
+| `Invalid --org "..."` | Org id contains spaces, slashes, CR/LF | Use the short id; query `myOrganizations` to find it |
+
+## Journal — debugging runtime events
+
+The **journal** is the platform's append-only log of externally interesting runtime events: rule fires, tournament step generation/reset, manual admin overrides, validator simulations. It replaces the legacy `logs(...)` query (removed) and is the canonical surface for debugging anything the engine did at runtime.
+
+### What it is
+
+- **Entries** are typed records carrying a namespaced `type` (e.g. `rule_engine.advancement_rule.fired`, `tournaments.step.generated`), a `payload` resolved to a concrete `@ObjectType`, an `actor` (who/what produced it), an optional `primaryResource`, and an optional `parentEntryId` so a single rule fire and all its emitted effects form a parent/child trace.
+- Entries are **scoped to the active organization** and visible through:
+  - `journalEntries(page, filters)` — paginated list, most-recent first.
+  - `journalEntry(id)` — single-entry lookup.
+  - `journalEntryAdded(filters)` — live-tail GraphQL subscription.
+- All three require the `organization:journal:view` permission.
+
+### Querying
+
+`JournalFiltersInput` accepts: `categories`, `types`, `typePrefix` (e.g. `rule_engine.`), `actorType`, `actorId`, `primaryResourceType`, `primaryResourceId`, `severity`, `rootOnly`, `parentEntryId`, `correlationId`, `createdAfter`, `createdBefore`, `includeSimulations`.
+
+```bash
+# Last 50 advancement-rule fires for a tournament step.
+wellplayed graphql --org my-org -F stepId=<id> <<'GQL'
+query StepRuleFires($stepId: ID!) {
+  journalEntries(
+    page: { first: 50 }
+    filters: {
+      typePrefix: "rule_engine."
+      primaryResourceType: "tournament_step"
+      primaryResourceId: $stepId
+    }
+  ) {
+    nodes {
+      id type severity createdAt
+      correlationId parentEntryId
+      actor {
+        type id
+        context {
+          __typename
+          ... on AdminActorContext { accountId accountUsername }
+          ... on SystemActorContext { source }
+        }
+      }
+      primaryResource { type id }
+      payload {
+        ... on RuleEngineAdvancementRuleFiredPayload { ruleId ruleName triggerType matched }
+        ... on RuleEngineEffectAdvancePayload { teamId fromGameId toGameId }
+        ... on RuleEngineEffectEliminatePayload { teamId reason }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+GQL
+```
+
+### Subscribing (live tail)
+
+```graphql
+subscription LiveStepJournal($stepId: ID!) {
+  journalEntryAdded(
+    filters: {
+      typePrefix: "rule_engine."
+      primaryResourceType: "tournament_step"
+      primaryResourceId: $stepId
+    }
+  ) {
+    id type severity createdAt
+    payload {
+      ... on RuleEngineAdvancementRuleFiredPayload { ruleId matched }
+    }
+  }
+}
+```
+
+The same `JournalFiltersInput` shape is honored. The server filters every event before it leaves the box, so a narrowly-scoped subscription costs essentially nothing on the client.
+
+### Discriminated payloads
+
+`JournalEntry.payload` is a GraphQL **interface** — clients MUST spread per-type fragments to access typed fields. The 14 concrete payload types are:
+
+| Type | Concrete payload |
+|------|------------------|
+| `rule_engine.advancement_rule.fired` | `RuleEngineAdvancementRuleFiredPayload` |
+| `rule_engine.generation_script.ran` | `RuleEngineGenerationScriptRanPayload` |
+| `rule_engine.seeding_rule.fired` | `RuleEngineSeedingRuleFiredPayload` |
+| `rule_engine.withdrawal_rule.fired` | `RuleEngineWithdrawalRuleFiredPayload` |
+| `rule_engine.cross_step.transferred` | `RuleEngineCrossStepTransferredPayload` |
+| `rule_engine.manual_override` | `RuleEngineManualOverridePayload` |
+| `rule_engine.effect.advance` | `RuleEngineEffectAdvancePayload` |
+| `rule_engine.effect.eliminate` | `RuleEngineEffectEliminatePayload` |
+| `rule_engine.effect.set_metadata` | `RuleEngineEffectSetMetadataPayload` |
+| `rule_engine.effect.end_step` | `RuleEngineEffectEndStepPayload` |
+| `rule_engine.effect.create_group` | `RuleEngineEffectCreateGroupPayload` |
+| `rule_engine.effect.emit_seeding_pin` | `RuleEngineEffectEmitSeedingPinPayload` |
+| `tournaments.step.generated` | `TournamentsStepGeneratedPayload` |
+| `tournaments.step.reset` | `TournamentsStepResetPayload` |
+
+`JournalEntry.actor.context` is also an interface (`JournalActorContextPayload`) — spread per-actor fragments. The 7 concrete actor contexts (one per `JournalActorType`) and their fields:
+
+| `actor.type` | Concrete context | Fields |
+|--------------|------------------|--------|
+| `ADMIN` | `AdminActorContext` | `accountId: ID!`, `accountUsername: String!` |
+| `PLAYER` | `PlayerActorContext` | `playerProfileId: ID!`, `accountId: ID!` |
+| `SYSTEM` | `SystemActorContext` | `source: String!` |
+| `MARKETPLACE_MODULE` | `MarketplaceModuleActorContext` | `appId: ID!`, `marketplaceAppId: ID!`, `installationId: ID!`, `appName: String!` |
+| `API_CLIENT` | `ApiClientActorContext` | `clientId: ID!`, `clientName: String!` |
+| `WEBHOOK_CALLBACK` | `WebhookCallbackActorContext` | `webhookId: ID!`, `deliveryId: ID!` |
+| `SIMULATION` | `SimulationActorContext` | `validationJobId: ID` (nullable), `source: String!` |
+
+Always spread `__typename` on `actor.context` (and on `payload`) when you need to discriminate at runtime — the registry binds `actor.type` (Prisma enum) to the GraphQL `__typename` listed above.
+
+### Tracing a rule fire to its effects
+
+Every entry carries an optional `parentEntryId`. Effect entries emitted by a rule fire share the rule fire's `id` as their `parentEntryId`, and the entire cascade carries a single `correlationId`. Two ways to reconstruct the tree:
+
+1. **Field-resolver walk** — `JournalEntry.children(first, after)` returns a paginated `JournalEntries` ordered by `createdAt` ascending. Use it to drill into one fire.
+2. **Correlation filter** — `journalEntries(filters: { correlationId: $cid })` returns every entry sharing the same correlation id (across multiple parents), useful for a flat timeline view.
+
+```graphql
+query RuleFireTrace($entryId: ID!) {
+  journalEntry(id: $entryId) {
+    id type createdAt
+    children(first: 100) {
+      nodes {
+        id type severity createdAt
+        payload {
+          ... on RuleEngineEffectAdvancePayload { teamId toGameId }
+          ... on RuleEngineEffectEliminatePayload { teamId reason }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+      totalCount
+    }
+  }
+}
+```
+
+### Default exclusions
+
+Entries produced by the `SIMULATION` actor (validator dry-runs, `simulateScript` previews) are **excluded by default** to keep operational dashboards quiet. Opt in explicitly:
+
+```graphql
+journalEntries(filters: { includeSimulations: true }) { ... }
+```
+
+### Permission required
+
+`organization:journal:view` (id of `ORGANIZATION_JOURNAL_VIEW`). All three operations — `journalEntries`, `journalEntry`, and the `journalEntryAdded` subscription — call `permissions.checkPermissionAndThrow` with this id. A caller without the permission gets a `FORBIDDEN` GraphQL error envelope.
+
+For **marketplace modules** this permission is opt-in: installed apps do not receive it implicitly through their default groups (`Anonymous`, `Public`, `Connected`) and must declare it in the manifest and have it granted at installation time. The permission ceiling enforced by the `OauthGuard` (`filterPermissionsByGranted`) strips it from the request context otherwise — even if the org's groups would have granted it. Plan for `FORBIDDEN` on every journal call from a freshly installed module that did not request the permission.
+
+### Error handling
+
+Journal operations only return the standard masked-error envelope. Common cases to handle:
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `FORBIDDEN` on `journalEntries`/`journalEntry`/`journalEntryAdded` | Caller lacks `organization:journal:view`, or module token without granted permission | Grant the permission to the caller's group; for marketplace modules add it to the manifest and re-install |
+| `journalEntry` returns `null` | Entry id does not exist, or belongs to a different organization (cross-tenant lookup is silently null, not an error) | Verify the `--org` short id matches the org the entry was written under |
+| Subscription disconnects immediately | Apollo client missing the WebSocket link, or the auth context expired mid-stream | Reconfigure the link; re-issue token; subscriptions reuse the same `Bearer` and `organization-id` headers as queries |
+| Subscription delivers nothing despite events firing | Filter is too narrow (`primaryResourceId` must match exactly — the server filter is server-side and silent on no-match) | Drop filters one by one; subscribe with no filters first to confirm the channel is hot |
+
+### Retention
+
+Entries are auto-pruned by category. Don't rely on the journal for long-term archival — emit a webhook if you need to mirror events into your own warehouse.
+
+| Category | Default retention |
+|----------|-------------------|
+| `EXECUTION` | 30 days |
+| `AUDIT` | 365 days |
+| `SYSTEM` | 90 days |
+| `SIMULATION` | 7 days |
+
+### Migration from `logs(...)`
+
+The legacy `logs(...)` query, `Log` / `LogType` / `LogAuthorType` / `LogData` types, and `ORGANIZATION_LOGS_VIEW` permission have been removed. Replace every call site with `journalEntries(...)` and adapt to the typed `JournalPayload` interface — see the platform's API deprecations changelog for the full migration note.
+
+## Account identities — linking and unlinking
+
+### `deleteAccountIdentity` mutation
+
+Unlinks an identity provider from an account. This is an admin-or-self operation: a caller can omit `accountId` to act on their own account, or supply it to act on another account (requires the `organization:account:identity:delete` permission scoped to `organization:account:{accountId}:identity:{identityProviderId}`).
+
+**Protected identities:**
+
+- **Creation identity** — the oldest linked identity (resolved by `createdAt` ascending, then `organizationIdentityProviderId`, then `providerId`). Deleting it raises `IDENTITY_CREATION_IDENTITY_NOT_DELETABLE`.
+- **Last identity** — when the account has only one linked identity, deletion raises `IDENTITY_LAST_IDENTITY_NOT_DELETABLE`.
+
+**Error codes:** `ACCOUNT_NOT_FOUND`, `IDENTITY_PROVIDER_NOT_FOUND`, `IDENTITY_NOT_FOUND`, `IDENTITY_LAST_IDENTITY_NOT_DELETABLE`, `IDENTITY_CREATION_IDENTITY_NOT_DELETABLE`.
+
+**`isCreationIdentity` field** — `AccountIdentity` carries an optional `isCreationIdentity: Boolean` field. It is `true` on the identity that cannot be deleted, `null` when not computed in the response (e.g. when fetching a single identity without the full list context).
+
+```bash
+# Self-service: unlink a specific provider from my own account
+wellplayed graphql --org my-org -F identityProviderId=<providerShortId> \
+  'mutation($identityProviderId: ID!) {
+    deleteAccountIdentity(identityProviderId: $identityProviderId)
+  }'
+
+# Admin: unlink a provider from another account
+wellplayed graphql --org my-org \
+  -F identityProviderId=<providerShortId> \
+  -F accountId=<accountShortId> \
+  'mutation($identityProviderId: ID!, $accountId: ID) {
+    deleteAccountIdentity(identityProviderId: $identityProviderId, accountId: $accountId)
+  }'
+```
+
+To discover which identity is the creation identity before unlinking, read the `identities` field with `isCreationIdentity`:
+
+```bash
+wellplayed graphql --org my-org 'query {
+  getMyAccount {
+    identities { organizationIdentityProviderId isCreationIdentity createdAt }
+  }
+}'
+```
+
+### Identity-link redirect contract
+
+When an org-scoped identity provider has a `linkRedirectUrl` configured, the IDP service redirects back to that URL after the OAuth callback completes. Query params are appended with `&`-aware logic (existing params in `linkRedirectUrl` are preserved):
+
+| Scenario | Added params |
+|----------|-------------|
+| Success | `success=true` |
+| Token exchange failure | `success=false`, `error=identity_provider_error` |
+| External identity already attached to another account | `success=false`, `error=identity_already_attached` |
+
+`localhost` URLs are valid in `linkRedirectUrl` (and in all other IDP URL configuration fields). The URL validator does not require a public TLD, so `http://localhost:3000/callback` is accepted.
+
+## Object metadata — visibility and access control
+
+Object metadata entries carry a `visibility` field with two values:
+
+- `PUBLIC` — returned to any caller regardless of authentication state. The `organization-id` header is still required.
+- `PRIVATE` — returned to any caller whose permission set includes `organization:metadata:view` or `organization:metadata:manage`. Authentication state is irrelevant: an organization can grant `organization:metadata:view` to its Anonymous group, in which case unauthenticated callers also receive `PRIVATE` entries. Callers without either permission receive only `PUBLIC` entries — no error is thrown.
+
+Both `objectMetadata(objectType, objectId)` and `objectMetadataBatch(objectType, objectIds[])` are decorated `@Public` — they accept requests without a Bearer token. The server filters the result set based on the caller's permission set, not on whether the caller is authenticated. The `organization-id` header is always required — callers without it are rejected by the platform.
+
+`objectMetadataBatch` accepts up to 100 object IDs in a single request.
+
+**Writing metadata** — `setObjectMetadata` requires `organization:metadata:manage`. Each entry in `SetObjectMetadataInput.entries` carries an explicit `visibility` field (`PUBLIC` or `PRIVATE`).
+
+### Lua `set_metadata` — optional visibility argument
+
+In rule-engine Lua scripts, `set_metadata` accepts an optional fourth argument controlling the visibility of the written entry:
+
+```lua
+-- 3-arg form: defaults to PRIVATE
+set_metadata(team, "key", "value")
+
+-- 4-arg form: explicit visibility
+set_metadata(team, "key", "value", "PUBLIC")
+set_metadata(team, "key", "value", "PRIVATE")
+```
+
+Passing any value other than `"PUBLIC"`, `"PRIVATE"`, or `nil` causes the script to fail with an error matching `/visibility must be one of/i`. Passing `nil` explicitly is equivalent to omitting the argument (defaults to `PRIVATE`).
+
+## Custom fields (visibility & editability)
+
+Custom fields attach typed, org-defined values to entities (players, tournament teams, events, …). Definitions live under **Data → Custom Fields**; values are read/written via the API.
+
+**Visibility** — who can read a value (`PropertyVisibility`):
+
+- `PUBLIC` — everyone, including unauthenticated callers.
+- `OWNER` — only the object's owner (profile owner, team manager, …). Permission holders do **not** see it unless they are also the owner.
+- `OWNER_OR_PERMISSION` — the owner, or a caller holding the field's view permission.
+- `WITH_PERMISSION` — only callers holding the view permission.
+
+Anonymous (unauthenticated) callers are never treated as an owner: they only ever see `PUBLIC` fields plus any field whose view permission is granted to the org's Anonymous/Public group. There is no ownership bypass.
+
+**Editability** — who can write a value (`PropertyEditability`, values `ALWAYS` / `ONE_TIME` / `WITH_PERMISSION`):
+
+- `ALWAYS` — the owner, or a caller with the field's edit permission.
+- `ONE_TIME` — the owner may set it once while empty; a caller with the edit permission may change it at any time.
+- `WITH_PERMISSION` — only a caller with the edit permission.
+
+Re-submitting a field's current value is a no-op. Owners may set their own `ALWAYS` and first-time `ONE_TIME` values without `organization:custom_fields:values:manage`.
+
+Key operations: `customFieldDefinitions(objectType)`, `customFieldValues(objectType, objectId)` and `customFieldValuesBatch(objectType, objectIds)` (both public, visibility-filtered per field), and `setCustomFieldValues(input)`.
+
+### `setCustomFieldValues` — `deleteKeys` argument
+
+`SetCustomFieldValuesInput` accepts an optional `deleteKeys: [String!]` alongside `fields`. The two operations are applied atomically in a single mutation call:
+
+- `fields` — upsert these key-value pairs.
+- `deleteKeys` — delete the stored value rows for these keys.
+
+Constraints:
+
+- Maximum 100 keys per call (`deleteKeys` is capped at 100 entries per mutation invocation).
+- A key must not appear in both `fields` and `deleteKeys` simultaneously (`CUSTOM_FIELD_KEY_IN_BOTH_SET_AND_DELETE`).
+- Required fields can only be deleted via `deleteKeys` by a caller holding `organization:custom_fields:values:manage`; a plain owner without that permission receives `CUSTOM_FIELD_REQUIRED_VALUE_NOT_DELETABLE`. The same restriction applies to `ONE_TIME` fields.
+- Each key in `deleteKeys` must match an existing definition (`CUSTOM_FIELD_DEFINITION_NOT_FOUND`).
+
+```bash
+# Upsert one field and delete another in a single call
+wellplayed graphql --org my-org \
+  -F input.objectType=Tournament \
+  -F input.objectId=<tournamentShortId> \
+  -F 'input.fields=[{"key":"stage","value":"playoffs"}]' \
+  -F 'input.deleteKeys=["legacy_bracket"]' \
+  'mutation($input: SetCustomFieldValuesInput!) {
+    setCustomFieldValues(input: $input) {
+      definition { key name }
+      value
+    }
+  }'
+```
+
+## Tournament seeding — rule-engine steps vs. legacy steps
+
+Every tournament step either has a `StepRuleSet` (built-in template or custom preset script applied via `applyBuiltinPreset` / `applyPresetScript`) or has none. A step with no rule set is a **legacy step** — a permanent, fully-supported configuration for tournaments predating the Lua rule engine, not a half-configured one. `seedTournamentStep` supports both:
+
+```graphql
+mutation SeedStep($input: SeedStepInput, $legacyInput: SeedStepLegacyInput) {
+  seedTournamentStep(input: $input, legacyInput: $legacyInput) {
+    id
+    status       # GENERATED -> SEEDING -> SEEDED
+    seedingOrder
+  }
+}
+```
+
+Pass **exactly one** of the two arguments:
+
+- **`input: SeedStepInput`** — the canonical, rule-engine-driven shape. Use this for any step that has a rule set: an ordered `orderedTeamIds` permutation of the step's teams, plus optional `pins: [SeedingPinInput!]` (group/game/slot anchors). The preset's `SEEDING` / `ROUND_SEEDING` Lua rules drive the actual placement.
+
+  ```bash
+  wellplayed graphql --org my-org \
+    -F input.stepId=<stepId> \
+    -F 'input.orderedTeamIds=["team-A","team-B","team-C","team-D"]' \
+    'mutation($input: SeedStepInput!) { seedTournamentStep(input: $input) { id status } }'
+  ```
+
+- **`legacyInput: SeedStepLegacyInput`** — only meaningful on a step with **no** rule set. Preserves the pre-rule-engine automatic/manual seeding contract for integrations that never migrated. Provide exactly one of `automaticSeeding` or `manualSeeding`:
+
+  ```bash
+  # Automatic: order the team pool with a SeedingMechanism, then spread
+  # it across entry groups with a GroupRepartitionMechanism.
+  wellplayed graphql --org my-org \
+    -F legacyInput.stepId=<stepId> \
+    -F legacyInput.automaticSeeding.seedingMechanism=REVERSE_HALF_SHIFT \
+    -F legacyInput.automaticSeeding.groupRepartitionMechanism=SEED_OPTIMIZED \
+    'mutation($legacyInput: SeedStepLegacyInput!) { seedTournamentStep(legacyInput: $legacyInput) { id status } }'
+  ```
+
+  `SeedingMechanism`: `NONE`, `REVERSE`, `HALF_SHIFT`, `REVERSE_HALF_SHIFT`, `PAIR_FLIP`. `GroupRepartitionMechanism`: `BALANCED`, `SEED_OPTIMIZED`.
+
+**Don't send `legacyInput` against a step that has a rule set** — it carries no rule-engine meaning there; use `input` so the preset's Lua seeding rules run instead.
+
+### What a legacy step gives you for free
+
+With no rule set attached, the platform still runs the step end-to-end using built-in, zero-config defaults — not silent no-ops:
+
+- **Scoring** — implicit `SUM` aggregation over raw match scores (the pre-migration match→game→round→group→step→tournament roll-up).
+- **Seeding** — a generic placement pass: walks the generated groups/rounds/games in order and drops the (ordered or legacy-derived) team list into entry games, respecting each game's team-slot capacity.
+- **Advancement** — driven by `GameLink` rows: when a game ends, winners/losers are read off recorded match scores and walked along the game's outgoing `GameLink` edges.
+- **Best-of-N series** — matches are created incrementally, one at a time, only once the prior match ended and the series is still undecided.
+- **Step completion** — the step auto-transitions to `ENDED` once every game has ended. There's no `STEP_ENDED` Lua rule, so use `setStepWinners` / `setTournamentWinners` to record results.
+
+The moment a rule set is attached (via `applyBuiltinPreset`, `applyPresetScript`, or `createStepRuleSet`), all of the above is fully replaced by the step's Lua rules.
+
+### Team withdrawal keeps two statuses in sync
+
+`withdrawTeamFromStep(stepId, teamId)` and the admin `updateTournamentTeamStatus(tournamentTeamId, status: WITHDRAWN)` mutation both now keep the team's tournament-wide `TournamentTeamStatus.WITHDRAWN` and its per-step score-row status (`team_scope_status.WITHDRAWN`) in sync across every one of the team's not-yet-`ENDED` steps. If you read standings or `tournamentStep.teamScores` right after either mutation, both statuses reflect the withdrawal.
+
+### Built-in preset: `cumulative-points-total`
+
+New `OTHER`-category built-in template alongside `cumulative-rounds-series`. Both run the same shape — the same set of teams plays `round_count` full-roster rounds — but rank teams differently:
+
+| Template | Ranks by | Aggregation |
+|----------|----------|-------------|
+| `cumulative-rounds-series` | round **wins** | `POINTS` (`points_per_round_win` per round win) |
+| `cumulative-points-total` | raw cumulative **score** total across all rounds | `SUM` of raw per-game scores |
+
+```bash
+wellplayed graphql --org my-org \
+  -F builtinPresetId=cumulative-points-total \
+  -F tournamentStepId=<stepId> \
+  -F 'parameters={"team_count":8,"round_count":5,"best_of":1,"shared_victory":false}' \
+  'mutation($builtinPresetId: String!, $tournamentStepId: ID!, $parameters: String!) {
+    applyBuiltinPreset(builtinPresetId: $builtinPresetId, tournamentStepId: $tournamentStepId, parameters: $parameters) { id version }
+  }'
+```
+
+Parameters: `team_count` (required, ≥ 2), `round_count` (default `5`), `best_of` (default `1`), `promote_step_winners_to_tournament` (default `true`), `shared_victory` (default `false` — when `true`, a full points+tiebreaker tie at the top declares every tied leader a co-champion instead of a single winner).
+
+> **Behavior-change note:** `cumulative-rounds-series` previously declared `SUM` aggregation, which silently ignored its own `points_per_round_win` parameter and ranked by raw score instead of round wins. It now declares `POINTS`, which is honored — standings correctly reflect round-win counts. This only affects rule sets built by *re-applying* the template after this change; already-persisted rule sets are unaffected until re-applied.
+
+## Related skills
+
+- `wellplayed-react` (when present) — building React apps against the WellPlayed React SDK.
+- `wellplayed-api` (when present) — using the TypeScript SDK and the GraphQL API in non-React code.
+
+When in doubt about API shape, call the WellPlayed MCP server at `https://mcp.well-played.gg/mcp` or fetch `https://mcp.well-played.gg/llms-full.txt`.

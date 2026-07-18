@@ -1,0 +1,654 @@
+---
+name: mcs-build
+description: "Use this skill to build an agent in Copilot Studio from a researched agentspec.json. Runs pre-build validation (auth, env, connections, tools, model), then creates the agent, configures instructions, knowledge, tools, model, topics, and publishes. Supports single-agent, multi-agent, and connected-agent architectures. Use after /mcs-research when agentspec.json is ready, or to resume a partially completed build."
+---
+
+# MCS Agent Builder — Unified Hybrid Build Stack
+
+Build agents in Microsoft Copilot Studio using the optimized hybrid approach: PAC CLI for listing agents and solution ALM, LSP wrapper for instructions, model, topics, knowledge, and full component sync, Dataverse API for file uploads and PvaPublish, and user-guided manual steps for new OAuth connections.
+
+This skill handles all build modes:
+- **Single Agent** — standalone build
+- **Multi-Agent** — builds specialists first, then orchestrator with child connections
+
+## Build Discipline — Verify-Then-Mark
+
+These rules apply to every build step, because unverified changes silently accumulate into broken agents.
+
+1. **Atomic tasks**: Every build step is a separate task. "Generate file" and "upload file" and "run eval" are three tasks, not one.
+2. **Verify after every action**: After each change, snapshot or read-back to confirm it worked.
+3. **Do not mark a task complete until verified**: If you can't verify, say "I did X but couldn't verify Y".
+4. **File generation is not deployment**: Writing a local file is not the same as uploading it to MCS.
+5. **Environment check**: Before PAC CLI ops, verify the agent's environment matches PAC CLI's active profile.
+6. **Attempt every MVP item**: Attempt every item in the spec tagged `phase: "mvp"`. If an item fails, document: (a) what was tried, (b) the specific error, (c) what's needed to unblock it. A failed attempt with a clear error is valuable; a silently skipped item is a build gap.
+7. **End-of-build reconciliation**: After all changes, walk the spec's component list and snapshot-verify each item. Every MVP item shows MATCH, PARTIAL (with reason), FAILED (with error), or BLOCKED (with dependency). Zero items should show SKIPPED.
+
+## Input
+
+```
+/mcs-build {projectId} {agentId}                                 # Full build (includes full guard)
+/mcs-build {projectId} {agentId} --quick                         # Quick guard (staleness + auth + env + PAC only)
+/mcs-build {projectId} {agentId} --allow-stale --stale-reason "<reason>"  # Override knowledge staleness guard
+```
+
+Reads from:
+- `Build-Guides/{projectId}/agents/{agentId}/agentspec.json` — the single source of truth (architecture, tools, instructions, model, topics, everything)
+
+Writes to:
+- `Build-Guides/{projectId}/agents/{agentId}/agentspec.json` — updates `buildStatus` field
+- `Build-Guides/{projectId}/agents/{agentId}/build-report.md` — customer-shareable summary
+
+## Progress Markers
+
+Emit `##PROGRESS##` JSON markers at each step transition. Steps: `auth`, `context`, `create`, `instructions`, `knowledge`, `tools`, `model`, `topics`, `publish`, `validate`. Format: `##PROGRESS## {"step":"...","label":"...","status":"running|completed|failed|skipped","detail":"..."}`. Emit `##BUILD_COMPLETE##` at the end. Emit `##AUTH_REQUIRED##` when user action needed (e.g., OAuth consent). Always emit regardless of headless or interactive mode.
+
+---
+
+## Smart Build Account & Environment Gate
+
+Every build targets a specific tenant and environment. This gate reads persisted context, confirms with the user, and verifies Azure CLI + Dataverse + PAC CLI (optional) all work before proceeding.
+
+> Full protocol: see reference/auth-gate.md
+
+---
+
+## Step 0.9: Populate Build Context
+
+After auth is verified, capture all derived state into `agentspec.json.buildStatus` so every subsequent step reads from one place instead of re-deriving URLs, IDs, and GUIDs.
+
+1. **From session-config.json** (looked up by accountId + environment name):
+   - `dataverseUrl`, `gatewayUrl`, `environmentId`
+
+2. **From Dataverse** (if `mcsAgentId` exists — resume build):
+   - `botSchemaName` — `GET bots(<mcsAgentId>)` full entity (query without `$select` because it can miss fields)
+   - `gptComponentId` — FetchXML query for botcomponent where `parentbotid`=`<mcsAgentId>` AND `componenttype`=15. Use FetchXML with `parentbotid` (logical name) because OData filter with `_parentbotid_value` is unreliable.
+
+3. **Persist to agentspec.json.buildStatus** — write all fields atomically.
+
+4. **Log Build Context:**
+   ```
+   Build Context:
+     Agent: {name} ({mcsAgentId || "new — will be created in Step 1"})
+     Environment: {environment} ({environmentId})
+     Dataverse: {dataverseUrl}
+     Gateway: {gatewayUrl}
+     Workspace: {workspacePath || "will be created in Step 1e"}
+     Tenant: {azTenantId}
+   ```
+
+All subsequent steps use buildStatus fields directly: Dataverse calls use `dataverseUrl` + `mcsAgentId`, Gateway calls use `gatewayUrl` + `environmentId`, LSP push/pull uses `workspacePath`, description PATCH uses `gptComponentId`, PAC CLI uses `botSchemaName`.
+
+After Step 1 (create agent): update `mcsAgentId`, `botSchemaName`, `gptComponentId` from the newly created agent.
+
+---
+
+## Phase 0: Pre-Build Validation (Guard)
+
+Validate all prerequisites before expensive operations begin. Catches auth failures, missing connections, unreachable knowledge sources, and model gaps that would otherwise waste build time. Runs automatically at the start of every build — no separate guard step needed.
+
+Supports two modes:
+- **Full** (default): all 8 checks (Check 0 + Checks 1–7)
+- **Quick** (`--quick` flag on `/mcs-build`): Check 0 + Checks 1–3 only (staleness + auth + env + PAC)
+
+Each check produces `pass`, `warn`, `fail`, or `skipped` (when a dependency check failed). Run all checks even if early ones fail — report everything at once.
+
+### Check 0: Knowledge Freshness (Staleness Guard)
+
+Validates that build-critical knowledge cache files are not dangerously stale. Builds refuse to proceed with stale knowledge unless explicitly overridden.
+
+```bash
+node tools/sync-orchestrator.js run --source knowledge-cache --json
+```
+
+Reads the `last_verified` dates in `knowledge/cache/` via the `knowledge-cache` sync adapter. The 8 Tier 1 files are listed in `tools/sync-adapters/knowledge-cache.js` (`TIER1` set).
+
+| Result | Criteria |
+|--------|----------|
+| `pass` | All Tier 1 cache files less than 14 days old |
+| `warn` | One or more Tier 1 files 3–14 days old |
+| `fail` | One or more Tier 1 files over 14 days old (critical staleness) |
+
+**Override:** If the user passes `--allow-stale` to `/mcs-build`, a `fail` becomes `warn` and the build proceeds. Log the override to `agentspec.json.buildStatus.staleKnowledgeOverride` with timestamp + user-supplied reason.
+
+If fail without override: stop build. Report:
+```
+Knowledge cache is critically stale (>14 days). Build refused.
+Run: /mcs-sync — TAKE the knowledge-cache and docs-manifest cards, follow the action plan to refresh the affected files.
+Or override: /mcs-build {projectId} {agentId} --allow-stale --stale-reason "<reason>"
+```
+
+### Check 1: Azure CLI Auth
+
+Validates current Azure CLI session is authenticated to the correct tenant.
+
+```bash
+az account show --query "{user:user.name, tenant:tenantId}" -o json
+az account get-access-token --resource https://{org}.crm.dynamics.com --query accessToken -o tsv
+```
+
+| Result | Criteria |
+|--------|----------|
+| `pass` | Signed in, token acquired, tenant matches spec/session-config |
+| `warn` | Signed in but tenant can't be confirmed, or token expires within 10 min |
+| `fail` | Not signed in, token acquisition fails, or tenant mismatch |
+
+If fail: stop checks that depend on Dataverse. Report: "Run `az login --tenant {tenantId}` to authenticate."
+
+### Check 2: Environment Reachability
+
+Validates target Dataverse environment responds.
+
+```bash
+node -e "const {get} = require('./tools/lib/http'); get('{dvUrl}/api/data/v9.2/WhoAmI').then(r => console.log(JSON.stringify(r)))"
+```
+
+| Result | Criteria |
+|--------|----------|
+| `pass` | WhoAmI succeeds, environment URL matches spec |
+| `warn` | Responds but with throttling (429) or slow (>5s) |
+| `fail` | Unreachable, 401/403, DNS failure, or env doesn't exist |
+
+### Check 3: PAC CLI Profile
+
+Validates PAC CLI targets the same environment. `pac auth list` + `pac env who`.
+
+| Result | Criteria |
+|--------|----------|
+| `pass` | Active profile matches target environment |
+| `warn` | PAC available but no profile selected |
+| `fail` | PAC CLI not installed or unreachable |
+
+PAC CLI failure is always a `warn` for overall status (API fallback exists).
+
+### Check 4: Required Connections
+
+Validates all connections from `agentspec.json.integrations[]` exist in the target environment.
+
+1. Read `agentspec.json.integrations[]` — extract required connector names
+2. Run `add-tool.js discover-connections --dataverse-url <url>`
+3. Match each required integration against discovered connections
+
+| Result | Criteria |
+|--------|----------|
+| `pass` | All required connections found and in usable state |
+| `warn` | Connection exists but status unknown or needs re-auth |
+| `fail` | One or more required connections missing |
+
+If fail: report which connections are missing with manual creation instructions.
+
+### Check 5: Knowledge Sources Accessibility
+
+Validates all knowledge sources from `agentspec.json.knowledge[]` are reachable.
+
+- **Public URLs:** HTTP HEAD request, check for 200/301/302
+- **SharePoint sites:** Graph API `GET /sites/{hostname}:/{path}`
+- **Dataverse files:** Check `annotation` table for file existence
+
+### Check 6: Tool / MCP Server Availability
+
+Validates all tools from `agentspec.json.tools[]` are configured and responsive.
+
+1. Read `agentspec.json.tools[]` — extract tool names and types
+2. For MCP servers: check `add-tool.js list-connections` output
+3. For Work IQ servers: verify Work IQ MCP is configured
+
+### Check 7: Model Availability
+
+Validates requested AI model is available for the target environment.
+
+```bash
+node tools/island-client.js list-models --env {envUrl}
+```
+
+Match `agentspec.json.model.name` against available models.
+
+### Guard Output
+
+Write results to `agentspec.json.guardReport`:
+
+```json
+{
+  "guardReport": {
+    "status": "pass|warn|fail",
+    "mode": "full|quick",
+    "checkedAt": "2026-03-31T12:00:00Z",
+    "checks": [{ "name": "...", "status": "...", "summary": "...", "evidence": [], "fix": null }],
+    "blockingIssues": [],
+    "warnings": [],
+    "nextAction": "..."
+  }
+}
+```
+
+**Status precedence:** `fail` > `warn` > `pass`. Any hard fail = overall fail.
+
+- **All pass:** proceed to Step 1
+- **Warnings only:** log warnings, proceed
+- **Any fail:** stop build, report blocking issues with remediation steps
+
+### Guard Progress Markers
+
+```
+##PROGRESS## {"step":"guard-staleness","label":"Checking knowledge freshness","status":"running"}
+##PROGRESS## {"step":"guard-auth","label":"Checking Azure CLI auth","status":"running"}
+##PROGRESS## {"step":"guard-env","label":"Checking environment","status":"running"}
+##PROGRESS## {"step":"guard-connections","label":"Checking connections","status":"running"}
+##PROGRESS## {"step":"guard-knowledge","label":"Checking knowledge sources","status":"running"}
+##PROGRESS## {"step":"guard-tools","label":"Checking tools/MCP","status":"running"}
+##PROGRESS## {"step":"guard-model","label":"Checking model availability","status":"running"}
+```
+
+### Brief Completeness (always runs, even in quick mode)
+
+5. **Spec completeness**: instructions non-empty and < 8000 chars, agent name non-empty, agent description present (warn if missing), at least 1 MVP capability
+
+If workspace is missing, clear `workspacePath` and re-clone in Step 1e. If agent was deleted, clear `mcsAgentId` and re-create in Step 1.
+
+---
+
+## MVP Phase Filtering
+
+Only build items tagged `phase: "mvp"`. Skip items tagged `phase: "future"`.
+
+Scan the spec and compute build scope across capabilities, integrations, knowledge, and topics. Output a scope summary:
+```
+## Build Scope (MVP filter)
+- Capabilities: {N} MVP, {M} deferred
+- Integrations: {N} MVP, {M} deferred
+- Knowledge: {N} MVP, {M} deferred
+- Topics: {N} MVP, {M} deferred
+```
+
+If all items of a type are `future`, skip that entire build step and note it. Deferred items are listed in the build report (Section 9) so the customer knows what's coming next.
+
+---
+
+## Step 0.25: Solution Type Gate
+
+Reads `agentspec.json.architecture.solutionType`. If "agent" or not set — proceed. If "hybrid" — proceed, log which capabilities are flow-only. If "flow" or "not-recommended" — hard stop with explanation and override instructions (`architecture.solutionTypeOverride = true`).
+
+---
+
+## Step 0.5: Decision Gate
+
+Reads `agentspec.json.decisions[]`, filters to MVP-relevant decisions, categorizes as hard-block (`architecture`, `infrastructure`) or soft-warning (`integration`, `model`, `topic-implementation`). Hard blocks stop the build. Soft warnings proceed with recommended defaults pre-applied.
+
+---
+
+## Before Building — Enrichment Check + Knowledge Cache + Learnings
+
+### Enrichment-Aware Build
+
+If the spec was created via the Agent Wizard and background enrichment ran (check `agentspec.json._enrichment`):
+- **Instructions**: Enrichment may have generated instructions via Claude Sonnet. Review them during Step 2 — if quality is sufficient, use as-is. If not, spawn PE to revise (not regenerate from scratch).
+- **Eval sets**: Enrichment may have generated eval test sets. Review during Step 4.5 — if coverage is sufficient, use as-is. QA validates and enhances rather than regenerating.
+- **Architecture scoring**: Enrichment ran deterministic scoring (build path, first-party agent matching, channel suggestions). These are pre-applied to the spec.
+- **Research flags**: Check `agentspec.json.recommendations[]` where `source === "enrichment"` — these are integrations the resolver couldn't match. May need live research or manual configuration.
+
+### Knowledge Cache + Learnings
+
+1. Read `knowledge/cache/api-capabilities.md` — check `last_verified` date
+2. If stale (> 7 days), refresh via WebSearch + MS Learn
+3. Read `knowledge/patterns/dataverse-patterns.md` for API call patterns
+4. Read `knowledge/learnings/build-methods.md` — check for creation precedents and known gotchas
+5. Update cache files if new findings
+
+## Route: Determine Build Mode
+
+Read `agentspec.json` -> `architecture.type`:
+
+| Value | Build Path |
+|-------|-----------|
+| `Single Agent` | Standalone Build (below) |
+| `Multi-Agent` | Multi-Agent Build (below) |
+| `Connected Agent` | Standalone Build + external connection notes |
+
+---
+
+## On-Demand Teammates During Build
+
+Two teammates are available on-demand when issues arise (not spawned at build start — only when specific conditions trigger them). This keeps simple builds fast while making complex builds resilient.
+
+**Research Analyst** — spawned when tool configuration fails (connector not found, auth mode mismatch, unexpected parameters). RA searches official docs and community, reports correct name/auth/alternatives. Lead applies the fix, updates spec + cache, dismisses RA.
+
+**Prompt Engineer** — spawned when instructions need adjustment after tools are configured (tool names differ, planned tool unavailable, action parameters changed, instructions exceed 8000 chars). PE uses GPT co-generation (`generate-instructions`) to produce and merge revised instructions. QA reviews, lead applies via LSP push, dismisses PE.
+
+## Step Failure Protocol (Build-Time Error Handling)
+
+When any build step fails (LSP push error, Dataverse 4xx/5xx, connector mismatch, publish ConcurrencyVersionMismatch, eval Direct Line failure, flow build error), follow the 3-attempt protocol from `CLAUDE.md` → "Error Handling" — do NOT just retry with a "different approach":
+
+**Attempt 1 — research-driven retry:**
+1. **Query claude-mem first** — vector search the error message + step name + connector/model/component name. Prior fixes for this exact pattern often exist. If found, prefer that fix over a fresh research cycle.
+2. Read `knowledge/learnings/` topic file relevant to the failing step (`build-methods.md`, `connectors.md`, `topics-triggers.md`).
+3. WebSearch for error string + "Copilot Studio".
+4. MS Learn MCP for official troubleshooting.
+5. Read back the API state (Dataverse query, LSP pull, `pac copilot list`) to confirm what actually happened.
+6. Retry with the researched approach.
+
+**Attempt 2 — superpowers 4-phase debug (NOT a generic retry):**
+If Attempt 1 fails, do NOT retry the same operation with another small change. Invoke the superpowers debugging skill explicitly:
+1. **Hypothesize** — enumerate candidate root causes from the layer set: `auth-token | payload-schema | API-contract | connector-config | model-availability | tenant-policy | timing | concurrency | LSP-Dataverse-divergence`. List 3-5 hypotheses with the evidence supporting each.
+2. **Reproduce** — produce a minimal repro outside the build pipeline. For Dataverse failures, run the same `curl` directly. For LSP push failures, do a dry-run pull-then-push on a clean copy. Confirm the failure is deterministic.
+3. **Isolate** — design ONE discriminating test per top hypothesis. Examples: "if it's auth, fresh token retry succeeds"; "if it's schema, payload-only modification reproduces it"; "if it's concurrency, sequential push succeeds". Run the tests. Narrow to one layer.
+4. **Fix** — apply the targeted fix. Verify via API read-back. Log the isolated cause + fix to `knowledge/learnings/build-methods.md` (or the relevant topic file) so claude-mem will surface it on Attempt 1 next time.
+
+**Attempt 3 — escalate to user:**
+If superpowers-debug doesn't isolate the cause in one cycle, escalate. Include: the hypothesis tree, what was tested, what remains uncertain, and the proposed next step (user manual MCS UI check, fresh tenant test, etc.).
+
+**Failure budget rules:**
+- A single build can absorb the 3-attempt protocol on at most TWO distinct steps before escalating the build itself.
+- Same-step third failure → escalate immediately, do not loop.
+- Always emit `##PROGRESS##` markers with `status: "failed"` and a `detail` summarizing which attempt was reached.
+
+---
+
+## Standalone Build (Single Agent)
+
+### Dataverse API Shorthand
+
+All Dataverse calls use buildStatus fields from Step 0.9:
+
+```bash
+TOKEN=$(az account get-access-token --resource <buildStatus.dataverseUrl> --query accessToken -o tsv)
+DV="<buildStatus.dataverseUrl>"
+BOT="<buildStatus.mcsAgentId>"
+GPT="<buildStatus.gptComponentId>"
+```
+
+**Publish + verify pattern:**
+```bash
+curl -s -X POST "$DV/api/data/v9.2/bots($BOT)/Microsoft.Dynamics.CRM.PvaPublish" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'
+sleep 5
+# Query WITHOUT $select (synchronizationstatus returns null with $select)
+curl -s "$DV/api/data/v9.2/bots($BOT)" -H "Authorization: Bearer $TOKEN" | node -e "
+let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+  const data=JSON.parse(d);
+  const ss=JSON.parse(data.synchronizationstatus||'{}');
+  const status=(ss.lastFinishedPublishOperation||{}).status||'pending';
+  console.log('Publish status: '+status);
+})"
+```
+
+**Description PATCH:** Now handled automatically by `mcs-lsp.js push` (patches lines 1-2 of GptComponent `data` field after LSP sync).
+
+### Step 0: Resume Detection & Environment Verification
+
+Read `agentspec.json.buildStatus.completedSteps`. If the array has entries, this is a resumed build — log which steps will be skipped. Mapping: `"created"` -> skip Step 1, `"instructions"` -> skip Step 2 instructions, `"knowledge"` -> skip Step 2 knowledge, `"tools"` -> skip Step 3 tools, `"model"` -> skip Step 3 model, `"topics"` -> skip Step 4. Step 5 (publish) re-runs on every build because it's cheap and ensures latest state.
+
+### Step 1: Find or Create Agent
+
+Check for existing agent before creating, to prevent duplicates on build resume or session restart.
+
+**1a.** Check `agentspec.json.buildStatus.mcsAgentId` — if set, verify via `pac copilot list`. If found, skip creation. If not found (deleted), clear ID and proceed.
+
+**1b.** If no ID, search `pac copilot list` for matching `displayName`. If found, store ID and skip creation.
+
+**1c.** Create new agent via Dataverse POST + PvaProvision:
+1. POST `bots` with:
+   - `name`, `schemaname`, `language: 1033`, `runtimeprovider: 0`
+   - `authenticationmode: 1` (Integrated — "Authenticate with Microsoft")
+   - `authenticationtrigger: 1` (AsNeeded)
+   - `configuration` JSON including `GenerativeAIRecognizer` and `contentModeration: "Medium"`
+   - Example configuration: `{ settings: { GenerativeActionsEnabled: true }, aISettings: { model: { modelNameHint: "GPT5Auto" }, contentModeration: "Medium" }, recognizer: { kind: "GenerativeAIRecognizer" } }`
+2. POST `PvaProvision` bound action
+3. Wait for `statuscode` to transition to `Provisioned(1)` (~5-15s)
+4. PATCH bot `name` field (LSP push updates GptComponent `displayName` but not the bot entity `name`)
+
+**Fallback:** `pac copilot create` (requires template extraction first).
+
+**1d.** Persist `mcsAgentId` to `agentspec.json.buildStatus` immediately. Add `"created"` to `completedSteps`.
+
+**1f. Flow Designer auto-spawn:** After the agent shell exists, scan `agentspec.json.architecture.solutionType` (and `buildPath`). If it matches `flow`, `hybrid`, or `automation`, spawn `flow-designer` (`Agent({ subagent_type: "flow-designer", isolation: "worktree", ... })`) to design Power Automate flow specs in parallel with Step 2-4. FD writes `flow-spec.md` to `Build-Guides/<project>/agents/<name>/flows/`. Skipped silently when solutionType is pure agent.
+
+#### 1e. Clone Agent Workspace (LSP)
+
+```bash
+node tools/mcs-lsp.js clone \
+  --workspace "Build-Guides/{projectId}/agents/{agentId}/workspace" \
+  --agent-id "<mcsAgentId>" --agent-name "<displayName>" \
+  --env-id "<environmentId>" --dataverse-url "<dataverseUrl>" --gateway-url "<gatewayUrl>"
+```
+
+Store the **agent subfolder** (the one containing `.mcs/conn.json`) in `buildStatus.workspacePath` — not the parent directory. Push/pull commands need the subfolder path.
+
+Skip if `buildStatus.workspacePath` exists and the directory has `.mcs/conn.json`.
+
+#### Pre-push Validation (run before every LSP push)
+
+Before running `mcs-lsp.js push`:
+1. Workspace exists: `<workspacePath>/.mcs/conn.json` present
+2. `agent.mcs.yml` line 1: starts with `# Name:` and is not `# Name: default`
+3. `agent.mcs.yml` line 2: is not `# default` (has actual description)
+4. Conversation starters: every entry has both `title` and `text` (missing title causes silent publish failure)
+5. Instructions: < 8000 chars
+6. Freshness: if last pull was > 30 min ago, pull first to avoid ConcurrencyVersionMismatch
+
+`mcs-lsp.js push` now automatically patches `botcomponent.description`, `botcomponent.name`, and comment headers via Dataverse API after LSP sync.
+
+### Steps 2-4: Parallel Dispatch (Instructions, Knowledge, Tools, Topics)
+
+After Step 1 completes (agent shell exists in MCS), Steps 2-4 run **in parallel** to compress the build. Dispatch all four work items in a single message with multiple Agent tool calls:
+
+| Work item | Owner | Isolation | Output written to |
+|-----------|-------|-----------|-------------------|
+| Instructions (Step 2b) | Prompt Engineer (sub-agent) | `worktree` | `agent.mcs.yml` `instructions:` field |
+| Knowledge (Step 2 knowledge) | Lead | — | `knowledge/*.mcs.yml` + Dataverse uploads |
+| Tools / MCP (Step 3) | Lead | — | `actions/*.mcs.yml` |
+| Topics (Step 4) | Topic Engineer (sub-agent) | `worktree` | `topics/*.mcs.yml` + Gateway create-topic |
+
+Lead-driven items (knowledge, tools) don't need worktree isolation because the lead serializes its own writes. Sub-agent items (PE, TE) MUST run in worktrees because they both touch `agent.mcs.yml` and `agentspec.json` adjacent paths.
+
+After all four return, the lead reads each output, merges as needed, and proceeds to Step 5 (publish). Step 5 is gated on every parallel item completing.
+
+**Resume behavior:** Each sub-step has its own `completedSteps` checkpoint. If `"instructions"` is already in `completedSteps`, the PE dispatch is skipped — same for `"knowledge"`, `"tools"`, `"topics"`.
+
+### Step 2: Configure Agent Metadata, Instructions & Knowledge
+
+**Skip check:** If `"instructions"` and `"knowledge"` are both in `completedSteps`, skip this entire step.
+
+**2a. Description & Starters:** Edit `agent.mcs.yml` — set lines 1-2 (name, description metadata) and `conversationStarters` (each entry needs both `title` and `text`). Push via LSP.
+
+**2b. Instructions:** Edit `agent.mcs.yml` `instructions:` field. Run instruction-capability alignment check first (verify MVP capabilities are addressed, future capabilities are not). Push via LSP. Checkpoint: add `"instructions"` to `completedSteps`.
+
+**Knowledge:** Create `.mcs.yml` files in `knowledge/` folder for SharePoint sites and URLs. Use Dataverse API for file uploads (PDF, DOCX). Phase filter: only MVP entries. Checkpoint: add `"knowledge"` to `completedSteps`.
+
+**Initial Publish:** `pac copilot publish --bot <bot-id>`
+
+**On-demand PE trigger:** After Step 3 configures tools, if tool names differ from spec, spawn PE to adjust instructions.
+
+### Before Step 3: Consult Connector & Integration Learnings
+
+Read `knowledge/learnings/connectors.md` and `integrations.md` — look for connector name mismatches, auth gotchas, known workarounds.
+
+### Step 3: Configure Tools & Model
+
+**Skip check:** If `"tools"` and `"model"` are both in `completedSteps`, skip this step.
+
+**3a. Model Selection:** Default to `GPT5Auto` (GPT-5 Auto — dynamically routes between general and reasoning). Edit `agent.mcs.yml` -> `aISettings.model.modelNameHint: GPT5Auto`. Only change if spec specifies a different model or the environment doesn't support preview models. Check available models via `island-client.js get-models`. Checkpoint: add `"model"`.
+
+**3b. Settings (type: "setting" integrations):** Patch `bot.configuration` via Dataverse. Always set: `GenerativeActionsEnabled: true`, `recognizer: GenerativeAIRecognizer`. Per-spec: web browsing, model knowledge, content moderation.
+
+**3c. Tool/Connector/MCP Configuration:**
+
+**Work IQ first:** For any M365 data integration (email, calendar, teams, sharepoint, onedrive, user profile, files, search), add Work IQ from the agent overview page. This adds 2 MCP servers that cover everything:
+
+- **Work IQ Copilot** (`mcp_M365Copilot`) — cross-M365 search and actions for mail, calendar, teams, sharepoint, onedrive, files, everything
+- **Work IQ User** (`mcp_MeServer`) — people, org chart, manager, direct reports
+
+No need to add individual Mail, Calendar, Teams, SharePoint servers separately. These 2 replace all individual M365 MCP servers and connectors. Requires M365 Copilot license. Status: Preview (Mar 2026).
+
+1. Auto-discover connection refs: `node tools/add-tool.js discover-connections --dataverse-url <url>`
+2. Check if `shared_a365mcpservers` connection exists (covers Work IQ)
+3. Match discovered connections to spec integrations — prefer Work IQ matches from the resolver's `workiqRecommended` field
+4. For matched: write YAML action files to `workspace/actions/`, push via LSP
+5. For unmatched: guide user to add Work IQ from overview page in MCS UI, re-discover, then write YAML + push
+
+**Gaps (use connectors instead):** Planner, Excel, Approvals, PowerPoint have no Work IQ equivalent — use Power Platform connectors.
+
+**When NOT to use Work IQ:** Non-M365 integrations (Dynamics 365, Dataverse, Fabric, third-party) use their own MCP servers or connectors as before.
+
+Checkpoint: add `"tools"` to `completedSteps`. Verify via LSP pull that `actions/` has all expected tools.
+
+### Before Step 4: Consult Topic & Trigger Learnings
+
+Read `knowledge/learnings/topics-triggers.md` — look for YAML patterns, adaptive card gotchas, node type issues.
+
+### Step 4: Author Topics (LSP Push)
+
+**Skip check:** If `"topics"` is in `completedSteps`, skip this step.
+
+Use **Topic Engineer** for validated YAML (dual model co-generation for 3+ node topics). Phase filter: only MVP topics. Topic type filter: only `custom` or `system` (customized) — `generative` topics are handled by orchestration, no YAML needed.
+
+For each MVP custom/system topic:
+1. TE generates topic definition (trigger phrases, actions, description)
+2. QA reviews definitions
+3. Create via Gateway API (required — LSP push does not produce renderable new topics):
+   ```bash
+   node tools/island-client.js create-topic --env <envId> --bot <botId> --topic-file <path>
+   ```
+4. For adaptive card topics: create with text placeholder via Gateway, pull workspace, edit YAML to add `SendMessage` + `AdaptiveCardTemplate`, push via LSP (LSP can update existing topics safely)
+5. For system topic customization: edit in workspace, push via LSP
+6. **Conversation Start welcome card (ALWAYS):** Replace the default plain-text ConversationStart with an adaptive card welcome. Use `welcome-card.yaml` template — fill `{{AGENT_NAME}}`, `{{WELCOME_MESSAGE}}`, and capability action buttons from agentspec.json capabilities. Write to `workspace/Agent/topics/ConversationStart.mcs.yml`, then push via LSP (system topic update, not new topic creation). This is not optional — every agent gets a welcome card.
+7. Available adaptive card styles for topics (see `knowledge/patterns/topic-patterns/`): `welcome-card.yaml` (welcome), `adaptive-card.yaml` (data display + form), `table-list-card.yaml` (tables/lists), `carousel-card.yaml` (multi-card), `status-card.yaml` (progress/status), `approval-card.yaml` (approve/reject), `confirmation-card.yaml` (review before submit), `feedback-card.yaml` (thumbs up/down). Choose the style that best fits each topic's purpose.
+
+Do not use `mcs-lsp.js push` to create new custom topics because the LSP skips internal MCS registration (NLU trigger indexing, compilation). Gateway API `BotComponentInsert` handles all registration automatically.
+
+Checkpoint: add `"topics"` to `completedSteps`.
+
+### Step 4.4: Power Automate Flow Build
+
+Runs only when `agentspec.json.flows[]` has at least one entry. The agent's logical name and Dataverse environment must already exist (Step 1 done), and topic YAML must already be pushed because flows are registered to the agent as `InvokeFlowTaskAction` in topics.
+
+**Order of operations** — handled by `tools/flow-build.js`:
+
+1. Validate `flows[]` (delegates to `app/lib/flow-spec.js`). Fast-fail on schema errors.
+2. Topo-sort: `kind=ai-tool` first, then `kind=agent-flow` (which can reference ai-tools by `name`).
+3. For each flow in order:
+   - **Plan**: skip if `id` set and `status=='published'` (Phase 5 will add content-hash drift detection).
+   - **Create**: `flowManager.createAIFlow` for ai-tool (category=7) or `flowManager.createFlow` for agent-flow (category=5, modernflowtype=1). Auto-derives `environment.name` from the Dataverse org.
+   - **Resolve cross-refs**: `aiFlowRef` → ai-tool's `id` (which exists because topo sort built it first).
+   - **Publish**: `flowManager.publishFlow` calls `POST /PublishComponent?ActivateFlowOnPublish=true` — single bound action publishes the component AND activates runtime.
+   - **Persist**: write `id`, `status`, `lastSyncedAt` back to `agentspec.json.flows[i]`.
+4. Failure isolation: a flow that fails marks `status='failed'` + `lastBuildError`, and execution continues with other independent flows.
+
+```bash
+# Plan-only (no API calls) — useful before the first build
+node tools/flow-build.js plan --spec Build-Guides/<project>/agents/<agent>/agentspec.json
+
+# Build all flows
+node tools/flow-build.js run \
+  --spec Build-Guides/<project>/agents/<agent>/agentspec.json \
+  --org "$DV"
+
+# Build a single flow (e.g. after a fix)
+node tools/flow-build.js run --spec <agentspec> --org "$DV" --only <flowName>
+```
+
+**Verify-then-mark**: after the run, query Dataverse for each `flows[i].id` and confirm `componentstate=0` (Published) and `statecode=1` (Activated). The CLI does this implicitly via the `publishFlow` round-trip; an explicit read-back is added in Phase 5.
+
+**Agent-side tool registration**: registering an agent-flow as a callable tool (`actions/<name>.mcs.yml` with `kind: TaskDialog, action: { kind: InvokeFlowTaskAction, flowId }`) is still authored as part of Step 4 (topics) — the flow build produces the `flowId` that those YAML files reference. Re-push the topic via `mcs-lsp.js` after the flow build if the YAML referenced `<flowId-pending>` or similar placeholder.
+
+Checkpoint: add `"flows"` to `completedSteps` once every `flows[i]` is either `status='published'` or `status='failed'` (with the failure recorded — silent skip is forbidden).
+
+### Step 4.5: Post-Build Eval
+
+**Check:** If agent uses MCP servers with user-delegated auth, skip automated eval (Direct Line can't authenticate). Generate test cases for manual testing instead.
+
+**Auto mode (Direct Line):** Acquire token, run boundaries set (target 100%), run quality set (target 85%), write results to `agentspec.json.evalSets[].tests[].lastResult`.
+
+**Manual mode (Gateway API):** Upload eval sets via `island-client.js upload-evals`, run via `run-eval`, present summary. User checks results in MCS or runs `/mcs-eval` later.
+
+No iterative boundaries/quality/edge-cases loop during build. Build is single-pass. User runs `/mcs-fix` for post-deployment issues.
+
+### Step 5: Publish (Dataverse PvaPublish)
+
+Re-runs on every build (even resume) because publishing is cheap and ensures latest state.
+
+```bash
+curl -s -X POST "$DV/api/data/v9.2/bots($BOT)/Microsoft.Dynamics.CRM.PvaPublish" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'
+```
+
+Verify via `synchronizationstatus` (not just HTTP 200): query bot without `$select`, parse `lastFinishedPublishOperation.status`. Poll up to 6 attempts at 5s intervals. Also check `publishedon` is today.
+
+Common failures: `MissingRequiredProperty: Title` (starter without `title`), `ConcurrencyVersionMismatch` (stale workspace), `InvalidComponent` (malformed YAML).
+
+Checkpoint: add `"published"` to `completedSteps` after `synchronizationstatus` shows `"Succeeded"`.
+
+### Step 5.5: QA Build Validation Gate
+
+After publish, spawn QA Challenger for formal validation. The lead collects reconciliation snapshots, runs automated drift detection (`drift-detect.py`), and QA analyzes everything: spec-vs-actual comparison, cross-reference validation, and deviation impact assessment. QA writes `qa-validation.md` with a verdict of PASS / PASS WITH CAVEATS / FAIL.
+
+> Full QA protocol: see reference/qa-validation-gate.md
+
+### Step 5.6: GPT Build Review
+
+After QA validation, fire GPT-5.5 via `multi-model-review.js`: `review-brief`, `review-instructions`, and per-topic `review-topics`. GPT findings merge with QA verdict (union of findings, stricter wins). If GPT finds a critical issue QA missed, escalate to user before writing buildStatus. If GPT is unavailable, proceed with QA verdict alone.
+
+### Step 6: Finalize agentspec.json buildStatus
+
+Write the complete buildStatus. Most fields were written incrementally during checkpoints — this step ensures the final state is clean:
+
+```json
+{
+  "buildStatus": {
+    "status": "published",
+    "lastBuild": "2026-02-18T...",
+    "mcsAgentId": "<bot-id>",
+    "environment": "<env-name>",
+    "account": "<account-label>",
+    "accountId": "<session-config-account-id>",
+    "publishedAt": "2026-02-18T...",
+    "completedSteps": ["created", "instructions", "knowledge", "tools", "model", "topics", "critical-gate", "capability-iteration", "edge-cases", "published"],
+    "lastCompletedStep": "published",
+    "lastError": null
+  }
+}
+```
+
+---
+
+## Multi-Agent Build
+
+Build specialists first, then orchestrator. Each specialist follows the standalone build flow with specialist-focused instructions and sharing enabled. The orchestrator connects to all specialists via Island Gateway API.
+
+> Full multi-agent protocol: see reference/multi-agent-build.md
+
+---
+
+## End-of-Build Reconciliation
+
+After all changes, walk the spec's MVP-scoped component list and snapshot each item: agent name, model, instructions, knowledge sources, tools, triggers, publish status, (multi-agent) specialist connections and sharing. Collect deferred items list. Then spawn QA Challenger (Step 5.5) with the snapshot data, agentspec.json, and deferred items list.
+
+## Output: Build Summary Report
+
+After reconciliation, generate two outputs:
+
+### Terminal Output
+
+```
+## Build Complete: [Agent Name]
+
+**Status:** Published | **Environment:** [env] | **Account:** [account]
+**QA Validation:** PASS ({N}/{N} items match, {M} cross-ref issues — see qa-validation.md)
+**Eval Sets:** boundaries {X}% | quality {X}% | edge-cases {X}%
+**Capabilities:** {N} passing, {M} failing, {K} not tested
+**Deferred:** {J} future items (see build report Section 9)
+
+Report saved: Build-Guides/{projectId}/agents/{agentId}/build-report.md
+
+**Next:** Review the build report, share with customer for approval. Run /mcs-eval for standalone re-runs.
+```
+
+### Build Report File
+
+Write a customer-shareable build report to `build-report.md` with 11 sections: overview, architecture, capabilities, tools, knowledge, topics/triggers, key behaviors, open questions, spec-vs-actual changes, eval status, and next steps.
+
+> Full template: see reference/build-report-template.md
+
+---
+
+## Post-Build Learnings
+
+Tier 1 (auto): bump confirmed counts for routine builds. Tier 2 (user-confirmed): deviations, workarounds, discoveries. See `reference/learnings-capture.md` and `.claude/rules/learnings-system.md`.

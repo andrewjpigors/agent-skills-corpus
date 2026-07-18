@@ -1,0 +1,258 @@
+---
+name: zk-query-proofs
+description: Prove and verify a SPARQL query result over committed RDF Verifiable Credentials in zero knowledge with sparq-zk + sparq-zk-compose — per-graph Poseidon2 commitments, BGP scan + integer FILTER Noir proofs, issuer Schnorr attestation (incl. hidden-key set membership), status-list revocation (clear- or hidden-index), verifier nonces / single-use replay defence, and the ProofManifest/circuit family. Use when building or driving the zk-query-proofs surface (proving a query answer, verifying a manifest, attesting an issuer, checking revocation). Requires the Noir toolchain (nargo + bb).
+---
+
+# sparq-zk-query-proofs
+
+Zero-knowledge proofs that a SPARQL query result is correct over RDF held in named-graph Verifiable Credentials. **`sparq-zk`** (stage 1) canonicalizes (RDFC10) and commits each named graph to a Poseidon2-BN254 commitment `C(G)`, encodes terms, and signs commitments with a Schnorr-over-Baby-JubJub issuer key. **`sparq-zk-compose`** (stage 2) builds per-property Noir circuit inputs (BGP **scan** + hidden-operand integer **FILTER**), drives `nargo`/`bb` to produce/verify proofs, and bundles everything into a serializable `ProofManifest` that a relying party verifies against its own trust anchors (issuer key-set, status list, fresh nonce).
+
+<!-- sq-im8u: the `scaffold-caveat` anchor is single-sourced into
+     book/src/getting-started/capabilities.md via mdBook {{#include}}. Load-bearing honesty
+     caveat; keep the anchored line link-portable (bead refs + inline code only, no
+     repo-relative links) so it renders under both mounts. Keep the ANCHOR markers
+     one-per-line — mdBook excludes only the exact marker line. [OPUS-4.8] -->
+<!-- ANCHOR: scaffold-caveat -->
+> **Research-stage / experimental — NOT-yet-sound.** The composition verifier's soundness is the subject of an open audit (sq-qhy4 / sq-9hrn; remediation epic sq-1s2): a passing proof is NOT a guarantee the SPARQL statement holds under an adversarial prover. Read the "Honest scope" section before relying on a guarantee — only `Simple` entailment is proved; circuit members are fixed buckets. The query fragment covers BGP scans, integer FILTER (and the integer-valued `xsd:double` fragment), and a single-prover hidden cross-credential JOIN.
+<!-- ANCHOR_END: scaffold-caveat -->
+
+## Prerequisites
+
+- **Noir toolchain on `PATH`** (the only way to prove/verify): `nargo` **1.0.0-beta.21** and Barretenberg `bb` **5.0.0-nightly.20260324** (bb target `noir-recursive`). Other versions may change the bb public-input byte layout the verifier reconstructs against. If `nargo`/`bb` are absent, the structural pre-filter and all host-side helpers still work, but `verify_manifest` / `CircuitProver` cannot.
+- **Compiled circuit family** lives at `zk/compose/` in the repo (a Nargo workspace, NOT linked — driven by subprocess). `CircuitProver::from_crate_root()` locates it as `../../zk/compose` relative to the crate.
+- **Cargo deps** (both crates are `publish = false`, non-default workspace members — nothing else in sparq depends on them, and there is **no `zk` cargo feature on these crates** to enable; just add them as path/git deps):
+  ```toml
+  sparq-zk = { path = "crates/sparq-zk" }
+  sparq-zk-compose = { path = "crates/sparq-zk-compose" }
+  ```
+
+## Quickstart
+
+A self-contained integer-FILTER proof (`5 < 10`) and full verify. Compiles and runs against the current API when `nargo`+`bb` are present (else `prove_in`/`verify` error).
+
+```rust
+use sparq_zk_compose::build::{build_filter_int, encode_int_literal};
+use sparq_zk_compose::driver::CircuitProver;
+use sparq_zk_compose::toml::prover_toml_for;
+use sparq_zk_compose::manifest::{CircuitId, FieldHex, FilterOp};
+
+// 1. Build inputs: prove the hidden operand 5 satisfies `?v < 10`, verdict true.
+let operand_enc = encode_int_literal(5);                       // term encoding of "5"^^xsd:integer
+let (inputs, digits) =
+    build_filter_int(operand_enc, /*value*/ 5, FilterOp::Lt, /*bound*/ 10, /*expected*/ true)
+        .expect("a compiled filter_int member fits");
+
+// 2. Render the Prover.toml (challenge = the verifier's nonce; 0x2a here).
+let challenge = FieldHex("0x2a".into());
+let (id, toml) = prover_toml_for(&inputs, &challenge, &[], &[], &digits);
+assert_eq!(id, CircuitId::FilterInt { d: 1 });
+
+// 3. Prove + verify via nargo/bb subprocesses (tag isolates concurrent provers).
+let prover = CircuitProver::from_crate_root();
+let out = std::env::temp_dir().join("sparq_zk_quickstart");
+let art = prover.prove_in(&id, &toml, &out, "quickstart").expect("prove");
+assert!(prover.verify(&art, &out.join("verify")).expect("verify runs"));
+```
+
+## Key APIs
+
+Stage 1 (`sparq-zk`):
+- `encode::salt_from_bytes(&[u8;32]) -> Fr` — a per-graph bnode salt. In trusted ingest use `ingest::IngestedDataset` instead (mints a fresh globally-unique salt per graph).
+- `commit::commit_triples(triples: &[Triple], salt: Fr) -> Result<GraphCommitment, CommitError>` and `commit::commit_graph_content(&sparq_core::Graph, salt) -> Result<GraphCommitment, _>`. `GraphCommitment { canonical, leaves, commitment: Fr, salt: Fr }`.
+- `commit::CommitmentMethod` (sq-zzxt, config-only — selects HOW a graph was committed over the `zk:scheme` slot): `StringCanonicalV1` (the byte-unchanged `DEFAULT`/back-compat anchor) · `DualLeafV1` · `ValueOnlyV1` (only under the OFF-by-default `commitment-value-only` feature — a **benchmark/research dial, never a production default**). A **closed, fail-closed enum**: `from_scheme_iri(iri) -> Option<Self>` returns `None` on an unknown/unselectable IRI (never a default). `scheme_iri()`/`scheme_node()` serialize it; `removes_inv_vl()` / `is_production_selectable()` report the honest per-method posture. `RegistryEntry::method() -> Option<CommitmentMethod>` / `RegistryEntry::with_method(m)` read + record the selection on a registry entry. **Config plumbing only — no circuit, no leaf-shape change** (the dual-leaf/value-only encodings + the per-method circuit dispatch are separate audit-gated beads); selecting `dual-leaf` records the #769-accepted INV-VL downgrade (value↔lexical agreement rests on trusted-issuer honesty), an open external-audit obligation (CR-G8 / sq-qhy4), and asserts NO soundness/privacy property. <!-- privacy-claims-allow: opt-in config plumbing only; dual-leaf INV-VL downgrade framed as an OPEN audit obligation; asserts no soundness/privacy property; sq-qhy4 / CR-G8 -->
+- `dual_leaf::*` (sq-xojl, behind the OFF-by-default `dual-leaf` feature — the host mirror of the `filter_value_dl_int` circuit member): `encode_literal(&Literal) -> Result<DualLeafComponents, DualLeafError>` encodes a NON-NEGATIVE `xsd:integer` under the dual-leaf shape `Enc = h3(h3(VALUE_HOOK, DATATYPE_CONST, LANG_NONE), lexical_component, TYPE_CODE_LITERAL)` with **fail-closed same-leaf co-binding** (derives the value handle and the lexical hash from the SAME parse; a non-canonical / signed / overflowing form is rejected, so sparq's own ingest cannot self-desync); `DualLeafComponents { value_hook, datatype_const, lexical_component }` exposes `.value_component()` / `.leaf()` so the verifier/circuit cross-check reconstructs the committed `operand_enc`; `lexical_component` is byte-identical to the string-canonical `h_s` (identity ops unchanged). Selecting dual-leaf carries the #769-accepted **INV-VL downgrade** (value↔lexical agreement on the value-FILTER lane is trusted-issuer-honesty, NOT machine-enforced), an open external-audit obligation (CR-G8 / sq-qhy4); it asserts NO soundness/privacy property (estate NOT externally audited). Datatype classes ([OPUS-4.8] sq-2ezsx adds double + decimal): `encode_literal` (integer, sq-xojl), `encode_double` (`xsd:double` — accepts canonical scientific notation plus `INF`/`-INF`/`NaN`, rejecting Rust-parser extensions such as lowercase `e`, leading `+`, and redundant zeros; value handle = the SPARQL-numeric CANONICAL IEEE bits via `canonical_f64_bits`, so `-0.0`/`+0.0` and all NaN payloads collapse to ONE handle; [GPT-5.6] sq-vh829), `encode_decimal` (`xsd:decimal` — value handle = the SIGNED scaled magnitude at the lexical's canonical fraction scale, with the scale folded into `datatype_const` via `decimal_datatype_const(fd)` so `"5.0"`/`"5.00"` get distinct handles). Both are fail-closed co-binding (a non-canonical form is rejected). <!-- privacy-claims-allow: opt-in dual-leaf host encoder; INV-VL downgrade framed as an OPEN audit obligation; fail-closed co-binding is a host mitigation, not a guarantee; asserts no soundness/privacy property; sq-qhy4 / CR-G8 -->
+- `ingest::IngestedDataset::ingest(store: &Graph, names: &[NamedNode]) -> Result<Self, IngestError>` — per-named-graph commitments, each under a fresh OS-random salt; `.commitments()`, `.salts()`, `.names()`.
+- `sig::SecretKey::{from_seed(u64) /*test/tooling only*/, public_key(), sign_commitment_with_status(&Fr c, &Fr salt, &Fr status_ref) -> String}`; free fns `commitment_message_with_status`, `status_ref_digest(&Fr list_id, index, version)`, `status_list_id_to_field(iri)`, `public_key_to_hex` / `public_key_from_hex`, `verify`, and `SignatureScheme::Poseidon2SchnorrV1`. **`PublicKey::is_prime_order()`** (sq-l15mi, audit H-1) gates a key as on-curve + prime-order-subgroup (`[L]·pk == O`) + non-identity: Baby-JubJub has cofactor 8, so a torsion/low-order key admits a no-secret Schnorr forgery on the hidden-issuer path. `public_key_from_hex`, `key_set_leaf`, and `in_circuit_witness` fail-closed unless prime-order (`PublicKey`'s inner field is `pub`, so a torsion point can be constructed directly); the in-circuit `issuer.nr::schnorr_verify` mirrors this with `assert_in_prime_order_subgroup` on `pk` and `R`. This closes ONE finding; the estate is still audit-gated (sq-qhy4). <!-- privacy-claims-allow: describes a soundness-hardening guard + its scope; explicitly states it closes one finding and the estate remains NOT externally audited (sq-qhy4) -->.
+- `sig::IssuerSignatureScheme` (sq-1hsl, the **OFF-circuit signature seam** — an OPEN trait, distinct from the CLOSED in-circuit `CommitmentMethod` enum because signature verification is verifier-side): `cryptosuite_iri() -> &str`, `verify_message(pk_hex, &Fr m, sig_hex) -> bool` (fail-closed, never panics), `in_circuit() -> InCircuitVerifier::{None, Native{member_hint}}` (the honest discriminator: whether a scheme has a native in-circuit verifier). `SchnorrBjjScheme` is the first/default impl — byte-for-byte the existing `public_key_from_hex`+`signature_from_hex`+`verify` path (back-compat), reporting the `hidden_issuer` native member. `resolve_signature_scheme(cryptosuite_iri) -> Option<Box<dyn IssuerSignatureScheme>>` (fail-closed; in lock step with `SignatureScheme::from_cryptosuite_iri`) and `verify_commitment_with_scheme(cryptosuite_iri, pk_hex, &Fr m, sig_hex) -> bool` (resolve + verify; no default fallback) compose the seam — independent of the commitment-method axis. The trait is the additive extension point for a second verifier-side scheme (an EdDSA/ECDSA-over-a-VC ingest bridge); only the Schnorr scheme is implemented today, and the trait asserts **no** soundness/privacy property (estate NOT externally audited, sq-qhy4). <!-- privacy-claims-allow: open trait BOUNDARY + Schnorr impl moved behind it byte-unchanged; only the in-tree Schnorr scheme is implemented; explicitly asserts no soundness/privacy property; sq-qhy4 -->
+- `secprop::*` (sq-bevd3, behind the OFF-by-default **`secprop-annotations`** feature — the machine-readable form of `research/zk-configurable-commitment-security.md` §4, the per-method security posture): a STATIC annotation graph (`ontologies/secprop-methods.ttl`) keyed on the `zk:scheme`/`zk:cryptosuite` IRIs the registry records, parsed to a typed model via `parse_annotations() -> BTreeMap<String, MethodAnnotations>`. Each `MethodAnnotations { method, assertions }` holds `PropertyAssertion { property, level, assurance: Assurance::{Proven, Claimed, Conjectured}, audit_status, assumption, scope: Scope::{QueryProofLayer, SourceLayerOnly} }`. The three over-claim GUARDS are public: `audit_overclaim_violations(&ann)` (guard 1 — no `Proven` on a positive property while `audit_qhy4_open()` is `true`; only settled NEGATIVES `PQForgeable`/`Replayable`/`SchemeRevealed` may be `Proven`), `completeness_violations(&ann, &production_method_iris())` (guard 3 — every production-selectable `zk:scheme` is annotated), and `source_layer_transfer_violations(&ann, &constraints)` + `MethodAnnotations::admits_query_proof_property(property, level)` (guard 2 — a `SourceLayerOnly` property NEVER satisfies a query-proof constraint; `zk:sourceCryptosuite` is provenance, design §5.3). It RECORDS claims + their epistemic basis — it is **NOT** a proof; the dual-leaf soundness assertion carries an explicit `secx:IssuerHonesty` assumption (the #769-accepted INV-VL downgrade) and stays `Claimed`; `value_only_posture()` returns the OFF-by-default research dial's prose posture (never a graph subject). The `secx:` vocabulary is owned by sparq-trust (`secprop-vocab`), but sparq-trust depends on sparq-zk, so the IRIs are declared locally and a drift test pins them to the canonical `secprop-ext.ttl`. Asserts NO soundness/privacy property (estate NOT externally audited, sq-qhy4); the assurance default is `Claimed` and no method is `Proven` on a positive property while sq-qhy4 is open. <!-- privacy-claims-allow: opt-in annotation graph that RECORDS claims + epistemic basis; the over-claim guards forbid Proven on a positive property while sq-qhy4 is open; explicitly asserts no soundness/privacy property; sq-qhy4 / CR-G8 -->
+
+Stage 2 (`sparq-zk-compose`):
+- `build::{Pattern, Slot::{Const(Term), Var}, build_scan(&[GraphCommitment], &Pattern) -> Option<BuiltScan>, build_filter_int(operand_enc, value, op, bound, expected) -> Option<(ProofInputs, Vec<u8>)>, encode_int_literal(u64) -> FieldHex}`. `BuiltScan { inputs: ProofInputs, witness: ScanWitness { counts, enc } }`. Composable signed/decimal FILTERs: `build_filter_signed_int(operand_enc, value: i64, op, bound: i64, expected) -> Option<(ProofInputs, FilterSignedWitness)>`, `build_filter_decimal(operand_enc, neg, int_part: &str, frac: &str, op, bound_neg, bound_scaled: u64, expected) -> Option<(ProofInputs, FilterSignedWitness)>` ([OPUS-4.8] sq-7lrq); `FilterSignedWitness { neg, int_digits, frac_digits }` is the private sign+digits witness.
+- `toml::prover_toml_for(&ProofInputs, &FieldHex challenge, scan_counts: &[u32], scan_enc: &[Vec<[FieldHex;3]>], filter_digits: &[u8], join_witness: Option<&JoinWitness>, filter_signed_witness: Option<&FilterSignedWitness>) -> Result<(CircuitId, String), ProverTomlError>`. A `JoinEq`/`FilterSignedInt`/`FilterDecimal` input without its witness returns `Err(ProverTomlError::{JoinEqMissingWitness, FilterSignedMissingWitness})` (recoverable, never a panic).
+- `driver::CircuitProver::{from_crate_root(), compile(&CircuitId), prove_in(&CircuitId, toml: &str, out_dir: &Path, tag: &str) -> Result<ProofArtifacts, DriverError>, gen_witness_tagged, canonical_vk, verify_with, verify}`.
+- `verifier::encode_artifacts(&ProofArtifacts) -> String` — the `proof_hex` blob (`len|proof|len|public_inputs|vk`) to put in a `SubProof`.
+- `verifier::verify_manifest(&ProofManifest, &CircuitProver, work_dir: &Path, &KeySet, &RevocationPolicy, &VerifierNonce, &dyn SeenNonces) -> Result<(), CheckError>` — **the full-binding entry point** (the only path that runs every gate; an internal re-audit finds it sound-as-landed under its stated threat model, but it is **pending external cryptographer sign-off — treat it as NOT-yet-sound for production**, see [SECURITY.md](../../SECURITY.md) / sq-qhy4). `prefilter_manifest_structure(&ProofManifest, &KeySet, &RevocationPolicy)` runs only the fast structural gate (no bb, binds nothing to a proof, enforces no freshness — **NOT a sound verifier on its own**). <!-- privacy-claims-allow: negative usage ("NOT a sound verifier on its own") + pending-external-audit caveat; sq-toze.35 -->
+- Trust anchors / freshness: `KeySet::{empty, from_hex_keys(I), with_hidden_issuer_depth(u32)}`, `RevocationPolicy::{up_to(now, window), accept_version(v), with_snapshot(StatusListSnapshot), with_hidden_index_depth(u32)}`, `VerifierNonce::{from_hex, from_field}`, `FileSeenNonces::open(path)` (durable), `InMemorySeenNonces::new()` (test-only).
+- Manifest model: `manifest::{ProofManifest, ProofInputs::{Scan, FilterInt, FilterF64, FilterSignedInt, FilterDecimal, JoinEq}, SubProof { inputs, proof_hex }, BindingEdge, BindingMode::Challenge { challenge }, CommitmentAttestation, AttestedStatusRef, RevocationStatus, StatusListSnapshot, EntailmentRegime::Simple, FilterOp, CircuitId::{Scan, FilterInt, FilterF64, FilterSignedInt{md}, FilterDecimal{id,fd}, …}, FieldHex}`. `ProofManifest::{to_json, from_json}` round-trip via serde.
+- Dual-leaf value lane (sq-xojl + sq-cfmv + [OPUS-4.8] sq-2ezsx, behind the OFF-by-default `dual-leaf` feature): `CircuitId::FilterValueDl` + `ProofInputs::FilterValueDl { operand_enc, op, bound, datatype_const, expected }` are the integer value-lane FILTER member — it binds the operand to the dual-leaf commitment via two Poseidon2 permutations over the witnessed `VALUE_HOOK` with **NO in-circuit blake3** (the measured gate win, `gate_count_snapshot.json`), and is DIGIT-COUNT-FREE (one member per datatype class; no `ceil(log10(value))` member-selection leak). **Sibling datatype-class members (sq-2ezsx):** `CircuitId::FilterValueDlF64` + `ProofInputs::FilterValueDlF64 { operand_enc, op, b_bits, datatype_const, expected }` (`xsd:double` — the value handle is the IEEE bits, and the member instantiates B4 IN-CIRCUIT by CANONICALISING `-0.0`/`+0.0` and NaN payloads before the bind, since the term is many-to-one on the value) and `CircuitId::FilterValueDlDecimal` + `ProofInputs::FilterValueDlDecimal { operand_enc, op, bound_neg, bound_scaled, datatype_const, expected }` (`xsd:decimal` — value handle = the SIGNED scaled magnitude; B4 is the canonical-SCALE bind, with the scale folded into the public `datatype_const`, so ONE compiled member serves every scale). `toml::filter_value_dl_prover_toml(...)` / `filter_value_dl_f64_prover_toml(...)` / `filter_value_dl_decimal_prover_toml(...)` emit each member's `Prover.toml` (their private witnesses are field elements — `value_hook` (+ `value_neg` for decimal) + `lexical_component`). **`dispatch::resolve_circuit(CommitmentMethod, &CircuitId) -> Result<CircuitId, DispatchError>`** and `dispatch::resolve_circuit_for_scheme(scheme_iri, &CircuitId)` are the **fail-closed `(commitment-method × circuit)` dispatch matrix** (sq-cfmv): they REJECT a value-lane member against a method with no value handle (`string-canonical`), a string-lane/identity member against `value-only`, an identity op routed at the value lane (reject-list (v)), and an unknown method IRI — `DispatchError::{IllegalPair, IdentityOpAtValueLane, UnknownMethod}`, never a silent mis-dispatch or default. **Wiring the resolver into `verify_manifest` (so the verifier reads the recorded `zk:scheme` and gates each sub-proof) is design bead 6 (depends on the host encoding sq-j506) — the resolver is the self-contained, tested component that bead consumes.** The member + matrix carry the #769-accepted INV-VL downgrade (CR-G8 / sq-qhy4); NOT externally audited; no soundness/privacy claim. <!-- privacy-claims-allow: opt-in dual-leaf value lane + fail-closed dispatch matrix; INV-VL downgrade framed as an OPEN audit obligation; resolver enforces structural legality only and asserts no soundness/privacy property; sq-qhy4 / CR-G8 -->
+- Privacy upgrades (opt-in): `issuer::{key_set_root, key_membership_witness, hidden_issuer_prover_toml, HiddenIssuerWitness}`, `holder::{holder_set_root, holder_set_membership_witness, holder_set_prover_toml, HolderSetWitness}` (hidden-holder-SET tier, sq-3c00), and `revocation::{merkle_root, merkle_witness, revoke_prover_toml, MerkleWitness}`.
+- Large-registry scaling (sq-8k3h, host-side only): `issuer::{key_set_root_sparse, key_membership_witness_sparse}` and `holder::{holder_set_root_sparse, holder_set_membership_witness_sparse}` build the BIT-IDENTICAL root + authentication path in `O(n·depth)` (no `2^depth` materialisation), so a very large issuer/holder registry commits at any depth. The in-circuit relation is depth-generic and UNCHANGED — these are a drop-in for the dense builders, asserting NO new soundness/privacy property.
+
+## Common recipes
+
+### 1. Commit a credential graph and attest it as an issuer
+```rust
+use sparq_zk::commit::commit_triples;
+use sparq_zk::encode::salt_from_bytes;
+use sparq_zk::sig::{SecretKey, status_list_id_to_field, status_ref_digest, public_key_to_hex, SignatureScheme};
+use sparq_zk_compose::manifest::{AttestedStatusRef, CommitmentAttestation, FieldHex};
+
+let salt = salt_from_bytes(&[7u8; 32]);                 // production: use IngestedDataset (OS-random)
+let commit = commit_triples(&credential_triples, salt).unwrap();
+
+let issuer = SecretKey::from_seed(1);                   // production: generate from OS entropy, NOT a seed
+let (list, index, version) = ("http://ex/status/1", 3u64, 1u64);
+let status_ref = status_ref_digest(&status_list_id_to_field(list), index, version);
+
+// A scan-covering attestation MUST bind salt AND status reference (fail-closed otherwise).
+let attestation = CommitmentAttestation {
+    commitment: FieldHex::from_field(&commit.commitment),
+    issuer_public_key: public_key_to_hex(&issuer.public_key()),
+    signature: issuer.sign_commitment_with_status(&commit.commitment, &salt, &status_ref),
+    cryptosuite: SignatureScheme::Poseidon2SchnorrV1.cryptosuite_iri().to_string(),
+    salt: Some(FieldHex::from_field(&salt)),
+    status: Some(AttestedStatusRef { index, version }),
+};
+```
+
+### 2. Build a BGP scan proof for `{ ?s <http://ex/age> ?o }`
+```rust
+use oxrdf::{NamedNode, Term};
+use sparq_zk_compose::build::{build_scan, Pattern, Slot};
+use sparq_zk_compose::manifest::ProofInputs;
+
+let pattern = Pattern {
+    s: Slot::Var,
+    p: Slot::Const(Term::NamedNode(NamedNode::new("http://ex/age").unwrap())),
+    o: Slot::Var,
+};
+let scan = build_scan(&[commit /* GraphCommitment */], &pattern).expect("a compiled scan member fits");
+// scan.inputs is ProofInputs::Scan { id, commitments, rows, attribution, .. };
+// scan.witness has the private per-graph encodings prover_toml_for needs.
+let operand_enc = match &scan.inputs {
+    ProofInputs::Scan { rows, .. } => rows[0][2].clone(), // the object column to feed a FILTER
+    _ => unreachable!(),
+};
+```
+
+### 3. Assemble + prove a full manifest (scan + bound integer FILTER)
+```rust
+use sparq_zk_compose::build::build_filter_int;
+use sparq_zk_compose::driver::CircuitProver;
+use sparq_zk_compose::toml::prover_toml_for;
+use sparq_zk_compose::verifier::encode_artifacts;
+use sparq_zk_compose::manifest::*;
+
+let challenge = FieldHex("0x2a".into());                 // == the verifier's nonce
+let prover = CircuitProver::from_crate_root();
+let out = std::env::temp_dir().join("sparq_zk_manifest");
+
+// scan proof
+let (scan_id, scan_toml) = prover_toml_for(&scan.inputs, &challenge,
+    &scan.witness.counts, &scan.witness.enc, &[]);
+let scan_art = prover.prove_in(&scan_id, &scan_toml, &out, "scan").unwrap();
+
+// filter proof `?o >= 18`, verdict true
+let (filter_inputs, digits) = build_filter_int(operand_enc, 25, FilterOp::Ge, 18, true).unwrap();
+let (f_id, f_toml) = prover_toml_for(&filter_inputs, &challenge, &[], &[], &digits);
+let filter_art = prover.prove_in(&f_id, &f_toml, &out, "filter").unwrap();
+
+let manifest = ProofManifest {
+    r#type: "urn:sparq:zk:ProofManifest".into(),
+    query: "SELECT ?s ?o WHERE { ?s <http://ex/age> ?o FILTER(?o >= 18) }".into(),
+    issuers: vec!["did:key:zIssuer".into()],
+    key_set: vec![public_key_to_hex(&issuer.public_key())], // declared (narrowing) — NOT the trust anchor
+    commitment_attestations: vec![attestation],
+    attributions: vec![vec![0]],                            // one BGP pattern, from graph 0
+    join_obligations: vec![],
+    entailment_regime: EntailmentRegime::Simple,
+    binding: BindingMode::Challenge { challenge: FieldHex("0x2a".into()) },
+    revocation: Some(RevocationStatus { status_list: "http://ex/status/1".into(), index: 3, version: 1 }),
+    status_snapshots: vec![],                               // prover copy is only a tripwire; see recipe 4
+    sub_proofs: vec![
+        SubProof { inputs: scan.inputs,   proof_hex: encode_artifacts(&scan_art) },
+        SubProof { inputs: filter_inputs, proof_hex: encode_artifacts(&filter_art) },
+    ],
+    binding_edges: vec![BindingEdge { from_proof: 0, from_row: 0, from_slot: 2, to_proof: 1 }],
+    hidden_revocation: None,
+    hidden_issuer_attestations: vec![],
+};
+let json = manifest.to_json(); // ships to the verifier
+```
+
+### 4. Verify a manifest as a relying party (the full-binding path)
+```rust
+use sparq_zk_compose::driver::CircuitProver;
+use sparq_zk_compose::verifier::{verify_manifest, KeySet, RevocationPolicy, VerifierNonce, FileSeenNonces};
+use sparq_zk_compose::manifest::{ProofManifest, StatusListSnapshot};
+use sparq_zk::sig::public_key_to_hex;
+
+let manifest = ProofManifest::from_json(&json).unwrap();
+
+// External trust anchors — resolved + authenticated OUT OF BAND, never from the manifest:
+let trusted = KeySet::from_hex_keys([public_key_to_hex(&issuer.public_key())]); // issuers you trust
+let policy = RevocationPolicy::accept_version(1)        // freshness window; or ::up_to(now, window)
+    .with_snapshot(StatusListSnapshot {                // AUTHORITATIVE bitstring (bit decision reads HERE)
+        status_list: "http://ex/status/1".into(), version: 1, bits: vec![0u8] /* index 3 unset = active */,
+    });
+
+let nonce = VerifierNonce::from_hex("0x2a").unwrap();  // mint fresh per session, hand to prover BEFORE proving
+let seen = FileSeenNonces::open("/var/lib/sparq/seen_nonces").unwrap(); // durable single-use store
+
+let prover = CircuitProver::from_crate_root();
+match verify_manifest(&manifest, &prover, std::path::Path::new("/tmp/verify"),
+                      &trusted, &policy, &nonce, &seen) {
+    Ok(())  => { /* result is correct, issuer-attested, live, fresh */ }
+    Err(e)  => eprintln!("rejected: {e:?}"), // CheckError variant pinpoints the failed gate
+}
+```
+The nonce is **burned on presentation** (consumed even if verification then fails) — a rejection is never a free retry; mint a new nonce for the next attempt.
+
+### 5. Fast structural pre-check without the toolchain
+```rust
+use sparq_zk_compose::verifier::{prefilter_manifest_structure, KeySet, RevocationPolicy};
+// Re-parses the query (Q6 cross-graph bnode-join guard + arity), re-derives circuit ids,
+// checks binding edges + issuer/key-set + revocation reference. NO bb, NO freshness.
+// [OPUS-4.8] sq-en5dx: the Q6 guard keys each pattern's attribution on committed-graph
+// IDENTITY (the answering scan's commitments[g]), NOT the scan-LOCAL index — so a
+// genuine cross-scan join over two DISTINCT committed graphs (e.g. two k=1 scans, the
+// `[[0],[0]]` alias) requires its non-bnode `join_obligations` entry to be DECLARED,
+// while two scans over the SAME graph stay obligation-free. Still under sq-qhy4: NOT sound.
+// NOT a sound verifier on its own — always follow with verify_manifest. privacy-claims-allow: negative usage; sq-toze.35
+let _required = prefilter_manifest_structure(&manifest, &KeySet::empty(), &RevocationPolicy::accept_version(1))?;
+```
+
+### 6. Hidden-index revocation proof (privacy upgrade — index never disclosed)
+```rust
+use sparq_zk_compose::revocation::{merkle_root, merkle_witness, revoke_prover_toml};
+use sparq_zk_compose::manifest::{CircuitId, HiddenIndexRevocation, FieldHex};
+use sparq_zk_compose::driver::CircuitProver;
+use sparq_zk_compose::verifier::encode_artifacts;
+
+let depth = 10;                                  // compiled member: revoke_unset_d10 (<= 1024 indices)
+let root = merkle_root(&authoritative_snapshot, depth).unwrap();
+let witness = merkle_witness(&authoritative_snapshot, depth, /*hidden index*/ 3).unwrap(); // witness.bit must be 0
+let toml = revoke_prover_toml(&nonce_field, &root, 3, &witness);
+let prover = CircuitProver::from_crate_root();
+let art = prover.prove_in(&CircuitId::RevokeUnset { depth }, &toml, std::path::Path::new("/tmp/rev"), "rev").unwrap();
+// attach to manifest.hidden_revocation; enable on the verifier with
+// RevocationPolicy::...with_hidden_index_depth(depth). (Hidden-issuer attestations mirror this
+// with sparq_zk_compose::issuer::* + KeySet::with_hidden_issuer_depth.)
+```
+
+## Honest scope (what is and isn't supported)
+
+- **Entailment:** only `EntailmentRegime::Simple` is proved — no in-circuit RDFS/OWL reasoning (`Rdfs`/`Owl` are stable schema placeholders).
+- **Query fragment:** BGP triple-pattern **scan** (in-circuit per-graph Poseidon2 commitment recompute + row soundness + **scan completeness**) and hidden-operand numeric **FILTER over `xsd:integer`** (`filter_int`, non-negative). `xsd:double` FILTER (`filter_f64`) is composable for the integer-valued fragment (`filter_f64_d{d}`; general fractional/scientific forms deferred). **NEGATIVE `xsd:integer`** (`filter_signed_int`) and **`xsd:decimal`** (`filter_decimal`, fixed-point at a fixed fraction-digit count, host-prescaled bound) are MANIFEST-COMPOSABLE ([OPUS-4.8] sq-1q9h compiled members, sq-7lrq composability wiring): `CircuitId::FilterSignedInt{md}` / `FilterDecimal{id,fd}` + the matching `ProofInputs` variants + `derive_filter_signed_int_id` / `derive_filter_decimal_id` + `build_filter_signed_int` / `build_filter_decimal` + the verifier binding edge + public-input reconstruction, so a signed/decimal FILTER assembles into a `ProofManifest` with the same operand binding as `filter_int`. The GENERAL fractional/scientific `xsd:double` fragment (an in-circuit decimal→IEEE round-to-nearest-even parser over an arbitrary lexical form) remains DEFERRED (sq-7lrq part 2). A **hidden cross-credential JOIN** is proved in-circuit (`join_eq`, single-prover; the join term stays private) — distinct from the verifier-side disclosed-row join. **No aggregation.** The Q6 cross-graph bnode-join guard runs from `manifest.attributions` / `join_obligations`.
+- **Wave-1 extended fragment gate (query-side, `sparq-zk`):** `sparq_zk::verify::fragment_query` re-derives the *monotone* fragment extensions of `research/zksparql-fragment-extension.md` §3–§4 from the query text — property-path rewrites (predicate/inverse/sequence with deterministic `!`-namespace intermediates), bounded `?`/`*`/`+` closures over an atomic step as `PathReach` obligations (the `path_reach_d{k}` statement family: `k` is a **manifest** public input, never query text; `p?` pins `k=1`), UNION branch lists (joins distribute; capped at `MAX_FRAGMENT_BRANCHES`), VALUES public rows (`UNDEF` = wildcard; triple terms rejected), and subqueries with inner-only variables renamed apart — failing closed on everything else (OPTIONAL / MINUS / (NOT) EXISTS / GRAPH / SERVICE / BIND / aggregates / ORDER BY / `FROM` / subquery LIMIT / non-atomic closures / negated property sets). `verify::branch_obligations` extends the Q6 coarse rule per-branch (path endpoints join like pattern variables; a multi-graph path attribution additionally flags `path_link_non_bnode`). The stage-1 entry points (`fragment_patterns`/`fragment_filters`/`recheck`) are unchanged and still reject the extensions. (sq-3kd2g.3; ZK-soundness posture unchanged: internally re-checked, external audit pending — sq-qhy4.)
+- **Wave-1 compose schema + fail-closed dispatch (OFF-by-default `extended-fragment` feature, sq-3kd2g.6):** `sparq-zk-compose` gains, behind the opt-in `extended-fragment` cargo feature, the compose side of the wave-1 fragment: `CircuitId::PathReach{d,k,n}` + `ProofInputs::PathReach` (the `path_reach_d{d}_k{k}_n{n}` member family, sq-3kd2g.2 — `d` is the design record's normative depth bound, disclosed as the public `depth_bound` and re-derived by the verifier; `k` = graph count, `n` = slot bucket), `build::build_path_reach` + `build::derive_path_reach_id`/`smallest_path_reach_id` + `toml::path_reach_prover_toml` (the prover wiring, symmetric to `build_join`/`build_scan`), the public-input reconstruction + `derive_id` binding, the per-solution UNION branch-attribution + VALUES row-index disclosure schema (`manifest::BranchWitness`, carried by the `manifest::FragmentManifest` wrapper — a distinct type so the stage-1 `ProofManifest` schema is byte-unchanged), and the **fail-closed** routing gate `verifier::dispatch_fragment(&FragmentManifest)`: it re-derives the branches from the query text alone (`verify::fragment_query`), then REFUSES (structured `FragmentDispatchError`, never a silent fallback) anything outside the proven-sound fragment — an unknown/mismatched circuit id, a bounded path claimed without a bound `PathReach` sub-proof of the right member, a `k`/depth mismatch (the disclosed `depth_bound` must equal the member's compiled `d`, req 1), a `p+`/`p*` closure disagreement, a `p?` bound to a deeper member, a branch attribution pointing at a non-existent branch, or a VALUES row-index out of range. **End-to-end routing (sq-h732x):** `verifier::verify_fragment_manifest(&FragmentManifest, …)` (same external inputs as `verify_manifest`) now verifies an extended-fragment presentation END-TO-END: it runs `dispatch_fragment` FIRST (fail-closed, before the verifier nonce is burnt or any bb subprocess starts, mapped into `CheckError::FragmentDispatch`), then the SAME crypto stage as `verify_manifest` over the embedded manifest — the per-sub-proof public-input reconstruction + canonical-vk + `bb verify`, nonce single-use + challenge binding, issuer attestation, revocation, holder binding — with stage-1a's query-fragment ACCEPTANCE routed through `fragment_query` (so the extended query is no longer rejected at `recheck`). `verify_manifest` itself is UNCHANGED and still rejects every extended query at its flat stage-1 `recheck` (byte-identical, feature ON or OFF). **Disclosed-solution term binding (sq-1zf94):** `verify_fragment_manifest` now also runs `verifier::bind_fragment_solution` (before the nonce is burnt) — the composition analogue of the flat `bind_query_correctness`/`bind_joins` term binding. `manifest::BranchWitness` gains a `solution: Vec<SolutionBinding>` (disclosed var→`DisclosedTerm`, IRI/literal), and the gate RE-ENCODES each disclosed term itself (`encode_term`, salt-independent for IRIs/literals — never a prover-supplied encoding) and demands, fail-closed (`FragmentSolutionError` → `CheckError::FragmentSolution`): each bound `PathReach`'s `pred_enc` = the query-text predicate encoding; each `src_enc`/`dst_enc` = the query-CONSTANT endpoint's encoding, or the disclosed solution's binding for a PROJECTED endpoint variable (a projected endpoint omitted from the solution is refused); and each disclosed `VALUES` cell = the PROJECTED variable's disclosed binding (a `values_rows` index pointing at a row whose cell disagrees — the "wrong disclosed row" — is refused). Because those `PathReach` public inputs are byte-bound into the bb proof (audit #1 reconstruction), a solution that passes this gate AND the crypto stage has its disclosed endpoints/VALUES terms genuinely tied to the proofs. **BGP scan-slot binding (sq-qyfth):** `verify_fragment_manifest` then runs the sibling gate `verifier::bind_fragment_scans` (also before the nonce is burnt) — the composition analogue of the flat `bind_query_correctness` scan-const check + the disclosed-row/`bind_joins` slot binding, for the LARGEST unbound surface #1673 left (a disclosed solution variable that occurs ONLY in a BGP scan). `manifest::BranchWitness` gains a `scan_rows: Vec<usize>` (one selected disclosed-row index per BGP-scan obligation), and the gate demands, fail-closed (`FragmentScanError` → `CheckError::FragmentScan`): the scan answers the query BGP pattern (`scan_matches_pattern`); a scan pattern carrying a variable has a selected row within the scan's ACTIVE disclosed rows (a missing selection or out-of-range index is refused); each PROJECTED scan variable's selected-row slot = its disclosed-solution encoding (a projected scan var omitted from the solution, or a row whose slot disagrees — the "wrong supporting row" — is refused); and the rows selected for two SCAN atoms sharing an EXISTENTIAL variable agree on its slot value (join incoherence is refused). This closes the BGP-scan-slot residual #1673 named. **Per-branch cross-graph Q6 + scan↔path coherence (sq-ygk6x):** `verify_fragment_manifest` then runs `verifier::bind_fragment_join_coherence` (also before the nonce is burnt) — the branch-local analogue of the flat cross-graph non-bnode obligation (`verify::cross_graph_join_obligations`/`recheck`), extended to path-rewritten obligations. Per branch it (1) binds every existential variable shared between two atoms — INCLUDING a scan slot and a `PathReach` endpoint (`src_enc`/`dst_enc` are public `FieldHex`, directly comparable to a selected scan row slot) — to ONE value by encoding-equality (a path claiming a different node than its supporting scan row, or another path endpoint, supports is refused, both directions — `FragmentJoinError::Incoherent` → `CheckError::FragmentJoin`); (2) re-derives the branch's Q6 obligations with `verify::branch_obligations` over the PROOF-BOUND per-obligation attributions (interned to a per-branch committed-graph identity, the safe-coarser flat discipline) and requires every cross-graph join edge's variable covered by the disclosed data — combined with the ALWAYS-ACTIVE salt-uniqueness gate (audit #9) an equal encoding across a cross-graph edge cannot be a blank node, so the flat non-bnode obligation holds branch-locally for BGP scans; and (3) refuses a multi-graph path (proof-bound attribution admitting >1 committed graph) whose interior-chain non-bnode obligation the verifier cannot discharge from disclosed data (`FragmentJoinError::MultiGraphPath`). **Salt-uniqueness + attestation now cover PATH commitments (sq-nlulr):** `verifier::bind_issuer_attestations` extends the audit-#9 issuer-attestation + salt-uniqueness record to `PathReach`-referenced committed graphs — each path commitment now carries the SAME issuer-attestation requirement + distinct-salt record as a scan commitment (an unattested or salt-colliding path commitment is refused fail-closed, `CheckError::UnattestedCommitment`/`SaltReused`, before any bb sub-proof runs), so a cross-graph scan↔single-graph-path (and path↔single-graph-path) join's non-bnode corollary is discharged by the two graphs being distinctly salted, exactly as for a scan↔scan join. This CLOSED the #1684 residual. **Honest scope — remaining BY DESIGN (not a non-bnode gap):** an EXISTENTIAL (non-projected) path endpoint's value stays hidden (a privacy choice); a multi-graph path is refused fail-closed. So the extended regime now carries the SAME attestation + salt discipline as the flat path for scan↔scan / scan↔single-graph-path / path↔single-graph-path cross-graph joins — enumerated, not hidden. Default builds are byte-identical (feature OFF); no new dependency; ZK-soundness posture unchanged (internally re-audited, external audit pending — sq-qhy4). No soundness/privacy claim.
+- **Fixed circuit members only** (build returns `None` for shapes outside these): scan `k∈{1,2}`, `n∈{16,64}`, `r∈{4,8}` — **all eight `(k,n,r)` combinations compiled** ([OPUS-4.8] sq-pzet); `filter_int_d∈{1,2,3,4}`; `filter_f64_d∈{1,2,3,4}`; `filter_signed_int_d∈{2,4}` + `filter_decimal_i3_f2` (compiled AND manifest-composable — sq-1q9h members, sq-7lrq wiring; `md`/`(id,fd)` are EXACT-match, an out-of-family shape returns `None`); `join_eq` `n_a,n_b∈{16,64}` — **all four `(n_a,n_b)` combinations compiled** ([OPUS-4.8] sq-pzet); `revoke_unset_d10` (≤1024 status indices); `hidden_issuer_d4` (≤16 issuers); `holder_pok`; `holder_set_d4` (hidden-holder SET, ≤16 holders — sq-3c00). Behind the OFF-by-default `dual-leaf` feature: the DIGIT-COUNT-FREE value-lane members `filter_value_dl_int` (sq-xojl) + `filter_value_dl_f64` + `filter_value_dl_decimal` ([OPUS-4.8] sq-2ezsx — one per datatype class; the decimal member is even scale-agnostic, the scale lives in the public `datatype_const`). The buckets are derived from the data by the prover **and re-derived by the verifier** (a proof can only verify against the member its public inputs fit); an out-of-bucket shape returns `None` (a clean error, never a silently-unprovable wrong-bucket member).
+- **Privacy defaults:** issuer attestation is checked in the **clear** (reveals which issuer signed) and `RevocationStatus.index` is **disclosed** (a linkability channel) unless you opt into the hidden-issuer / hidden-index circuits — those are **additive** layers; the clear-path checks always still run.
+- **Holder binding (`HolderPop`):** a presentation may bind the proof to a holder key, cross-checked against the issuer-attested `AttestedHolderBinding.holder_pk_digest` (the issuer signed `commitment_message_with_holder` under the external `K`), so it closes the trusted-holder gap (holder A cannot present holder B's credential). Two tiers: **B1 (clear-key, default)** discloses the holder key and the verifier recomputes its digest host-side (`verifier::bind_holder_pop` / `bind_holder_binding`, gated by `HolderBindingPolicy::require_binding()`); **B2 (hidden-key, opt-in — [OPUS-4.8] sq-c2ql)** carries a `HolderPokProof` (a `holder_pok` bb proof) so the holder proves possession **in zero knowledge without disclosing the key** — `verifier::bind_holder_pok` binds the proof's public digest to the issuer-attested digest (the binding edge), gated by `HolderBindingPolicy::require_in_circuit_pok()`. B2 is **NOT-yet-sound** (sq-qhy4) like the rest of the verifier; it is the additive hidden-holder layer over B1.
+- **Trust anchors are external, never the prover's manifest:** the trusted issuer key-set (`KeySet`) and the authoritative status bitstring (`RevocationPolicy::with_snapshot`) come from the relying party. `manifest.key_set` is only accepted as a *subset* of the external `K`; the prover's `status_snapshots` is only a tamper tripwire, never the bit-decision source.
+- **Proving is subprocess-only** (`nargo`/`bb`), no embedded prover. **Concurrency:** against the *same* compiled member, use the tagged entry points (`prove_in` / `gen_witness_tagged` with a unique `tag`) — the untagged `prove` / `gen_witness` share one `Prover.toml`/witness and are only safe single-threaded.
+- **Replay/freshness:** use `FileSeenNonces` (durable: `flock` + `fsync`, single-host) in production. `InMemorySeenNonces` is non-durable, test-only (a restart reopens the replay window). For multi-host, back `SeenNonces` with a DB UNIQUE constraint / CAS store.
+- **Toolchain pin:** `nargo 1.0.0-beta.21`, `bb 5.0.0-nightly.20260324`, bb target `noir-recursive`. Other versions may change the public-input byte layout the audit-#1 reconstruction byte-compares against.
+- **Maturity:** v1, authored by Opus 4.8 while Fable was unavailable; flagged for ZK re-review. Treat as a research seam, not a hardened product.
+- **Dual-leaf value lane (opt-in, research grade, PARTIAL):** a field-native value-hook (`VALUE_HOOK`) dual-leaf encoding (design: `research/zk-field-native-encoding.md`; #769 accepted) is now implemented at research grade behind the OFF-by-default `dual-leaf` feature: the value-FILTER circuit members **`filter_value_dl_int`** (sq-xojl) + **`filter_value_dl_f64`** + **`filter_value_dl_decimal`** ([OPUS-4.8] sq-2ezsx — the double + decimal datatype classes; both bind `VALUE_HOOK` + a `lexical_component` witness with NO in-circuit blake3 — the measured gate win — and, because their terms are MANY-TO-ONE on the value (`-0.0`/`+0.0`, NaN payloads; `"5.0"`/`"5.00"`), instantiate B4 IN-CIRCUIT: f64 canonicalises the IEEE bits before the bind, decimal folds the canonical scale into the public `datatype_const`), their **host encoders** (`sparq_zk::dual_leaf::{encode_literal, encode_double, encode_decimal}`, fail-closed same-leaf co-binding), and the **fail-closed `(method × circuit)` dispatch matrix** (`sparq_zk_compose::dispatch`; sq-cfmv — all three are value-lane members). STILL PARTIAL: the full host commit-pipeline integration (`encode.rs`/`commit.rs` leaf re-base + scan/join recompute) is `sq-j506`, and wiring the dispatch resolver into `verify_manifest` (so the verifier reads the recorded `zk:scheme` and gates each sub-proof) is design bead 6 — both audit-gated. It carries the **INV-VL downgrade** — value↔lexical agreement on the value-FILTER lane is trusted-issuer-honesty, NOT machine-enforced (an open external-audit obligation, gap-register **CR-G8** / `sq-qhy4`). It makes no soundness or privacy claim; the estate is NOT externally audited. [OPUS-4.8] <!-- privacy-claims-allow: opt-in, audit-gated dual-leaf value lane; INV-VL downgrade framed as an OPEN obligation; asserts no soundness/privacy property; sq-qhy4 / CR-G8 -->
+- **Numeric type promotion in mixed integer/float comparisons (sq-3x7dl.5, [SONNET-4.6]):** the `noir_XPath` circuit layer (`xpath/src/numeric_types.nr` in the `sparq-org/noir_XPath` face repo — formerly the in-tree `zk/xpath/xpath/src/numeric_types.nr`, externalized by sq-5reoy / #1599) previously truncated the `xs:integer` operand to `i8` before converting to `xs:float`/`xs:double`, silently producing wrong comparison results for integers outside [-128, 127] (e.g. `256 == 0.0` was `true`). This was a soundness-flavoured flaw: an adversarial prover could satisfy a FILTER constraint with a wrong integer value that happens to match after i8-wrap. Fixed by using the generated `From<i64>` trait (`f64::from(n)` / `f32::from(n)`) for all 20 mixed comparison functions (eq/lt/le/gt/ge — 5 operators × 2 operand orders × 2 float types). XPath 2.0 F&O §6.2 / Appendix B.1 type promotion uses IEEE 754 round-to-nearest-even (exact for |n| <= 2^53 in f64, |n| <= 2^24 in f32; correctly rounded beyond). Also fixed: `get_common_type(float, decimal)` now returns `float` per spec rather than `double` (Bug B); `XsdDouble::from_float` now correctly converts denormal f32 values to f64 rather than mapping them to signed zero (Bug C). These are internal circuit corrections; no Rust public API surface changed.
+- **`op:numeric-divide` vs `idiv` de-aliasing + `fn:number` interior whitespace (sq-3x7dl.4, [FABLE-5]):** `noir_XPath` previously wired BOTH `xpath_op::numeric_divide` and `xpath_op::numeric_integer_divide` to truncating i64 division, so `7 div 2` silently evaluated to `3` — and SPARQL 1.1 §17.4 maps `/` to `op:numeric-divide`, so any FILTER/BIND dividing integers could constrain against a wrong value (the qt3-generated corpus only records exact-quotient cases, so the truncation was never exercised). Per XPath F&O §4.2.6, two `xs:integer` operands yield the `xs:decimal` quotient (`7 div 2 = 3.5`); the module has no arbitrary-precision decimal type, so `numeric_divide_int_as_double` implements the documented approximation: `XsdDouble::from_i64` promotion (exact for |n| <= 2^53, RNE beyond) + correctly-rounded IEEE 754 double division, fail-closed `assert(b != 0)` (err:FOAR0001 — no Infinity escape for decimal operands). `numeric_divide_int` remains only as `op:numeric-integer-divide` (`idiv`, truncates toward zero) — a distinct code path, with tests pinning `div(7,2)=3.5` vs `idiv(7,2)=3` against an independent Python IEEE 754 oracle. Also fixed: `fn_number_from_string` now implements the xsd `whiteSpace="collapse"` rule it delegates to — leading/trailing whitespace accepted, but once trailing whitespace starts any non-whitespace byte is invalid, so `fn:number('1 2')` is NaN (previously folded to `12`). Internal circuit corrections; no Rust public API surface changed.
+- **Per-method security-property annotations (opt-in, `secprop-annotations`):** the `sparq_zk::secprop` module ships the machine-readable per-method posture (`ontologies/secprop-methods.ttl`, design §5a) keyed on the `zk:scheme`/`zk:cryptosuite` IRIs. It RECORDS claims + their epistemic basis — it is NOT a proof. Three over-claim GUARDS are enforced by test AND exposed as public functions: no `Proven` on a positive privacy/soundness property while sq-qhy4 is open (only settled negatives — `PQForgeable`/`Replayable`/`SchemeRevealed` — may be `Proven`); completeness (every production-selectable scheme is annotated); and source-layer non-transfer (`zk:sourceCryptosuite` provenance never satisfies a query-proof constraint). The default assurance is `Claimed`+`ExternalSignOffPending`; promoting any annotation to `Proven` is HARD-GATED on the external sign-off (`sq-qhy4`, Phase 7 `sq-8ac8l`), out of agent scope. Asserts no soundness/privacy property. [OPUS-4.8] <!-- privacy-claims-allow: opt-in annotation graph recording claims + epistemic basis; the guards forbid Proven on a positive property while sq-qhy4 is open; asserts no soundness/privacy property; sq-qhy4 -->
+
+## See also
+
+- Internal soundness re-audits (single-model, PRECEDE the external sq-qhy4 sign-off, do not replace it): [`research/zk-verifier-reaudit.md`](../../research/zk-verifier-reaudit.md) (binding layer, sq-gbp4) + [`research/zk-membership-pok-reaudit.md`](../../research/zk-membership-pok-reaudit.md) (hidden-issuer / holder-pok / holder-set, sq-ru0yx — finds them sound-as-landed AFTER the M-1 issuer challenge-reduction no-wrap fix). <!-- privacy-claims-allow: links to internal re-audits that explicitly state they precede and do NOT replace the external sq-qhy4 sign-off; assert no production soundness/privacy property -->
+- `verifiable-credentials-zk` — credential signature schemes, commitment choices, and the credential↔circuit public-input contract.
+- `noir-circuit-patterns` / `noir-optimisation` — writing/sizing the Noir circuits this crate drives (`zk/compose/`).
+- `sparql-formal-semantics` — the Pérez–Arenas–Gutiérrez fragment + blank-node scoping the Q6 guard and `verify::recheck` enforce.
+- `mpc-protocols` — the multi-party layer that composes with this single-prover ZK estate.

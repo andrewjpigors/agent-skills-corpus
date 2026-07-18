@@ -1,0 +1,785 @@
+---
+name: literary-composition-engine
+description: Use when building, testing, or running the Hermes-native literary composition experiment end to end: prepare a literary corpus, derive theme/style contracts and evidence, validate an author pack, and generate high-style long-form prose through blueprinting, paragraph planning, neutral drafts, literal source-sentence anchoring, audit, and repair.
+version: 0.1.0
+author: Hermes Competition Team
+license: MIT
+metadata:
+  hermes:
+    tags: [creative, writing, literary-composition, corpus, subagents, sqlite, anti-slop]
+    category: creative
+    related_skills: [humanizer, subagent-driven-development, hermes-agent-skill-authoring]
+---
+
+# Literary Composition Engine
+
+## Overview
+
+Build an editable author model from a messy literary corpus, then use that model as a high-style literary composition benchmark. Literary mimicry is the hardest evaluation surface: success requires control over world, knowledge, paragraph logic, sentence architecture, and phrase-level pressure. The same machinery then becomes useful anywhere durable style matters.
+
+The core thesis is that style becomes executable when it is decomposed into artifacts: corpus evidence, theme cards, style cards, source-sentence anchors, paragraph plans, audits, and repair moves.
+
+The full workflow has four production phases plus one mandatory final repair
+gate before release:
+
+1. **Phase 1: Corpus Preparation**: raw source files -> `corpus/<author>.db` with stories, paragraphs, sentences, and source sentence anchors.
+2. **Phase 2: Author Pack Construction**: corpus -> `theme.contract.yaml`, `style.contract.yaml`, `evidence.notes.yaml`, and `instruction.pairs.yaml`.
+3. **Phase 3: Artifact Validation & Calibration**: contracts/evidence -> validated author pack with release gate and runtime flags.
+4. **Phase 4: Writing Runtime**: user request -> outline/blueprint/paragraph plan -> neutral draft -> paragraph-local sentence-anchor cycles -> blind adversarial audit -> repaired released prose.
+4.5. **Phase 4.5: Final Text Repair**: assembled prose -> local error repair, false-positive repair reversal, final repair audit, and approved output for release.
+
+The operator should be able to give Hermes an author, source files, and a writing request. Hermes must run the phase workflow without requiring manual steering between internal steps. All semantic/editorial decisions are made by agents. Python tools only persist, count, list, validate structure, index, and assemble already released artifacts.
+
+Core rule:
+
+```text
+agents decide; Python persists
+```
+
+This rule is a release gate, not a slogan. Do not use Python, shell heredocs,
+or generated scripts to create or hard-code any literary decision artifact:
+`sentence_meaning_plan.yaml`, `sentence_anchor.matching.yaml`,
+`source_sentence_anchor.selection.yaml`, `paragraph.rewrite.plan.yaml`,
+`candidate.output.yaml`, anchor audits, `final.paragraph.yaml`, or
+`final.output.yaml`. Scripts may query SQLite, normalize mechanical data,
+copy already approved artifacts, assemble already released paragraphs, and run
+validators. If a script writes final prose, source sentence choices, matching
+reasons, semantic exclusions, or audit judgments, the run must be marked
+blocked and restarted.
+
+This also forbids putting unreleased target prose inside a Python or shell
+snippet "just to count words" or "just to compare lengths". Count source
+sentences with tools if needed; count target prose only after it exists in an
+agent-authored YAML artifact at the correct stage.
+
+## When to Use
+
+Use this skill when the user wants to:
+
+- prepare or inspect an author corpus for the hackathon project
+- build `corpus/<author>.db` from `.txt`, `.pdf`, `.epub`, or `.docx` source material
+- run discovery, extraction, cleanup, or validation subagents
+- derive `theme.contract.yaml`, `style.contract.yaml`, `evidence.notes.yaml`, and `instruction.pairs.yaml` from an approved corpus
+- validate an author pack before generation
+- run the Phase 4 writing runtime with outlines, blueprint, paragraph plans, sentence anchors, audits, repairs, and release gates
+- run the Phase 4.5 final text repair gate before final release
+- avoid parser-driven literary ingestion
+
+Do not use this skill for generic text rewriting without a corpus and validated author pack. Use a direct editing workflow for that.
+
+## Directory Layout
+
+Expected project-local layout:
+
+```text
+sources/<author>/                         # raw source files
+corpus/<author>.db                        # Phase 1 output
+author-models/<author>/                   # contracts, evidence, validation, validated pack
+runs/<author>/<run_id>/                   # phase runs and writing outputs
+```
+
+Inside this skill:
+
+```text
+scripts/corpus_db.py                      # mechanical SQLite tool
+scripts/validate_phase4_run.py            # mechanical Phase 4 release validator
+references/artifact-schemas.md            # generated artifact locations and required files
+references/schemas/                       # contract schemas for generated artifacts
+references/prompts/discover_stories.md    # discovery agent prompt
+references/prompts/extract_story.md       # extraction agent prompt
+references/prompts/cleanup_story.md       # cleanup agent prompt
+references/prompts/validate_story.md      # validation agent prompt
+references/prompts/run_phase2_author_pack.md         # Phase 2 orchestration prompt
+references/prompts/run_phase3_validation.md          # Phase 3 orchestration prompt
+references/prompts/run_phase4_writing_runtime.md     # Phase 4 orchestration prompt
+references/prompts/audit_phase4_sentence_anchor.md   # blind adversarial sentence anchor audit prompt
+references/prompts/run_phase4_sentence_anchor_repair_pass.md # final anchor repair/lock prompt
+references/prompts/run_phase45_final_text_repair.md  # story-level final text repair prompt
+```
+
+Generated DBs, YAML author packs, validation reports, and run artifacts belong
+in the user's active workspace. See `references/artifact-schemas.md`.
+
+Before writing any generated YAML or JSON artifact, load the relevant schema
+from `references/schemas/`. Do not invent fields when the schema already
+provides a place for the information. Do not add arbitrary numeric style scores,
+similarity scores, strength values, or confidence values. Mechanical corpus
+statistics are allowed only when a schema explicitly asks for them.
+
+Generated YAML must be valid YAML on the first write. Use block style, not flow
+style, for text-rich objects. Any free-form sentence, explanation, source quote,
+target sentence, reason, warning, or field containing `:`, quotes, apostrophes,
+semicolons, brackets, or comma-heavy prose must be written with a block scalar
+(`>-` for single-paragraph text, `|-` for text whose line breaks/paragraph breaks
+must be preserved). Do not put source sentences or long reasons inside inline
+maps such as `{...}`. `final_text` and `assembled_text` must use literal block
+style (`|-`) so paragraph breaks survive YAML parsing. Values like `yes`/`no`
+inside `formal_match_checks` must be quoted strings or true booleans; never rely
+on YAML's implicit coercion accidentally.
+
+Phase 4 release requires paragraph-local cycles. For each paragraph, generate,
+audit, and repair one paragraph at a time until `blind_anchor_adversarial_audit.yaml`
+passes. A failed sentence must be repaired by rewriting the target sentence or
+replacing its source sentence, never by improving the explanation. Only a passed
+cycle may be copied to the paragraph root and released.
+Anchor approval must be literal and adversarial: source-selection reasons and
+blind audit reasons cite exact source/target spans, and repeated boilerplate
+such as "same local machine" or "controlled expansion" is a release blocker.
+The target may inherit source sentence form, never source semantic cargo:
+memorable images, entities, conclusions, and target-language calques from the
+source sentence must be listed and blocked before writing.
+
+## Phase 1 Workflow
+
+### 0. Operator Contract
+
+The human/operator should only need to provide:
+
+```text
+author slug
+source file or source directory
+working directory
+```
+
+Hermes is responsible for creating `corpus/<author>.db` if it does not exist. Do not ask the user to initialize the DB manually.
+
+### 1. Create the Author DB
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py init --db corpus/<author>.db
+```
+
+This creates:
+
+- `stories`
+- `paragraphs`
+- `paragraphs_fts`
+- `sentences`
+- `sentences_fts`
+- `ingestion_log`
+
+Status source of truth:
+
+- `stories` stores accepted story metadata and word counts only.
+- `paragraphs` stores accepted paragraph text only.
+- `sentences` stores accepted sentence text and paragraph/story position.
+- `ingestion_log` stores ingestion state: `pending`, `done`, or `needs_review`.
+- Any pending/review/done query must read `ingestion_log`, not `stories`.
+- Reports that combine text metadata with status should join `stories.story_id` to `ingestion_log.story_id`.
+
+### 2. Dispatch Discovery
+
+Use `delegate_task` with the contents of `references/prompts/discover_stories.md`.
+
+The discovery agent reads source files and returns a JSON manifest. It decides:
+
+- which works are present
+- their order
+- candidate `story_id`
+- title / collection / publication year when available
+- source path
+- risks and exclusions
+
+The parent then writes pending entries through the DB tool:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py load-manifest \
+  --db corpus/<author>.db \
+  --manifest runs/<author>/<run_id>/manifest.json
+```
+
+### 3. Dispatch Extraction in Parallel
+
+Hermes `delegate_task` uses the configured `delegation.max_concurrent_children` limit from `config.yaml` or `DELEGATION_MAX_CONCURRENT_CHILDREN`. Before a corpus run, set that limit to the desired concurrency. For independent story extraction, prefer one extraction subagent per pending story whenever the runtime permits it. Use waves only as a fallback when the configured/runtime limit is lower than the number of pending stories.
+
+Get pending work:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py list \
+  --db corpus/<author>.db \
+  --status pending
+```
+
+Each extraction subagent receives:
+
+- author slug
+- absolute source path
+- target `story_id`
+- title / collection / year if known
+- exclusion rules
+- required artifact JSON schema
+- output path under `runs/<author>/<run_id>/extracted/`
+
+Use `references/prompts/extract_story.md`.
+
+The parent persists a completed extraction:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py ingest-story \
+  --db corpus/<author>.db \
+  --story-json runs/<author>/<run_id>/extracted/<story_id>.json
+```
+
+### 4. Cleanup and Validation
+
+If an extraction has visible source problems, missing boundaries, duplicate
+metadata, or an explicit `needs_review` recommendation, dispatch
+cleanup/validation agents using:
+
+- `references/prompts/cleanup_story.md`
+- `references/prompts/validate_story.md`
+
+Agents decide whether the result is `done` or `needs_review`. The DB tool only records that decision.
+
+Validation artifacts must use a strict schema:
+
+- `validated_status` must be exactly `done` or `needs_review`; do not use `valid`, `validated`, `ok`, `passed`, or `failed`.
+- `cleaned_story_json` must be a string path to a cleaned JSON artifact or `null`; never embed a story JSON object in this field.
+- If cleanup is needed, write the cleaned story to `runs/<author>/<run_id>/cleanup/` and reference that path.
+- The parent must not ingest an artifact until the corresponding validation artifact has `validated_status: "done"`.
+
+Epigraphs, dedications, authorial date lines, and other authorial paratext inside a story chapter are story material by default. Exclude them only when the validation agent can identify them as publisher/editor/translator matter rather than authorial text.
+
+### 5. Rebuild Sentence Index
+
+After all accepted stories are persisted, rebuild sentence rows:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py rebuild-sentences \
+  --db corpus/<author>.db
+```
+
+Do not extract, classify, persist, validate, or use `sentence_patterns`. The
+only Phase 4 source anchor is a real row in `sentences`, selected at writing
+time for a specific planned target sentence.
+
+### 6. Finalize
+
+After all stories are `done`:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py rebuild-fts --db corpus/<author>.db
+python3 ${HERMES_SKILL_DIR}/scripts/corpus_db.py report --db corpus/<author>.db
+```
+
+Do not discard `ingestion_log` until the corpus has been manually spot-checked.
+
+When producing reports, remember that the `stories` table has no `status` column. Use `corpus_db.py report`, `corpus_db.py list --status ...`, or a direct query against `ingestion_log`.
+
+## Agent Boundaries
+
+Agents decide:
+
+- story boundaries
+- paragraph segmentation
+- whether a source section is editorial matter
+- whether OCR/mojibake repair is safe
+- whether a story is complete enough for `done`
+
+Python tools may only:
+
+- create SQLite schema
+- insert/update rows
+- count words
+- list pending/review items
+- read statuses from `ingestion_log`
+- rebuild FTS5
+- export reports
+
+Do not add regex title detection, EPUB parsing heuristics, PDF layout heuristics, or automatic preface removal to Python.
+
+## Subagent Output Contract
+
+Extraction and cleanup agents must write JSON shaped like:
+
+```json
+{
+  "story_id": "author/title-slug",
+  "title": "Title",
+  "collection": null,
+  "source_file": "sources/author/source.txt",
+  "pub_year": null,
+  "status": "done",
+  "reason": "Complete story extracted; editorial intro excluded.",
+  "paragraphs": [
+    "First paragraph...",
+    "Second paragraph..."
+  ]
+}
+```
+
+Use `needs_review` when unsure. A clean `needs_review` with evidence is better than a false `done`.
+
+Validation reports must not introduce alternate status vocabularies. Use only:
+
+```json
+{
+  "validated_status": "done"
+}
+```
+
+or:
+
+```json
+{
+  "validated_status": "needs_review"
+}
+```
+
+## Common Pitfalls
+
+1. **Letting Python become a parser.** If a decision requires reading judgment, use an agent.
+2. **Overloading one subagent.** One extraction target per subagent. Batch according to `delegation.max_concurrent_children`.
+3. **Under-specifying context.** Child agents start fresh. Give exact source path, target title, expected output path, and exclusion rules.
+4. **Trusting labels alone.** Short extracts, duplicate titles, missing source references, or weak boundary explanations still need review.
+5. **Discarding logs too early.** Keep `ingestion_log` and run artifacts until the corpus is spot-checked.
+
+## Verification Checklist
+
+- [ ] `corpus/<author>.db` exists
+- [ ] `stories`, `paragraphs`, `paragraphs_fts`, `sentences`, `sentences_fts`, and `ingestion_log` exist
+- [ ] every intended story is `done` or intentionally `needs_review`
+- [ ] status counts come from `ingestion_log`, not from `stories`
+- [ ] unusually low `word_count` values are reviewed against the source and expected work type
+- [ ] FTS5 rebuild completed
+- [ ] each accepted paragraph has sentence rows
+- [ ] report output matches expected corpus size
+- [ ] at least 3 story samples were compared against source text
+
+## Phase 2 Evidence Hygiene
+
+When deriving author contracts from an approved corpus, every card must keep evidence structured and local to the Phase 1 corpus.
+
+Required shape for card-level `evidence_refs`:
+
+```yaml
+evidence_refs:
+  - id: "ev-theme-world-rules-001"
+    source_work: "author/story-id"
+    source_location: "paragraph 12"
+    observed_behavior: "What the passage does textually/functionally."
+    supports_specific_claim: "The exact card claim this evidence supports."
+    relevant_function: "The function this evidence demonstrates."
+    not_a_license_for: "What this evidence must not authorize."
+```
+
+Rules:
+
+- Do not use string-only `evidence_refs`.
+- Do not cite works outside `corpus/<author>.db` as evidence for a run.
+- `source_work` must be a `story_id` in the DB, or a clearly named mechanical artifact such as `working/raw_style_profile.json`.
+- Do not write `source_work: unknown` or `source_location: unspecified`.
+- `observed_behavior` must describe observed textual function; it must not merely repeat `story_id#paragraph`.
+- If card evidence is repaired, regenerate both `evidence.notes.yaml` and `working/evidence.candidates.yaml`; do not leave stale candidate evidence.
+- If these conditions fail, `absorption.report.yaml` must set `ready_for_phase3: false`.
+
+## Phase 2: Author Pack Construction
+
+Use `references/prompts/run_phase2_author_pack.md` to build `author-models/<author>/` from the approved corpus. Run one card agent per required card whenever runtime concurrency permits.
+
+Required outputs:
+
+```text
+author-models/<author>/
+  theme.contract.yaml
+  style.contract.yaml
+  evidence.notes.yaml
+  absorption.report.yaml
+```
+
+Rules:
+
+- Every card must include use, non-use, rewrite moves, prohibited moves, examples, failure signs, repair moves, and evidence refs.
+- `evidence_refs` must be structured objects tied to `corpus/<author>.db`.
+- Evidence must include `relevant_function` and `not_a_license_for`.
+- Claims without evidence may be hypotheses, but must not become generation rules.
+
+## Phase 3: Artifact Validation & Calibration
+
+Use `references/prompts/run_phase3_validation.md` to validate the author pack before writing.
+
+Required validated outputs:
+
+```text
+author-models/<author>/validated/
+  theme.contract.yaml
+  style.contract.yaml
+  evidence.notes.yaml
+  instruction.pairs.yaml
+  phase3.release.yaml
+```
+
+Fase 4 is blocked unless `phase3.release.yaml` has:
+
+```yaml
+generation_allowed_for_phase_4: true
+```
+
+Phase 3 does not validate pre-extracted sentence patterns. Sentence anchoring is
+performed in Phase 4 from real corpus sentences, after a concrete
+`sentence_meaning_plan` exists.
+
+## Phase 4: Writing Runtime
+
+Use `references/prompts/run_phase4_writing_runtime.md`. The production method is
+**sentence-by-sentence literal source anchoring**. The old
+`sentence_patterns`/`structural_pattern_anchor` idea is not a production mode,
+not a retrieval layer, and not valid release evidence.
+
+Length is part of form, not an afterthought. A run that chooses a corpus-like
+paragraph count but writes paragraphs at flash-fiction density is failed. The
+length advisor must compute story word-count percentiles and paragraph
+word-density percentiles, then write explicit release floors into
+`length.selection.yaml`. For a standard run, use at least corpus p25 story words
+as `min_total_words` unless the user explicitly requests shorter output.
+
+Canonical sentence flow:
+
+```text
+paragraph_reader_contract
+→ paragraph_assertions
+→ sentence_meaning_plan with semantic payload, no final prose
+→ sentence_anchor.matching.yaml with pre-writing formal requirements and candidates
+→ literal source_sentence_anchor selection from `sentences`
+→ source_to_target_alignment_plan
+→ target sentence generation
+→ blind_anchor_adversarial_audit
+→ sentence_anchor_final_repair_pass
+→ paragraph audit
+→ paragraph release
+→ story assembly and story audit
+→ Phase 4.5 final text repair gate
+→ final release
+```
+
+Every final sentence must be a necessary imitation of one selected source sentence's formal machine, with different semantic content. The selected source sentence controls architecture, order of operations, coordination/subordination, contrast, negation, enumeration, delay, closure, and relation between sentence parts. The target content comes only from the blueprint, paragraph plan, neutral paragraph, continuity bible, and user constraints.
+
+Do not use these as production modes:
+
+- `surface_transposition_baseline`: word-swapping a source sentence; allowed only as quarantined experiment.
+- generic `structural_pattern_anchor` or `sentence_patterns`: invalid in production.
+
+### Phase 4 Required Artifacts
+
+For each paragraph:
+
+```text
+paragraph.request.yaml
+neutral.paragraph.yaml
+sentence.plan.yaml
+anchor.cycle.summary.yaml
+sentence_anchor.matching.yaml
+source_sentence_anchor.selection.yaml
+paragraph.rewrite.plan.yaml
+candidate.output.yaml
+blind_anchor_adversarial_audit.yaml
+anchor.cycle.summary.yaml
+sentence_anchor.final_audit.yaml
+sentence_anchor.repair.plan.yaml, if needed
+repaired.candidate.output.yaml, if needed
+final.anchor.lock.yaml
+audit.report.yaml
+repair.plan.yaml, if needed
+final.paragraph.yaml
+paragraph.release.yaml
+```
+
+These files are not just a checklist. They must be written in order. A
+paragraph is invalid if `candidate.output.yaml` or `final.paragraph.yaml` is
+created before `sentence_anchor.matching.yaml`,
+`source_sentence_anchor.selection.yaml`, the blind audit, the final anchor
+audit, and `final.anchor.lock.yaml` have done their work. Never create a
+cycle summary that says the cycle passed before matching, selection, candidate,
+and blind audit exist. Never create a
+placeholder `audit.report.yaml` with `overall_status: passed` and
+`findings: []`; a passed paragraph audit must contain concrete checks for
+semantic preservation, continuity, theme, style, symbolic policy,
+anti-pastiche, slop, Phase 4 flags, and sentence-plan execution.
+
+`sentence.plan.yaml` must be operational, not a short label. For each sentence
+include:
+
+```yaml
+sentence_id: ""
+semantic_payload: ""
+must_say:
+  - ""
+must_not_say:
+  - ""
+required_narrative_action: ""
+```
+
+`must_say` names the concrete semantic obligations the target sentence must
+carry. `must_not_say` blocks premature revelations, wrong agents, copied source
+cargo, and source-language calques before anchor selection.
+
+`neutral.paragraph.yaml` must be genuine neutral prose. It is invalid to wrap
+the final prose in labels such as `Neutral p003 sentence 2:` or other metadata just
+to make `candidate.output.yaml` differ mechanically from the neutral draft. If
+stripping those labels makes the neutral text equal to the candidate/final
+paragraph, regenerate the neutral draft.
+
+At story level:
+
+```text
+story.assembly.yaml
+story.audit.report.yaml
+final.output.yaml
+final.text.repair.report.yaml
+final.text.repair.plan.yaml, if repair is needed
+final.repaired.output.yaml, if repair is needed
+final.repair.audit.yaml
+final.release.yaml
+run.decision.log.yaml
+```
+
+`run.decision.log.yaml` is mandatory. It must explicitly record which tools or
+scripts wrote artifacts and must state that no Python/shell/generated script
+wrote final prose, source-anchor decisions, matching reasons, semantic
+exclusions, or literary audit judgments. It must also state that no mechanical
+tool processed, counted, or compared unreleased final/candidate prose, and that
+no parent/driver preselected source anchors or passed selected/recommended
+source anchors to a delegated writer before `sentence.plan.yaml` existed.
+
+`final.output.yaml` must include both `final_text` and paragraph refs. Keeping a legacy `text` alias is allowed, but `final_text` is required for downstream tooling.
+
+### Source Sentence Anchor Selection
+
+`source_sentence_anchor.selection.yaml` must preserve
+`source_sentence_anchor_selection`: target `sentence_id`, semantic payload ref,
+`selected_source_sentence_ref` with `story_id`/`sentence_id`/positions/hash,
+literal `selected_source_sentence_text`, rejected candidate source sentences,
+part-by-part alignment plan, and semantic content that must not be copied.
+
+Before selecting the final anchor, write `sentence_anchor.matching.yaml`. This
+artifact is the anti-retrojustification gate: it describes what the planned
+target sentence needs before final prose exists, searches several real source
+sentences, rejects incompatible forms, and selects only a strong or acceptable
+formal match. `acceptable_form_match` means the selected source preserves most
+governing sentence machinery and declares narrow differences; it never means
+"same vibe", "same broad operation", or "can be explained after the fact".
+
+If the agent already has a target sentence in mind, stop and return to the
+meaning plan. Target prose comes after matching and source selection. The
+required effort is to fit planned meaning into a selected source sentence, not
+to write a sentence and search for a defense.
+
+Do not preselect or recommend source sentence anchors outside the paragraph
+artifact sequence. Before `sentence.plan.yaml` exists on disk for a paragraph,
+an agent may inspect corpus availability or broad corpus statistics, but it may
+not choose source sentence ids for that paragraph. If using `delegate_task`, do
+not pass selected or "recommended" source anchors in the delegated context. The
+worker must write `sentence.plan.yaml`, then perform matching and selection
+inside the paragraph run directory, preserving the file order. Parent-provided
+anchor ids, prefiltered selected-anchor lists, or "use these anchors" context
+make the run unreleasable, even if target prose is written later.
+
+For each target sentence, matching must record:
+
+- required target form: mood, clause sequence, coordination/subordination,
+  expected turn logic, enumeration/contrast/negation needs, and punctuation
+  function if any;
+- required concrete action form: narrative action type, entity/action roles,
+  and discourse function. This is where the plan says whether the sentence is
+  an inventory, a physical movement, an evidentiary record, a hypothesis
+  failure, an observation, a warning, etc.;
+- incompatible source forms, such as question vs declaration, list vs event,
+  event vs inventory, temporal turn vs administrative assignment;
+- several candidate source sentences with explicit `form_match_status` values:
+  `strong_form_match`, `acceptable_form_match`, `weak_form_match`, or
+  `failed_form_match`;
+- a selected source with `strong_form_match` or `acceptable_form_match` before
+  any target sentence is written.
+
+Block when a source is selected first and justified later. Block when the
+selected source is a question but the target is a declaration, a bodily event
+but the target is an inventory, or any similar mood/turn/category mismatch,
+unless the artifact explicitly proves the same governing machinery survives.
+Also block loose action analogy: expedition logistics cannot anchor
+ecclesiastical routine merely because both involve movement, and a source about
+illness, hospitality, or social reaction cannot anchor a clerical evidentiary
+statement merely because both can mention a named person. The selected source
+must share the target's concrete narrative action type and comparable
+entity/action roles, recorded as `narrative_action_match: exact | close` and
+`entity_action_role_match: exact | close`.
+
+The alignment agent, writer, and independent auditor may read the source sentence
+text. The writer must imitate the actual sentence architecture while replacing
+the semantic payload. Block if the alignment is generic enough that many
+unrelated source sentences could replace the chosen one.
+
+The selector must not walk sequentially through a source work and assign the
+next available sentence. For each target sentence, retrieve several candidate
+source sentences, record rejected candidates, and explain why the selected
+source is necessary for that sentence's semantic payload. A source story
+over-concentration or long sequential run is a release blocker unless the user
+explicitly requested imitation of one specific source work.
+
+Generic source parts are invalid. Do not write `source_words_or_span: "opening
+syntax"`, `source_words_or_span: "clause skeleton"`, or `formal_job:
+"qualification"`. Cite literal spans from the source sentence and name their
+local job, for example: `source_words_or_span: "As I began my request"`,
+`formal_job: "temporal subordinate opener that precedes a visible reaction"`.
+Every literal span must also declare `semantic_cargo_to_exclude` with
+target-language forbidden calques. The target may inherit the span's syntactic
+or rhetorical pressure, but not its semantic cargo. If "enfeebled by a previous
+war" becomes "enfraquecidos por água", the anchor failed even if the clause
+shape looks right.
+
+Do not let generic GPT rhetoric pass as source fidelity. A surface formula such
+as `not with X, but with Y` is blocked unless the chosen source sentence has an
+equivalent contrastive/corrective operation and the alignment cites that
+operation explicitly.
+
+Do not let GPT add semicolons as generic literary seasoning. A target sentence
+may use `;` only when the selected source sentence also uses `;`, and it may not
+use more semicolons than the source. This is not a style ban; it is a source
+fidelity rule.
+
+### Sentence Anchor Final Repair Pass
+
+Before paragraph release, run
+`references/prompts/run_phase4_sentence_anchor_repair_pass.md`. This pass audits every
+target/source sentence pair by concrete sentence machinery, not by punctuation,
+sentence length, or broad operation labels. It must write
+`sentence_anchor.final_audit.yaml` and `final.anchor.lock.yaml` for every
+paragraph.
+
+Only `strong_anchor` and `acceptable_anchor` may appear in
+`final.anchor.lock.yaml`. If a sentence is `weak_anchor` or `failed_anchor`, the
+runtime must find a better real source sentence and rewrite only that sentence,
+preserving the semantic payload. When repair happens, write
+`sentence_anchor.repair.plan.yaml` and `repaired.candidate.output.yaml`.
+
+The pass must block shallow matches where the justification is only same length,
+same punctuation, same semicolon, or generic "opening / qualification /
+implication". The source and target need the same local rhetorical operation:
+the operation should be named from the selected source sentence itself, such as
+causal qualification, contrastive correction, evidentiary inventory, sensory
+observation, inference from material detail, temporal reversal, definition by
+negation, or closing constraint. Do not reuse any operation label as a default
+for all authors or all paragraphs.
+
+Operation labels are never sufficient. The final audit must separately check
+source/target mood, clause order, coordination/subordination, governing turn
+logic, punctuation function, and category fit. A target can pass with small
+differences only when those differences are listed as acceptable in
+`sentence_anchor.matching.yaml` before generation.
+The final audit and lock must also preserve `narrative_action_match`,
+`entity_action_role_match`, and `why_action_match_is_not_loose_analogy`. `loose`
+or `mismatch` blocks release; a boilerplate explanation blocks release.
+
+### Phase 4.5 Final Text Repair Gate
+
+After `story.audit.report.yaml` and `final.output.yaml`, but before
+`final.release.yaml`, run `references/prompts/run_phase45_final_text_repair.md`.
+
+This gate is not a beauty pass. It may only repair concrete local findings:
+
+- duplicated phrase or accidental patch artifact;
+- unclear agent, antecedent, pronoun, predicate, or transition;
+- false-positive repair, such as removing a legitimate negative imperative
+  because it was mistaken for the blocked `not X but Y` template;
+- residual generic GPT rhetoric not licensed by the selected source sentence;
+- weak anchor fit visible only after story assembly;
+- continuity glitch introduced during assembly.
+
+Every repair must say whether it preserves the current source sentence anchor or
+requires explicit re-anchoring. If it re-anchors, update the relevant paragraph
+artifact, sentence mapping, final anchor lock, and final output.
+
+Allowed:
+
+```text
+repair one sentence
+restore a previous valid sentence
+remove accidental duplication
+clarify antecedent without changing facts
+replace source anchor and regenerate only that sentence
+```
+
+Forbidden:
+
+```text
+rewrite the whole story
+improve style without a concrete finding
+change blueprint, causal chain, characters, ending, or symbols
+create a new generic ban from one false positive
+remove legitimate constructions just because they contain a surface token
+```
+
+Required story-level files:
+
+```text
+final.text.repair.report.yaml
+final.text.repair.plan.yaml, if any repair is required
+final.repaired.output.yaml, if any repair is applied
+final.repair.audit.yaml
+```
+
+`final.release.yaml` must include:
+
+```yaml
+approved_output_ref: "final.output.yaml | final.repaired.output.yaml"
+final_text_repair_status: "clean | repaired"
+final_repair_audit_ref: "final.repair.audit.yaml"
+```
+
+Forbidden legacy fields:
+
+```text
+sentence.pattern.selection.yaml
+sentence_pattern_selection
+source_sentence_pattern_id
+selected_source_sentence_pattern_id
+pattern_structural_match
+why_this_pattern_is_necessary
+clause_skeleton
+structural_signature_used
+```
+
+Any occurrence of these fields in Phase 4 artifacts blocks release.
+
+### Candidate Output Contract
+
+Required per output sentence in `candidate.output.yaml`: `sentence_id`,
+`output_sentence`, `source_semantic_units`, `source_sentence_ref`,
+`source_sentence_text_hash`, `source_to_target_alignment_ref`,
+`source_sentence_fidelity`, and `target_semantic_independence`.
+
+Audit must block release if:
+
+- any output sentence lacks `source_sentence_ref`;
+- any Phase 4 artifact contains a forbidden legacy pattern field;
+- `sentence_anchor.final_audit.yaml` or `final.anchor.lock.yaml` is missing;
+- any locked final sentence is still `weak_anchor` or `failed_anchor`;
+- `repair_required: true` but no `sentence_anchor.repair.plan.yaml` and `repaired.candidate.output.yaml` exist;
+- source anchors are assigned sequentially or overwhelmingly from one source story without local necessity;
+- `source_sentence_fidelity`, `target_semantic_independence`, or source-selection reasons are boilerplate repeated across many sentences;
+- source sentence selection happened after target sentence generation;
+- the selected source sentence is not necessary for that sentence's local function;
+- the selected source shares only broad analogy rather than concrete narrative
+  action type and comparable entity/action roles;
+- the candidate copies source-sentence content, imagery, conclusion, objects, entities, scene, or memorable phrasing;
+- the candidate copies semantic cargo from a source part used as formal machinery;
+- the candidate fails to match the selected source sentence's formal machine;
+- the candidate uses a generic rhetorical template not licensed by the selected source sentence;
+- punctuation is used as a shallow proxy for fidelity;
+- `candidate_text == neutral_text`;
+- `declared_transformations` is absent;
+- a sentence has category error, unclear agent, unresolved pronoun, broken predicate fit, or copied discourse marker without narrative need.
+
+### Mechanical Validation
+
+After a Phase 4 run, Hermes must execute:
+
+```bash
+python3 ${HERMES_SKILL_DIR}/scripts/validate_phase4_run.py \
+  --run-dir runs/<author>/<run_id> \
+  --paragraph-count <N> \
+  --min-total-words <floor_from_length_selection> \
+  --min-median-paragraph-words <floor_from_length_selection> \
+  --report runs/<author>/<run_id>/mechanical.validation.yaml
+```
+
+This script cannot approve literary quality. It only catches structural release errors. If it fails, Hermes must repair the artifacts before presenting final text.

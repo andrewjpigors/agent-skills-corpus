@@ -1,0 +1,22 @@
+# Never redistributed (no clear license): full text of no-license skills
+full_text_local_only/
+
+# Full local corpus that inlines ALL text (incl. no-license) + pre-dedup dump
+data/metadata.jsonl
+data/metadata_included_predupe.jsonl
+
+# Large / regenerable intermediate API pull
+raw/
+
+# ~103 MiB uncompressed (> GitHub's 100 MiB limit); the tracked table is the .gz
+data/metadata.public.jsonl
+data/metadata.public.jsonl.tmp
+
+# full_text/ (clear-license text, by category) and data/by_category/ ARE committed.
+
+# misc
+*.pyc
+__pycache__/
+scripts/__pycache__/
+.DS_Store
+logs/

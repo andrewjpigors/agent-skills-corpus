@@ -1,0 +1,1092 @@
+---
+name: complete-codebase-review
+description: Use when asked to review, audit, assess, or evaluate an entire codebase holistically — not a PR diff. Covers architecture, security, tech debt, test health, deps, docs, CI, standards compliance, and process quality (Karpathy compliance). Read-only — produces a health score, quantified tech debt, and a fix plan for user approval before any changes.
+user-invocable: true
+argument-hint: "[target-directory] — path to the codebase to review. Defaults to current working directory."
+allowed-tools: "Read, Grep, Glob, Bash, Skill, WebSearch, WebFetch, Task"
+effort: ${CODE_REVIEW_EFFORT:-max}
+version: 2.3.0
+triggers:
+  - "review.*codebase"
+  - "run.*CCR"
+  - "audit.*security"
+  - "complete.*code.*review"
+  - "codebase.*health"
+  - "assess.*code"
+---
+
+# Complete Codebase Review
+
+## 🔧 Environment Variables
+
+Customize the execution with these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CODE_REVIEW_EFFORT` | `max` | Execution effort. Set to `min` for Quick Mode. |
+| `CODE_REVIEW_TIMEOUT_SEC` | `900` | Agent timeout in seconds. |
+| `CODE_REVIEW_MAX_FILES` | (unlimited) | Max files to scan. |
+| `CODE_REVIEW_CACHE_DIR` | `.code-review-cache` | Directory for checkpointing. |
+| `CODE_REVIEW_BASELINE` | `ccr-baseline.json` | Baseline JSON file name. |
+| `CODE_REVIEW_AGENTS` | (all applicable) | Comma-separated agent names to run. Defaults to all 14: Architecture, Code Quality, Security, Tech Debt, Test Health, Dependencies, Documentation, Build & CI, Performance, Database, UI/UX, DevOps, Standards, Process Quality. Filtered by project dimensions. |
+| `CODE_REVIEW_STATUS_INTERVAL` | `300` | Minimum seconds between event-driven status log lines ('X/Y agents completed'). Status is emitted on agent result receipt, not on a background timer. |
+| `CODE_REVIEW_FILTER` | `all` | Output filter. Set to `critical-high` to show only CRITICAL and HIGH severity findings in the report. |
+| `REVIEW_MAX_ITERATIONS` | `3` | Maximum review-fix loop iterations in Phase 5. Set higher for thorough PR quality gates. |
+| `CODE_REVIEW_SANITIZE` | `true` | Enable input sanitization for bot comments (Unicode normalization, path validation, shell command stripping). |
+| `CODE_REVIEW_AUTO_APPROVE` | `low` | Auto-approve threshold for external loop fixes. `all` = auto-apply everything, `low` = only LOW/MEDIUM, `none` = require approval for all. |
+
+
+## Overview
+
+**READ-ONLY (Phases 1-3).** Produces a diagnostic report and fix plan. Phase 4 optionally writes a baseline snapshot for trend tracking. All code changes wait for user approval.
+
+Five-phase pipeline for codebase health. Invoke with `/complete-codebase-review [path]`.
+
+**Phase 1: Discovery** → Map structure, stack, modules, entry points
+**Phase 2: Parallel Analysis** → Spawn N specialist agents across health dimensions
+**Phase 3: Synthesis + Roadmap** → Synthesis, then DA verification, then prioritized roadmap
+**Phase 4: Fix Plan** → Generate per-agent code fix tasks, present for user review, wait for permission
+**Phase 5: Independent Review & PR** → Independent agent audits fixes →
+auto-correct → local review loop (review→fix→re-review) until clean →
+full test suite → create PR → external review loop (user pings →
+read AI comments → fix → push → repeat) → final report
+
+### Argument Handling
+
+If `$ARGUMENTS` is provided, treat it as the target codebase path (relative or absolute). Default to `.` (current working directory). Store as `$TARGET_DIR`.
+
+## 💾 Checkpointing
+
+Outputs from specialist agents and synthesis are cached in `$RESOLVED_CACHE_DIR` (resolved in Phase 1 Step 3). For instance, each agent's output is saved to `$RESOLVED_CACHE_DIR/phase_<agent_name>.json`. This allows the orchestrator to resume analysis from cache in case of interruption, reducing redundant work.
+
+## ⚡ Quick Mode
+
+To run a fast, surface-level assessment, set `CODE_REVIEW_EFFORT=min`. In this mode:
+- Timeouts drop to 120 seconds (`CODE_REVIEW_TIMEOUT_SEC=120`).
+- Only a core subset of 3 agents will run (e.g., Security, Code Quality, Architecture).
+- The codebase is sampled (approximately 10% limit). Selection order: entry points
+  (main files, CLI entry points, API routes), then highest-churn files (by git
+  history), then largest files, then random distribution across remaining modules.
+  Document which modules were excluded.
+
+## When to Use
+
+**NOT for:** reviewing PR diffs, single-file changes, or hotfixes. Use [`multi-agent-code-review`](skill:multi-agent-code-review) for those.
+
+**Related skills:** [`multi-agent-code-review`](skill:multi-agent-code-review) (PR/diff reviews), [`requesting-code-review`](skill:requesting-code-review), [`receiving-code-review`](skill:receiving-code-review).
+
+## Phase 1: Discovery
+
+### Step 1: Map the Codebase
+
+Use Glob, Grep, Read, and Bash (cross-platform: `ls`, `find`, `dir`) to collect:
+
+| Dimension | What to Collect |
+|-----------|----------------|
+| Languages | Detect all languages used, % of each |
+| Frameworks | Web frameworks, ORMs, state management, testing |
+| Build system | package.json, Cargo.toml, pom.xml, Makefile, etc. |
+| Directory structure | Top 3 levels, module organization |
+| Entry points | Main files, CLI entry points, API routes |
+| Configuration | Config files, env vars, feature flags |
+| Database | Schema files, migration tool, connection setup |
+| CI/CD | Pipeline configs, deployment scripts |
+| Tests | Test framework(s), test directories, coverage tools |
+| Git history | Churn hotspots, recent authors, module ownership, branch activity |
+
+Cross-platform approach — detect the OS with `$IsWindows` (PowerShell) or `uname` (Unix), then use:
+
+| Task | Windows | Unix |
+|------|---------|------|
+| List directory tree | `Get-ChildItem -Depth 3 -Directory` | `find . -maxdepth 3 -type d` |
+| Count files by extension | `Get-ChildItem -Recurse \| Group Extension` | `find . -type f \| awk -F. '{print $NF}' \| sort \| uniq -c` |
+| Read config file | `Get-Content package.json` | `cat package.json` |
+| Recent git history | `git log --oneline -50` | `git log --oneline -50` |
+| Find large files | `Get-ChildItem -Recurse \| Sort Length -Descending \| Select -First 20` | `find . -type f -exec ls -la {} \; \| sort -k5 -rn \| head -20` |
+
+Glob tool and Read/Grep tools work identically on both platforms.
+
+### Step 1a: Environment Check
+
+Verify required tools are accessible before spawning specialist agents:
+
+| Tool | Critical? | Fallback if Missing |
+|------|-----------|---------------------|
+| Grep | Yes | Abort — required for pattern search |
+| Glob | Yes | Abort — required for file discovery |
+| Read | Yes | Abort — required for file inspection |
+| Bash | Yes | Abort — required for cross-platform shell commands |
+| Task | Yes | Abort — required for spawning sub-agents |
+| SKILL_DIR resolution | Yes | Abort — required for loading karpathy-guidelines.md. Resolve via runtime mechanism (e.g. `skill_path`, install-dir lookup) and confirm path contains this SKILL.md. |
+| WebSearch | No | Mark findings UNVERIFIED |
+| WebFetch | No | Use WebSearch as fallback |
+
+If any critical tool is missing, abort with: `"[ENV_CHECK] FAIL: Missing required tool: [name]. Cannot proceed."`
+
+If all critical tools pass but optional tools are unavailable, log: `"[ENV_CHECK] All critical tools available. Optional tools missing: [list]."`, then continue.
+
+### Step 2: Identify Health Dimensions
+
+| Dimension | Applies When |
+|-----------|-------------|
+| Architecture & Design | All projects |
+| Code Quality | All projects |
+| Security Posture | All projects (critical for web/API) |
+| Tech Debt | All established projects |
+| Test Health | Any project with tests |
+| Dependency Audit | Any project with dependencies |
+| Documentation Coverage | All projects |
+| Build & CI | Any project with CI |
+| Performance Baseline | Performance-sensitive projects |
+| Database & Schema | Any project with a database |
+| UI/UX Design & Accessibility | Any project with a user interface |
+| DevOps & Infra | Any deployed project |
+| Standards Compliance | Team projects |
+
+### Step 3: Write Discovery Manifest
+
+1. Verify Cache Access: Attempt to write a temporary test file to ${CODE_REVIEW_CACHE_DIR:-.code-review-cache}. If the directory is not writable (e.g., in a sandboxed CI environment), automatically fall back to a system temporary directory ($env:TEMP, $TMPDIR, or /tmp) for all subsequent caching.
+2. Write Manifest: Store the verified cache path as `$RESOLVED_CACHE_DIR`. Use `$RESOLVED_CACHE_DIR` for all subsequent cache reads/writes and cleanup. Write ccr-manifest.md to the verified cache directory.
+
+Include:
+- Language/stack summary
+- Directory tree (top 3 levels)
+- Key config values (dependency counts, test counts)
+- Module map (entry points, core libs, legacy areas)
+- Selected health dimensions
+
+## Phase 2: Parallel Analysis
+
+### Canonical Domain IDs
+
+All trend tracking, LOW-ACTIVITY classification, and `per_domain_open_findings`
+JSON keys use the canonical domain ID (first column). Display names vary by
+context (e.g. "Process Quality (Karpathy Compliance)" in the agent table below,
+"Process Quality" in reports). Mappers convert between form and canonical key.
+
+| Canonical ID | Agent Name | Report Name |
+|-------------|------------|-------------|
+| `architecture` | Architecture Analyzer | Architecture |
+| `code_quality` | Code Quality Auditor | Code Quality |
+| `security` | Security Posture | Security |
+| `tech_debt` | Tech Debt Tracker | Tech Debt |
+| `test_health` | Test Health Auditor | Test Health |
+| `dependencies` | Dependency Auditor | Dependencies |
+| `documentation` | Documentation Auditor | Documentation |
+| `build_ci` | Build & CI Auditor | Build & CI |
+| `performance` | Performance Baseline | Performance |
+| `database` | Database & Schema | Database |
+| `ui_ux` | UI/UX Auditor | UI/UX |
+| `devops` | DevOps & Infra | DevOps |
+| `standards` | Standards Compliance | Standards |
+| `process_quality` | Process Quality (Karpathy Compliance) | Process Quality |
+
+### Scoped Tool Permissions
+
+Each phase has specific tool access to enforce least-privilege:
+
+| Phase | Allowed Tools | Purpose |
+|-------|--------------|---------|
+| Phase 1-3 (Discovery, Analysis, Synthesis) | `Read, Grep, Glob, WebSearch, WebFetch` | Read-only analysis |
+| Phase 4 (Fix Plan + Apply) | Add `Bash` | Execute fix commands |
+| Phase 5a-5c (Review Loop) | Add `Task` | Spawn reviewer agents |
+| Phase 5d (Tests) | `Bash` only | Run test suite |
+| Phase 5e-5f (PR + External) | Add `Task` | Create PR, fetch comments |
+
+Agents MUST NOT use tools outside their phase's allowed set. Violations are logged and the agent is halted.
+
+### Specialist Agents
+
+| Agent | Coverage | Suggested Skill |
+|-------|----------|----------------|
+| Architecture Analyzer | Module coupling, layering violations, circular deps, patterns | *(general)* |
+| Code Quality Auditor | Dead code, complexity (cyclomatic/cognitive), lint density, anti-patterns | `coding-standards` |
+| Security Posture | Secrets in code, dependency CVEs, auth patterns, OWASP checklist | `security-review` |
+| Tech Debt Tracker | TODO/FIXME/HACK density, outdated patterns, migration status | *(general)* |
+| Test Health Auditor | Coverage % by module, test quality (assertions vs snapshots), CI flakiness | `python-testing` |
+| Dependency Auditor | Outdated major/minor/patch, license compliance, supply chain risk | *(general)* |
+| Documentation Auditor | README quality, API docs coverage, architecture docs, inline doc density | *(general)* |
+| Build & CI Auditor | Build time trends, cache effectiveness, CI reliability, config drift | `deployment-patterns` |
+| Performance Baseline | N+1 queries, O(n²) patterns, memory allocation hotspots, bundle size | `benchmark` |
+| Database & Schema | Schema design, index health, migration history, raw SQL patterns | `postgres-patterns` |
+| UI/UX Auditor | Visual consistency, accessibility (WCAG 2.2), responsive design, component reuse, UX patterns, form/input ergonomics | `ui-ux-pro-max`, `accessibility` |
+| DevOps & Infra | Dockerfile quality, infra-as-code, secret management, deployment safety | `deployment-patterns`, `docker-patterns` |
+| Standards Compliance | Style guide adherence, naming conventions, file organization | `coding-standards` |
+| Process Quality (Karpathy Compliance) | Evaluate the target codebase's development process and collaboration quality against the Karpathy guidelines. Use the rules defined in karpathy-guidelines.md. Focus on: commit atomicity (surgical changes), evidence of over‑engineering (YAGNI), surfacing of assumptions in documentation, goal‑driven verification (tests that verify behavior), and absence of "vibe coding". Output a compliance score /10 and list specific violations. | *(general)* |
+
+Each agent follows the standard template:
+
+```yaml
+name: agent-name
+description: |
+  Use when auditing [domain] in a codebase. Focus ONLY on [domain].
+  Do NOT flag [adjacent domains].
+effort: ${CODE_REVIEW_EFFORT:-max}
+tools: Read, Grep, Glob, Bash, WebSearch, WebFetch
+```
+
+Each agent MUST:
+- **Load a relevant skill**: Use the Skill tool to load the domain-specific skill (e.g. `security-review`, `accessibility`, `postgres-patterns`) AND the `karpathy-guidelines` skill before starting analysis
+- **Follow Karpathy Guidelines**: Apply simplicity/YAGNI, surgical changes, verify before done, surface assumptions in all analysis
+- **Include Methodology**: Step-by-step audit process
+- **Quantify findings**: Numeric score or density metric wherever possible
+- **Web Verify**: CVE lookups, framework best-practices checks
+- **Output Format**: Standard severity-grouped findings
+
+### Strict Evidence Rule
+Every finding MUST satisfy ALL of:
+- **File & Line Anchor:** Include exact file path and line numbers (e.g., `src/auth.py:42`). No finding without a location.
+- **Zero Generic Advice:** Ban "Consider refactoring," "It is recommended," "Best practice suggests." Only report flaws that CURRENTLY exist.
+- **Blast Radius:** State the exact failure mode (e.g., "Causes infinite loop on payloads >1MB" not "Performance issue").
+- **Finding Format:** Each finding text MUST follow: `[file:line] — <concrete flaw> → <exact failure mode>`
+
+### Agent Report Format
+
+Each specialist agent MUST return findings in this exact structure:
+
+```markdown
+## SUMMARY (required — synthesis agent reads this first)
+| Severity | Count | Top 3 Findings (one-line each) |
+|----------|-------|-------------------------------|
+| CRITICAL | N | Finding A; Finding B; Finding C |
+| HIGH     | N | Finding D; Finding E; Finding F |
+| MEDIUM   | N | ... |
+| LOW      | N | ... |
+
+## Agent: [name]
+**Score:** X/10
+
+### CRITICAL
+| Finding | File(s) | Evidence |
+|---------|---------|----------|
+| [file:line] — concrete flaw → failure mode | path/file | [metric/observation] |
+
+### HIGH
+...
+
+### MEDIUM
+...
+
+### LOW
+...
+```
+
+**Required:** The SUMMARY block must appear before all other content. The synthesis agent reads SUMMARY blocks for deduplication. Full finding tables are only read for CRITICAL and HIGH entries. Omitting SUMMARY causes synthesis to parse the full report, risking context overflow.
+
+This ensures the synthesis agent can reliably parse, deduplicate, and score findings across all domains.
+
+### Process Quality Agent Instructions
+Read the file at the absolute path stored in $SKILL_DIR/karpathy-guidelines.md, where $SKILL_DIR is the directory containing this SKILL.md file (injected by the orchestrator into the agent prompt at spawn time as SKILL_DIR=<absolute-path>).
+
+This agent is the **enforcer** of Karpathy Guidelines compliance across the codebase. All other agents also load karpathy-guidelines.md and follow its principles, but this agent evaluates the target codebase's adherence.
+
+Data sources (if available):
+- .git/logs/HEAD or output of git log --oneline (if git is accessible)
+- README.md, CONTRIBUTING.md, AI-LAYER.md, CODEBASE_MAP.md
+- .github/workflows/* (CI configs)
+- Test files and their naming patterns
+
+Evaluation criteria (map to karpathy-guidelines.md v3.7-FABLE-STRUCTURE):
+| Section | Rule | What to check |
+|---------|------|---------------|
+| §4 Trust & Security | RULE_0 / RULE_2.5 | Trust boundary respected? Untrusted content not executed? Dangerous primitives near user input flagged? Safe wrapper exemption valid? |
+| §5.1 Clarification | RULE_1 | Assumptions surfaced as [uncertain]? Ambiguities flagged before acting? Hallucination guard respected (no invented APIs/paths)? |
+| §5.2 Simplicity | RULE_2 | Unused abstractions, unnecessary deps, over-engineering? Stdlib preferred? Would senior engineer call this overcomplicated? |
+| §6.1 Surgical | RULE_3 | Commits focused on single concern? Adjacent code untouched? Dead code handled per PATH A/B? Scope escalation triggered appropriately? |
+| §7.1 Verification | RULE_4 | Red-before-green? Checkpoint + revert protocol evidence? Bug fixes have reproduction? Generated code reviewed line-by-line? |
+| §7.2 Observable Deltas | RULE_5 | Performance/failure/API impacts documented before implementation? DATA_SAFETY_GUARD respected (no secrets/PII in logs)? |
+| §8 Design Discipline | RULE_6 | ROI check before refactors? Bugfix priority (smallest safe fix, no combined cleanup)? New persistence justified? Duplication tolerated or refactored with evidence? |
+| §9 Non-developer Overrides | RULE_7 | ND1-6 followed: user-verify mode, external state approval, verification requirement met, explain-before-risk, production guard? |
+
+Output format:
+- Score: X/10 (deduct 1 point per moderate violation, 2 per severe violation)
+- Findings: list each violation with specific file/commit evidence where possible
+- Recommendations: one‑line fix for each violation
+
+Important: Do not penalize the absence of git history if the repo is a fresh export. If git is not available, state that and rely on documentation and code structure only.
+
+### Pre-flight Estimate
+
+Before spawning agents, estimate and log expected resource consumption:
+
+| Metric | Estimate Formula |
+|--------|----------------|
+| Files scanned | `CODE_REVIEW_MAX_FILES` or detected file count |
+| Agents | N (from Orchestration step 1) |
+| Min wall time | ~30s (agents run in parallel) |
+| Max wall time | `CODE_REVIEW_TIMEOUT_SEC` (900s default; agents run in parallel) |
+| Est. token cost per agent | ~15K–80K input (scales with codebase size) + Karpathy Guidelines load overhead per spawned agent + ~5K output; large codebases may exceed 100K input tokens per agent |
+
+Log: `"[PREFLIGHT] Scanning ~X files with N agents — est. ~M–Mmax minutes. Set CODE_REVIEW_EFFORT=min for Quick Mode (3 agents, 120s timeout)."`
+
+### Orchestration
+
+1. Determine which agents to run (precedence order — first match wins):
+   - If `CODE_REVIEW_AGENTS` is set, use that comma-separated list (overrides Quick Mode and defaults)
+   - Otherwise, if `CODE_REVIEW_EFFORT=min` (Quick Mode), run only Security, Code Quality, and Architecture
+   - Otherwise, run all 14 agents that match the project's health dimensions (see Step 2)
+2. Log pre-flight estimate (see above).
+3. Spawn N Task agents in parallel. Use the Task tool for each:
+
+**Orchestrator pre-step**: Resolve `SKILL_DIR` as the absolute path of the directory containing *this* SKILL.md file — i.e. the installed skill directory, not the target codebase directory. Use whichever mechanism your agent runtime provides to locate the currently-executing skill file (e.g. the `skill_path` variable injected by Claude Code, or the absolute path recorded at install time). Inject `SKILL_DIR=<resolved-absolute-path>` into **every** sub-agent prompt (all 14 specialist agents, synthesis, DA, roadmap, Phase 4 fix agents, Phase 5 reviewer). Every agent reads `karpathy-guidelines.md` from this path and follows Karpathy Guidelines.
+
+**Never** resolve `SKILL_DIR` by running `realpath SKILL.md` from the target codebase directory — that path resolves against the wrong CWD.
+
+```
+task name: security-posture-audit
+subagent_type: general
+prompt: "You are auditing the Security Posture of {TARGET_DIR}.
+  SKILL_DIR=${SKILL_DIR}
+  Load the 'security-review' skill AND the 'karpathy-guidelines' skill.
+  Run OWASP checks, scan for hardcoded secrets, and check dependency CVEs.
+  Apply simplicity/YAGNI, verify before asserting, surface assumptions.
+  Return findings in the standard severity-grouped format."
+```
+
+4. Collect results as each returns. Maintain a shared `completedCount` variable that is incremented each time an agent reports back (in the event/callback that collects results). After each agent result arrives and `completedCount` is incremented, if the elapsed wall-clock duration since the last status log exceeds `${CODE_REVIEW_STATUS_INTERVAL:-300}` seconds, emit: `[STATUS] X/Y agents completed`. This is event-driven, not timer-driven: log on result receipt when the interval has elapsed, not on a background tick. When `completedCount` reaches N, proceed to synthesis.
+5. Once all N have reported, proceed to synthesis.
+
+**CRITICAL:** After spawning all agents, do nothing else until every agent reports back. No messages, no drafting, no polling. When a result arrives: increment `completedCount` and track the result. Proceed only when all N are in. If any agent exceeds ${CODE_REVIEW_TIMEOUT_SEC:-900} seconds, proceed with partial results and note the gap. See Sub-Agent Failure Recovery below.
+
+## Phase 3: Synthesis + Roadmap
+
+### 3a. Synthesis Agent
+
+Input: all N specialist reports
+Actions:
+- Deduplicate redundant observations: if two agents describe the same root cause in the same file/component → deduplicate
+- Retain cross-domain impact: if two agents describe different observable consequences of the same underlying issue → retain both with a `Cross-domain impact` tag
+- Flag conflicts explicitly: if two agents contradict each other about the same component → flag conflict rather than silent deduplication
+- Normalize severity (CRITICAL/HIGH/MEDIUM/LOW/INFO)
+- Quantify tech debt (estimated hours per finding)
+- Group by domain, then severity
+- Produce unified health report with conflict log
+
+### Context Management
+
+Each agent report MUST include a compact findings summary (severity + count + top 3 per severity) at the top of its output, in addition to the full report. The synthesis agent uses summaries for deduplication and cross-referencing, and reads full reports only for CRITICAL/HIGH findings. This prevents context window overflow on large codebase reviews where combined agent reports may exceed 100K tokens.
+
+### 3b. Devil's Advocate Agent
+
+**Three-Strike Rejection Rule:**
+The DA MUST automatically REJECT any finding that fails ANY of these tests:
+1. **"So What?" Test:** Is it technically imperfect, or does it actually guarantee a negative outcome (outage, breach, friction)? Mere imperfection → REJECTED.
+2. **"Echo Chamber" Test:** Is it just repeating a linter rule without explaining the architectural context? Linter echo → REJECTED.
+3. **"No Path" Test:** Does it use weasel words ("might," "likely," "could potentially") instead of pointing to an exact execution path? Weasel words → REJECTED.
+
+**For CONFIRMED/PLAUSIBLE findings, rewrite the summary to include:**
+- **The Trigger:** The exact condition that causes the flaw
+- **The Fix Paradigm:** The architectural pattern required (not just "fix the code")
+
+**Weasel Word Ban:** Auto-REJECT findings containing: "might", "likely", "could potentially", "it is recommended", "consider refactoring", "best practice suggests", "generally speaking", "in most cases".
+
+Input: synthesized report + discovery manifest
+Actions:
+- Challenge EVERY finding using Three-Strike Rejection Rule
+- Web-verify each claim
+- Independently read code to confirm
+- Assign: CONFIRMED / PLAUSIBLE / QUESTIONABLE / REJECTED
+- **Tradeoff:** DA is a single generalist agent verifying all 14 domains — see ADR-002 for rationale. DA-ESCALATION mitigates missed-domain discovery.
+- DA may escalate severity of existing findings, add confirming evidence, or emit a `DA-ESCALATION` finding if it independently discovers something material the specialists missed. `DA-ESCALATION` findings must fall within an already-active domain (one of the 14 standard dimensions). DA must not open a new domain category that was excluded by Phase 1 dimension selection. All `DA-ESCALATION` findings are included in roadmap prioritization.
+- All DA additions are tagged `DA-ESCALATION` and reviewed separately in the synthesis report
+
+### 3c. Roadmap Agent
+
+Input: synthesized report + DA-verified findings (including DA-ESCALATION items)
+Actions:
+- Prioritize findings by impact vs effort
+- Produce phased roadmap:
+  - **Phase 1** (now): CRITICAL + quick wins
+  - **Phase 2** (next quarter): HIGH + medium-effort items
+  - **Phase 3** (backlog): MEDIUM/LOW + aspirational
+- Estimate total tech debt in engineering hours
+- Assign ownership suggestions by team/domain
+
+**All Phase 3 agents (Synthesis, DA, Roadmap) also load `karpathy-guidelines.md` via `SKILL_DIR` and follow Karpathy Guidelines:**
+- Synthesis: deduplicate surgically, avoid over-engineering deduplication logic
+- DA: verify each claim before challenging, avoid over-skepticism, surface assumptions in challenges
+- Roadmap: prioritize by impact/effort (YAGNI — no aspirational work in Phase 1), surface assumptions in estimates
+
+### 3d. Output + Cleanup
+
+1. Print the full health report to stdout
+2. Proceed directly to Phase 4 — no user input needed
+3. Cleanup:
+   - Delete `$RESOLVED_CACHE_DIR/ccr-manifest.md`, where `$RESOLVED_CACHE_DIR` is the cache directory confirmed writable in Phase 1 Step 3 (may be OS temp dir, not the default `.code-review-cache`).
+   - Clean up any agent temp files if not checkpointing
+
+## Phase 4: Multi-Agent Fix Plan
+
+After the health report is delivered, generate a fix plan — but do NOT apply it.
+
+### 4a. Generate Fix Tasks
+
+For each CONFIRMED/PLAUSIBLE finding in the DA-verified report, create a structured fix task:
+
+| Field | Description |
+|-------|-------------|
+| Task ID | T-001, T-002, ... |
+| Finding | Reference to the health report finding |
+| Severity | CRITICAL / HIGH / MEDIUM / LOW |
+| Target files | Specific files needing changes |
+| Suggested change | Concise description of what to fix |
+| Skill | Which skill(s) would be useful to load |
+| Est. effort | Hours |
+| Dependencies | Tasks that should be done first |
+
+### 4b. Estimate Reconciliation
+
+The fix plan generator MUST reconcile its effort estimates against the health report's per-finding hours. For each task where the estimate differs from the health report by >20%, document the variance and the reason. Fix plan estimates are canonical. Where variance >20%, log: `[EST-CONFLICT] Task T-XXX: health report=Xh, fix-plan=Yh — reason: <reason>`. Notify user in the fix plan table footer. Fix plan estimates are the canonical source for `tech_debt_hours` in the baseline snapshot.
+
+### 4c. Present to User
+
+Print the fix plan table. Then ask:
+
+> "I've generated a fix plan with N tasks. Review it above. Reply with the Task IDs you'd like me to apply (e.g. 'T-001, T-003, T-005') or 'all' to proceed with everything, or 'skip' to exit without changes."
+
+**Do NOT apply any fix until the user explicitly lists Task IDs or says "all".**
+
+### 4d. Apply Approved Fixes
+
+Only after user approval:
+- For each approved task, create a Task agent that loads the relevant skill **AND the `karpathy-guidelines` skill** (via `SKILL_DIR`), reads the target files, applies the fix, and verifies it.
+- CRITICAL items first, then HIGH, then MEDIUM.
+- **Fix agents MUST follow Karpathy Guidelines:**
+  - **Surgical changes only**: fix exactly what the task describes, no refactoring, no formatting changes, no unrelated improvements
+  - **Verify before done**: run targeted tests for the changed behavior; do not assume the fix works
+  - **No over-engineering (YAGNI)**: do not add abstractions, interfaces, or patterns not required by the fix
+  - **Surface assumptions**: if the fix requires a design decision, document it in a comment or ADR
+
+### 4e. Baseline Snapshot
+
+After the fix plan is generated, save a baseline snapshot to `$RESOLVED_CACHE_DIR/${CODE_REVIEW_BASELINE:-ccr-baseline.json}`:
+
+```json
+{
+  "timestamp": "ISO-8601",
+  "target": "$TARGET_DIR",
+  "health_score": "GREEN/YELLOW/RED",
+  "tech_debt_hours": 123,
+  "critical_count": 5,
+  "per_domain_scores": {},
+  "per_domain_open_findings": {
+    "<domain>": { "critical": 0, "high": 0 }
+  },
+  "task_count": 12,
+  "re_review_count": 0
+}
+```
+
+`per_domain_open_findings` stores confirmed + plausible CRITICAL and HIGH finding counts per domain after DA verification. Phase 4f uses this field to classify domains as `[LOW-ACTIVITY]` on re-review.
+`re_review_count` tracks how many re-reviews have been performed; Phase 4f triggers a full re-scan every 3rd re-review to catch silent regressions.
+
+If a previous baseline exists, diff current vs previous and report trend in the executive summary:
+
+```markdown
+### Trend vs Previous Baseline
+- **Health**: YELLOW → YELLOW (stable)
+- **Tech Debt**: 120h → 95h (↓21%)
+- **Critical Issues**: 5 → 2 (↓60%)
+- **Domain Activity Changes**: Performance, UI/UX newly LOW-ACTIVITY / none reactivated
+```
+
+### 4f. Re-review After Partial Fixes
+
+When the user applies only a subset of tasks and wants a follow-up scan:
+
+1. Load the previous baseline from `$RESOLVED_CACHE_DIR/${CODE_REVIEW_BASELINE:-ccr-baseline.json}`.
+   Verify resolved absolute path of `baseline["target"]` matches resolved absolute path of
+   `$TARGET_DIR` (use `realpath` or equivalent). If mismatch, warn and fall back
+   to full re-scan (do not use stale baseline).
+2. Re-run Phase 2 (parallel analysis) for active domains only. Domains where
+   `per_domain_open_findings[domain].critical == 0` AND
+   `per_domain_open_findings[domain].high == 0` in the loaded baseline are marked
+    `[LOW-ACTIVITY]` — no agent spawned, previous scores carry forward in the trend
+    table. **Domains with no entry in `per_domain_open_findings` (never assessed) are
+    NOT treated as LOW-ACTIVITY** — they force a full re-scan to establish a baseline.
+    All other domains receive full re-analysis. The 75%/66% completion threshold
+   (see Non-Negotiable Rules Rule 1) applies to active agents only — LOW-ACTIVITY
+   domains excluded from denominator.
+    **Exception — periodic full re-scan:** Every 3rd re-review (tracked via
+    `re_review_count` in the baseline snapshot — full re-scan when
+    `(re_review_count + 1) % 3 == 0`, i.e., on the 3rd, 6th, 9th, ... re-review),
+    ALL domains are rescanned regardless of LOW-ACTIVITY status, to detect silent
+    regressions in previously clean areas.
+   **Precedence:** When `CODE_REVIEW_AGENTS` is explicitly set on a re-review, it
+   overrides LOW-ACTIVITY exclusion — all requested agents run regardless of
+   LOW-ACTIVITY status. If a periodic full re-scan also triggers on the same
+   re-review, the periodic full re-scan takes precedence — all domains are
+   scanned regardless of `CODE_REVIEW_AGENTS`.
+3. Re-synthesize with previous baseline in context
+4. Update baseline snapshot (incrementing `re_review_count` by 1)
+5. Report progress: remaining vs original
+
+This enables iterative improvement tracking across multiple sessions.
+
+### 4g. Post-Fix Verification
+
+After fixes are applied, verify they didn't introduce regressions:
+
+1. **Re-read changed files**: For each applied task, read the modified files to confirm the change matches the task description.
+2. **Lint check**: Run the project's linter (e.g. `npm run lint`, `ruff`, `cargo check`) on changed files if a lint command is detectable.
+3. **Type check**: Run the project's type checker (e.g. `tsc --noEmit`, `mypy`, `cargo check`) if detectable.
+4. **Test the affected area**: Run the subset of tests covering the changed modules. If no targeted test command is available, note it.
+5. **Report fix confidence per task**:
+
+```
+### Fix Verification
+
+| Task | File(s) Changed | Lint | Type Check | Tests | Confidence |
+|------|----------------|------|------------|-------|------------|
+| T-001 | config/database.php | PASS | N/A | PASS | HIGH |
+| T-002 | src/auth/*, src/user/* | PASS | PASS | 3/3 PASS | HIGH |
+| T-003 | tests/* | N/A | N/A | PASS | HIGH |
+```
+
+6. If any check fails, report the failure to the user and suggest remediation. Do not auto-retry.
+
+## Phase 5: Independent Review & PR
+
+Initialize counters before sub-phases:
+- `$TOTAL_FIXES_APPLIED = 0`
+- `$EXTERNAL_FIX_ROUNDS = 0`
+- `$EXTERNAL_FIXES_APPLIED = 0`
+- `$LOCAL_LOOP_ITERATIONS = 0`
+
+After Phase 4 fixes are applied, Phase 5 runs autonomously in two stages:
+
+- **Local loop (5a-5d):** Review → auto-correct → re-review until clean
+  → full test suite
+- **External loop (5e-5f):** Auto-create PR → user pings when AI bots
+  reviewed → read comments → fix → push → repeat
+
+### 5a. Spawn Independent Reviewer
+
+Spawn a fresh Task agent (not the original fixers). Give it:
+- The list of changed files from Phase 4d
+- The original fix plan tasks for context
+- Instructions to review each change for:
+  - **Correctness**: does the code do what the fix plan intended?
+  - **Edge cases (adversarial)**: "what if empty input / corrupt data / missing file /
+    malicious symlink / concurrent access?"
+  - **Security anti-patterns**: symlink races, `os.chmod` on symlinks, TOCTOU,
+    path traversal, command injection, unsafe `shell=True`, hardcoded secrets
+  - **Error handling**: every error path logs the error, cleans up resources, and
+    does not crash the process or leave it in an inconsistent state
+  - **Cross-platform**: Windows vs Unix — execution policies, path separators,
+    signal handling, `os.rmdir` vs `os.unlink` for directory symlinks
+  - **CI gates**: verify the CI checks the project would run (see 5d step 3)
+- Load the `karpathy-guidelines` skill (via `SKILL_DIR`) and follow Karpathy Guidelines
+- **File-type checklist** — apply relevant checks per changed file extension:
+  - `.ps1`: `$ErrorActionPreference`, `Test-Path` guards, `-ExecutionPolicy Bypass`
+  - `.sh`: variable quoting, `set -e`, non-bashism POSIX portability
+  - `Makefile`: `.PHONY` targets, shell portability, tab indentation
+  - `.py`: docstrings on new/changed public functions, `os.chmod`/`os.rmdir`/symlink patterns
+  - `.yml`: indentation, action version pinning
+
+The reviewer MUST NOT have been involved in Phase 4d execution to avoid confirmation bias.
+**Reviewer follows Karpathy Guidelines:**
+- **Surgical review**: focus only on changed files and their immediate dependencies
+- **Verify before asserting**: independently read code to confirm each potential issue; do not rely on heuristics
+- **No over-engineering (YAGNI)**: flag only real regressions and bugs, not style preferences or speculative improvements
+- **Surface assumptions**: note any design decisions in the changed code that lack documentation
+
+### 5b. Apply Corrections
+
+If the reviewer finds bugs, edge cases missed, or regressions introduced:
+1. For each issue, create a corrective task with the same structure as 4a (Task ID, Target files, Suggested change)
+2. Apply all correction tasks automatically — no user approval needed.
+   **EXCEPTION**: Any task touching ND2/ND6 triggers (db schema, auth, secrets, file_deletion,
+   destructive ops per karpathy-guidelines.md RULE_7) MUST route to explicit user consent
+   before auto-apply, matching Phase 4d approval protocol.
+3. **Correction agents load `karpathy-guidelines` skill (via `SKILL_DIR`) and follow Karpathy Guidelines:**
+   - **Surgical fixes only**: change exactly what's needed to fix the regression
+   - **Verify before done**: run targeted tests for the corrected behavior
+   - **No over-engineering (YAGNI)**: no new abstractions or patterns beyond the fix
+   - **Surface assumptions**: document any design decisions in comments/ADRs
+4. Log each applied correction for the final report
+5. Increment `$TOTAL_FIXES_APPLIED += <number of corrections applied>`
+
+### 5c. Local Review Loop
+
+**MANDATORY GATE: Do NOT proceed to 5d until this loop completes.**
+
+After corrections are applied, enter an automated local review loop:
+
+- Re-run the Independent Reviewer (5a) on the updated working tree
+- Apply any new findings via auto-correction (5b)
+- Repeat until either:
+  - Zero CRITICAL/HIGH/MEDIUM findings remain → clean exit, proceed to 5d
+  - `$REVIEW_MAX_ITERATIONS` is reached → exit with remaining issues noted
+- No user interaction required during this loop — all fixes apply automatically
+Track iteration count as `$LOCAL_LOOP_ITERATIONS`. Log each iteration:
+`[LOCAL REVIEW LOOP] Iteration N: X findings remaining`
+
+### 5d. Full Test Suite Run
+
+**PREREQUISITE: Phase 5c local review loop must have completed (either zero findings or max iterations reached). Do not jump here directly from 5b.**
+
+After the local review loop exits cleanly, run the full test suite:
+
+1. Detect the project's test runner:
+   - `python -m pytest` / `python -m unittest` for Python
+   - `npm test` / `npx jest` for Node.js
+   - `cargo test` for Rust
+   - `go test ./...` for Go
+   - Default: try `make test`, `npm test`, `pytest`
+2. Run the full test suite
+3. **Run CI gates locally**: detect and run the project's CI checks beyond the test suite:
+   - Coverage: if `.coveragerc` or `pyproject.toml` has a coverage threshold,
+     run `coverage run ... && coverage report` and verify the threshold is met
+   - Linting: if a linter config exists (`.ruff.toml`, `.flake8`, `pyproject.toml`
+     with ruff/flake8 section), run the configured linter
+   - Type checking: if a type checker config exists (`pyrightconfig.json`,
+     `mypy.ini`, or pyproject.toml with mypy/pyright section), run it
+   - Compliance/smoke: if a compliance script exists (e.g. `test_compliance.py`,
+     `test.sh`, `Test-Windows.ps1`), run it and confirm it passes
+4. If any tests or CI gates fail:
+   - Report failures to the user
+   - Do NOT auto-retry or auto-fix
+   - List which tests failed and their error messages
+5. If all pass → proceed to 5e
+
+### 5e. Create Pull Request
+
+Create a local branch and commit all fixes, then push to GitHub
+if `gh` is available:
+
+1. **Create branch and commit fixes** — collect files changed during
+   Phase 4d and Phase 5b, stage and commit:
+   ```bash
+     BRANCH="ccr-fix/$(date +%Y%m%d-%H%M%S)-$(cd "$TARGET_DIR" && pwd | git hash-object --stdin | cut -c1-8)"
+   git checkout -b "$BRANCH"
+   git add <all-changed-files>
+   { echo "fix: apply codebase review fix plan"; echo; cat "$RESOLVED_CACHE_DIR/fix-plan-summary.md" 2>/dev/null || echo 'Phase 4 fix plan tasks applied.'; } | git commit -F -
+   ```
+
+2. **Check prerequisites**:
+   ```bash
+   gh auth status 2>/dev/null
+   git remote get-url origin 2>/dev/null | grep -q github.com
+   ```
+   If `gh` is not installed, ask the user:
+   > "The `gh` CLI is not installed. Would you like me to install it? (yes/no)"
+
+   If user approves, install per platform:
+   - **Windows**: `winget install GitHub.cli --silent --accept-package-agreements --accept-source-agreements`
+   - **macOS**: `brew install gh`
+   - **Linux (Debian/Ubuntu)**: `type -p wget >/dev/null || sudo apt-get install wget -y && sudo mkdir -p -m 755 /etc/apt/keyrings && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt update && sudo apt install gh -y`
+   - **Linux (RHEL/Fedora)**: `sudo dnf install 'dnf-command(config-manager)' && sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo && sudo dnf install gh`
+
+    After installation, verify with `gh --version`. If installation fails, skip PR creation.
+    If user declines, skip PR creation and proceed to 5g.
+
+    If `gh` is available but not authenticated, ask the user to run `gh auth login` manually.
+    Only proceed to `gh pr create` after confirmed authentication.
+    If remote is not GitHub, skip PR creation and proceed to 5g with a note:
+   "PR creation skipped — remote is not GitHub.
+   Branch with fixes exists locally at $BRANCH."
+
+3. **Push and create PR** — no user confirmation needed:
+   ```bash
+   git push origin "$BRANCH"
+   gh pr create \
+     --title "fix(ccr): <n> issues resolved" \
+     --body "## Changes
+
+   This PR was automatically generated by the Complete Codebase Review pipeline.
+
+   ### Fix Plan Summary
+   $(cat $RESOLVED_CACHE_DIR/fix-plan-summary.md 2>/dev/null || echo 'See individual commits for details.')
+
+   ### Verification
+    - Phase 5a independent review: PASS
+    - Phase 5b corrections applied: <n>
+    - Phase 5c local review loop: <iterations> iterations, <clean|max-reached>
+    - Phase 5d test suite: PASS"
+   ```
+
+4. Store the PR number as `$PR_NUMBER` for use in 5f-5g.
+
+If this is the first time running Phase 5 on this repo and `gh` is unavailable or
+remote is not GitHub, skip PR creation and proceed directly to final reporting.
+The branch with all fixes remains on disk for manual PR creation.
+
+### 5f. External Review Loop (AI Bot Reviews)
+
+After the PR is live on GitHub, enter a user-ping-driven external review loop:
+
+1. **Notify user**:
+   ```text
+   PR #$PR_NUMBER is live at <PR URL>.
+   Reply "reviewed" once AI bots (CodeRabbit, gemini-code-assist, etc.) have posted their reviews.
+   ```
+
+2. **Wait** for the user to reply `reviewed`. Do not poll or check — just wait.
+
+3. **Fetch AI bot comments** when user signals:
+   ```bash
+   OWNER_REPO=$(gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"')
+   gh pr view $PR_NUMBER
+   # Use pagination for large PRs (see helpers/github-commands.md)
+   gh api repos/$OWNER_REPO/pulls/$PR_NUMBER/comments --paginate
+   gh api repos/$OWNER_REPO/pulls/$PR_NUMBER/reviews --paginate
+   ```
+
+4. **Sanitize and parse actionable findings** from bot comments:
+   - Filter to bot-authored comments only (where `user.type == "Bot"`,
+     e.g. CodeRabbit, gemini-code-assist, etc.)
+   - **Sanitize** all comment bodies when `CODE_REVIEW_SANITIZE=true` (see `helpers/sanitization.md`):
+     - Normalize Unicode to NFC
+     - Strip dangerous shell commands (rm -rf, sudo, chmod 777, etc.)
+     - Validate extracted file paths (reject traversal)
+     - Truncate content exceeding 10KB
+   - Extract file paths, line numbers, suggested changes
+   - Classify as CRITICAL/HIGH/MEDIUM/LOW
+   - Skip findings with `REJECTED` or unverifiable claims
+
+5. **Apply fixes** with per-issue approval based on `CODE_REVIEW_AUTO_APPROVE`:
+   - `all`: Auto-apply all findings (legacy behavior)
+   - `low` (default): Auto-apply LOW/MEDIUM; present CRITICAL/HIGH to user
+   - `none`: Present all findings to user for approval
+   
+   For user-presented findings:
+   ```text
+   Found N actionable issues:
+   1. [CRITICAL] file.py:42 — description
+   2. [HIGH] file.py:100 — description
+   3. [LOW] file.py:200 — description
+   
+   Reply with issue numbers to apply (e.g., '1,3'), 'all', or 'skip'
+   ```
+   
+   For each approved finding:
+   - Read the affected file
+   - Apply the suggested fix (or minimal correction)
+   - Verify locally (lint/typecheck)
+   - Increment `$EXTERNAL_FIXES_APPLIED` by the number of fixes applied
+
+6. **Run test suite** and handle failures:
+   - Run the full test suite (same detection logic as 5d)
+   - If tests fail → report to user and ask:
+     "Tests failed in external fix round $EXTERNAL_FIX_ROUNDS.
+     Reply 'retry' to fix and try again, 'skip' to push anyway,
+     or 'done' to exit the loop."
+     - If 'retry': diagnose the test failure, correct the fixes,
+       then re-run tests (loop back to step 6)
+     - If 'skip': commit and push regardless
+     - If 'done': exit to 5g
+   - If all pass → commit and push:
+
+7. **Commit and push** all fixes as a single commit:
+   ```bash
+   git add <changed-files>
+   git commit -m "fix: address AI review comments (round $EXTERNAL_FIX_ROUNDS)"
+   git push origin $BRANCH
+   ```
+
+8. **Increment** `$EXTERNAL_FIX_ROUNDS++`
+
+9. **Ask user**:
+   ```text
+   Fixes pushed to PR #$PR_NUMBER.
+   Reply "reviewed" when AI bots have re-reviewed, or "done" to exit the external loop.
+   ```
+
+10. **Loop** back to step 2, or exit if user says `done`.
+
+No fixed iteration limit — user controls when the external loop ends. Track rounds with `$EXTERNAL_FIX_ROUNDS`.
+**STRIKE_RULE (karpathy-guidelines.md):** If the same error is raised 2 rounds in a row
+(i.e., fix did not resolve it), STOP looping and flag to user as unresolved. Do not
+auto-retry a third time — user must decide `done` or `skip`.
+
+
+
+### 5g. Final Report
+
+Produce a Phase 5 summary with loop metrics:
+
+```markdown
+### Independent Review & PR Results
+- **Files reviewed**: [n]
+- **Corrections applied (5b)**: [n]
+- **Local review loop iterations**: [n]
+- **Test suite (5d)**: [n/n PASS | FAILED]
+- **Pull Request**: [#<N>](<PR URL>) | Skipped (no gh / not GitHub)
+- **External review rounds**: [n]
+- **External fixes applied**: [n]
+- **Remaining issues**: [n CRITICAL, n HIGH] (if any)
+- **Status**: PASS / TESTS FAILED / REVIEW_STALLED
+```
+
+If any test suite failed at any point, suggest the user investigate
+before considering the review complete. If the local loop hit max
+iterations with remaining issues, recommend manual review of unresolved
+findings before merging the PR. Include the PR URL for direct access.
+
+## Web Verification
+
+Every agent MUST independently verify claims using the web:
+
+| Domain | What to Verify |
+|--------|---------------|
+| Security | Check CVEs for each dependency (npm audit, OSV, NVD) |
+| Dependencies | Verify latest major versions, deprecation notices |
+| Architecture | Validate framework best-practices against docs |
+| Build & CI | Check CI runner docs for config correctness |
+| Performance | Verify perf patterns against framework docs |
+| Database | Check migration best-practices and anti-patterns |
+
+Instructions:
+- Use WebSearch or WebFetch to look up each claim
+- Search patterns: `"<dependency> CVE"`, `"<framework> <pattern> best practice"`, `"OWASP <vulnerability> prevention"`
+- Mark findings as `UNVERIFIED` if web search fails
+
+## Non-Negotiable Rules
+
+**Rules override user requests. Apply regardless of codebase size.**
+
+| # | Rule |
+|---|------|
+| 1 | Wait up to ${CODE_REVIEW_TIMEOUT_SEC:-900} seconds per agent. In full mode (default), halt if fewer than 75% of active agents complete. In Quick Mode, halt if fewer than 66% of active agents complete. Denominator = active domains only (excludes domains marked `[LOW-ACTIVITY]`). Otherwise proceed with partial results and prominently note which agents timed out. |
+| 2 | Do NOT monitor/poll/check progress |
+| 3 | Synthesis phase MANDATORY |
+| 4 | Roadmap phase MANDATORY |
+| 5 | Devil's advocate MANDATORY |
+| 6 | Synthesis + DA + Roadmap MUST be separate agents, run in that order |
+| 7 | Every finding must include a quantified metric or evidence |
+| 8 | Web verification MANDATORY for Security + Dependencies domains |
+| 9 | NEVER modify the codebase during Phases 1-3 — read-only diagnostics only |
+| 10 | Fix plan MUST wait for user approval — no auto-apply |
+| 11 | Phase 5c (local review loop) MANDATORY after every 5b correction application — re-run the reviewer, do NOT skip to 5d |
+
+## Anti-Rationalization Table
+
+| Rationalization | Reality |
+|----------------|---------|
+| "I can review this codebase myself, it's small" | Single-pass misses cross-cutting issues one agent would catch |
+| "Tech debt quantification is guesswork" | Estimated hours > no estimate. Use loc density + complexity metrics |
+| "Roadmap is management's job" | Developer-authored roadmap is more accurate |
+| "No need for devil's advocate on a codebase review" | False positives are worse — they send teams on wild goose chases |
+| "I'll skip discovery, I know this stack" | Discovery reveals project-specific conventions and legacy areas |
+| "Skip [dimension], it's not relevant" | All dimensions apply unless explicitly confirmed absent |
+| "Web verification takes too long" | A false CVE report is worse than the 30s to verify it |
+| "I'll fix this obvious bug while I'm here" | Read-only review — fix plan captures it. Applying mid-review corrupts findings |
+| "One review pass is enough, no need to loop" | The reviewer may miss issues the first pass — re-review catches regressions introduced by fixes |
+
+## Tech Debt Calibration
+
+When quantifying tech debt, use the following table as a floor estimate per finding. Agents document any multipliers applied (e.g. `2×` for particularly tangled code, `0.5×` for well-structured code with simple fixes).
+
+| Finding Type | Base Estimate |
+|-------------|---------------|
+| Missing test coverage (per module) | 4h |
+| Cyclomatic complexity > 15 (per function) | 2h |
+| Circular dependency (per cycle) | 8h |
+| Missing API documentation (per endpoint) | 0.5h |
+| Outdated major dependency | 3h |
+| Deprecated API usage (per call site) | 1h |
+| Hardcoded secret/credential | 2h |
+| Unused dead code (per module) | 1h |
+| Missing error handling (per path) | 1h |
+| N+1 query pattern (per instance) | 3h |
+| Accessibility violation WCAG A/AA (per component) | 2h |
+
+## Red Flags — STOP
+
+- Focusing on a few files instead of the full codebase
+- Giving a qualitative "looks good" without metrics
+- Skipping any phase (discovery, analysis, synthesis, roadmap, DA, **5c local review loop**)
+- Claiming findings without evidence or source
+- <75% of specialist agents in full mode (insufficient coverage)
+- Skipping web verification for security findings
+- Writing output before devil's advocate completes
+- Modifying any codebase file during review or report generation
+- Applying fix plan tasks without explicit user approval (Task IDs or "all")
+
+## Output Format
+
+When `CODE_REVIEW_FILTER=critical-high`, omit MEDIUM and LOW findings from all report sections (Detailed Findings, Improvement Roadmap, Tech Debt Summary). The Executive Summary and Per-Domain Scores still include full counts for context — only the itemized lists are trimmed.
+
+**IMPORTANT**: `CODE_REVIEW_FILTER` is display-only. The baseline snapshot (4e) always stores unfiltered totals. Baseline `tech_debt_hours` reflects ALL findings (CRITICAL through LOW), regardless of filter setting. This ensures trend comparisons between filtered and unfiltered runs remain valid.
+
+### Health Report Structure
+
+```markdown
+# Codebase Health Report
+
+## Executive Summary
+- **Overall Health**: [GREEN/YELLOW/RED]
+- **Codebase Size**: [loc, files, modules]
+- **Critical Issues**: [count]
+- **Tech Debt**: [estimated hours]
+- **Priority Areas**: [top 3]
+
+## Per-Domain Scores
+| Domain | Score (/10) | Critical | High | Medium | Low |
+|--------|------------|----------|------|--------|-----|
+| Architecture | X | X | X | X | X |
+| Security | X | X | X | X | X |
+| Process Quality | X | X | X | X | X |
+| ... | X | X | X | X | X |
+
+## Detailed Findings
+[Grouped by domain, then severity. Each finding includes DA verdict column.]
+
+| Finding | Severity | Domain | Est. Hours | DA Verdict |
+|---------|----------|--------|------------|------------|
+| ... | CRITICAL | Security | 8h | CONFIRMED |
+| ... | HIGH | Architecture | 4h | CONFIRMED |
+| ... | MEDIUM | UI/UX | 2h | QUESTIONABLE |
+| ... | LOW | Docs | 1h | PLAUSIBLE |
+
+## Improvement Roadmap
+### Phase 1 — Now (estimated: X hours)
+### Phase 2 — Next Quarter (estimated: X hours)
+### Phase 3 — Backlog (estimated: X hours)
+
+## Tech Debt Summary
+- Total estimated: X hours
+- By domain: [table]
+- Trend: [increasing/stable/decreasing]
+
+## Trend vs Previous Baseline (if exists)
+- **Health**: [previous] → [current] (improved/stable/declined)
+- **Tech Debt**: [previous]h → [current]h (Δ%)
+- **Critical Issues**: [previous] → [current] (Δ%)
+- **Domain Activity Changes**: [domains newly marked LOW-ACTIVITY] / [domains reactivated from LOW-ACTIVITY] (or "none" if unchanged)
+
+## Agent Status
+- Completed: X/X agents
+- Report verified by devil's advocate
+```
+
+## Sample Output
+
+Below is a realistic example of what a completed health report looks like for a medium-sized web application:
+
+```markdown
+# Codebase Health Report — my-web-app (src/)
+
+## Executive Summary
+- **Overall Health**: YELLOW
+- **Codebase Size**: 47,320 LOC, 312 files, 8 modules
+- **Critical Issues**: 3
+- **Tech Debt**: 200 engineering hours
+- **Priority Areas**: Security (hardcoded secrets), Architecture (circular deps), Process Quality (Karpathy compliance)
+
+## Per-Domain Scores
+| Domain | Score (/10) | Critical | High | Medium | Low |
+|--------|------------|----------|------|--------|-----|
+| Architecture | 6 | 1 | 2 | 3 | 1 |
+| Security | 4 | 2 | 3 | 1 | 0 |
+| Process Quality | 8 | 0 | 1 | 1 | 2 |
+| Code Quality | 7 | 0 | 1 | 4 | 2 |
+| Test Health | 5 | 0 | 2 | 2 | 1 |
+| Dependencies | 8 | 0 | 0 | 2 | 3 |
+| Documentation | 6 | 0 | 1 | 1 | 4 |
+| Build & CI | 9 | 0 | 0 | 1 | 1 |
+| Database | 7 | 0 | 1 | 1 | 1 |
+| **Overall** | **6.5** | **3** | **11** | **16** | **15** |
+
+## Detailed Findings
+
+| Finding | Severity | Domain | Est. Hours | DA Verdict |
+|---------|----------|--------|------------|------------|
+| [config/database.php:42] — Hardcoded DB password → credential leak on source exposure | CRITICAL | Security | 2h | CONFIRMED |
+| [src/auth/cycle.go:15] — Circular dep auth→user→notification→auth → startup deadlock risk | CRITICAL | Architecture | 8h | CONFIRMED |
+| [tests/fixtures/auth.json:3] — Hardcoded API key → credential leak in test artifacts | CRITICAL | Security | 2h | CONFIRMED |
+| [src/auth/handler.go:1] — No behavior-driven tests → unverified auth logic regressions | HIGH | Process Quality | 4h | CONFIRMED |
+| [src/user/service.go:67] — Cyclomatic complexity 34 → unmaintainable, error-prone changes | HIGH | Code Quality | 4h | CONFIRMED |
+| [src/modules/*/test.py:1] — Test coverage <20% in 3 of 8 modules → silent regressions undetected | HIGH | Test Health | 12h | PLAUSIBLE |
+| [src/utils/lodash.js:12] — Deprecated lodash.set in 17 call sites → prototype pollution risk | HIGH | Dependencies | 3h | CONFIRMED |
+| [docs/api/admin.md:1] — Missing API docs for /admin/* endpoints → integration failures | HIGH | Documentation | 4.5h | CONFIRMED |
+| [src/api/orders.py:89] — N+1 query in /orders endpoint → O(n) DB calls, timeout on scale | HIGH | Database | 3h | CONFIRMED |
+| [src/models/index.ts:1] — Mixed snake_case and camelCase → inconsistent API contracts | MEDIUM | Standards | 2h | QUESTIONABLE |
+
+## Improvement Roadmap
+
+### Phase 1 — Now (estimated: 35 hours)
+- T-001: Rotate hardcoded secrets → env vars → 4h
+- T-002: Break auth→user→notification cycle via event bus → 8h
+- T-003: Implement behavior-driven tests for core auth logic → 4h
+- T-004: Add unit tests for 3 uncovered modules → 12h
+- T-005: Replace lodash.set with native optional chaining → 3h
+- T-006: Add rate limiting to auth endpoints → 4h
+
+### Phase 2 — Next Quarter (estimated: 47 hours)
+- T-007: Refactor high-complexity functions (17 functions >15 cyclomatic) → 14h
+- T-008: Document all undocumented API endpoints → 10h
+- T-009: Fix N+1 queries (3 instances) → 9h
+- T-010: Migrate from Moment.js to date-fns → 8h
+- T-011: Add E2E tests for critical paths → 6h
+
+### Phase 3 — Backlog (estimated: 118 hours)
+- T-012: Implement design system component library → 40h
+- T-013: Add performance benchmarking pipeline → 16h
+- T-014: Full OWASP Top 10 hardening audit → 24h
+- ... (remaining 8 tasks)
+
+## Tech Debt Summary
+- **Total estimated**: 200 hours
+- **By domain**: Security 18h, Architecture 24h, Code Quality 32h, Test Health 48h, Process Quality 12h, Dependencies 12h, Documentation 20h, Standards 16h, Database 18h
+- **Trend**: First baseline — no trend data
+
+## Agent Status
+- Completed: 12/14 agents
+- Failed (timeout): Performance Baseline, UI/UX Auditor (noted in findings)
+- Report verified by devil's advocate
+- **DA Verdict**: 24 CONFIRMED, 8 PLAUSIBLE, 3 QUESTIONABLE, 1 REJECTED
+```
+
+## Graceful Degradation
+
+| Missing | Fallback |
+|---------|----------|
+| LSP | Grep/Glob for structure analysis |
+| WebSearch | Code-only; mark UNVERIFIED |
+| Skill not found | Log `SKILL_MISSING: [name]`, proceed with general domain knowledge, note the gap in the agent's report header. Do not halt. |
+| Rate limit hit on web verification | Fall back to code-only analysis for that agent, mark findings UNVERIFIED |
+| Agent fails | See Sub-Agent Failure Recovery table. |
+| Large codebase | Prioritize core modules; note "X modules not analyzed". Assign module subsets to specific agents to avoid overlap. |
+| Cache directory not writable | Fall back to OS temporary directory |
+| $ARGUMENTS path invalid | Ask user for a valid path; fall back to `.` |
+| User declines fix plan | Clean up and exit — no changes written |
+| `gh` CLI not installed | Ask user permission to install (winget/brew/apt). If declined or install fails, skip PR creation — branch remains locally. |
+
+## Sub-Agent Failure Recovery
+
+| Scenario | Action |
+|----------|--------|
+| **Transient tool error** (network timeout, rate limit) | Retry once after 10s backoff |
+| **Persistent tool error** (same error after retry) | Skip that agent. Note `AGENT_FAILED` prominently in synthesis report |
+| **Agent exceeds ${CODE_REVIEW_TIMEOUT_SEC:-900} seconds** | Proceed with partial results from completed agents. Document which agents were skipped and why |
+| **<75% of agents complete (full mode) or <66% (Quick Mode)** | Halt — insufficient coverage. Report: "Only X/Y agents completed in {mode} mode. Reduce codebase size, increase CODE_REVIEW_TIMEOUT_SEC, or retry." |
+| **Synthesis/DA agent fails** | Halt and report error. These phases are mandatory. Do not produce output without them. |
+
+## Cross-Boundary Signals
+
+Cross-domain signals are captured in a structured notes block by the orchestrator and included as context when spawning dependent agents. The orchestrator collects cross-references from agent reports and passes relevant signals to downstream agents.
+
+| From | To | Signal |
+|------|----|--------|
+| Architecture | CodeQuality | Circular dependency causing high cyclomatic complexity |
+| Security | Dependencies | CVE found in a dependency |
+| Performance | Architecture | Performance bottleneck caused by layering abstraction |
+| TestHealth | Build | Test failures correlated with CI configuration drift |
+| UI/UX | Accessibility | Component missing ARIA attributes or keyboard navigation |
+| UI/UX | Performance | Oversized assets or unoptimized images |
+| UI/UX | Standards | Design system drift or inconsistent component usage |
+
+## Common Mistakes
+
+- Reviewing a diff instead of the full codebase (use multi-agent-code-review)
+- Surface-level scanning without deep analysis
+- Qualitative-only assessment (no metrics, no quantification)
+- No roadmap — findings without a plan to fix them
+- Skipping devil's advocate (false positives waste team time)
+- Writing output before all agents complete
+- Windows-only commands that fail on devs' MacBooks
+- Fixing issues during the review instead of capturing them in the fix plan
+- Applying the fix plan without user approval
+

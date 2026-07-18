@@ -1,0 +1,26 @@
+{
+  "snapshot_date": "2026-07-18",
+  "raw_records": 109312,
+  "included_raw": 105392,
+  "excluded_raw": 3920,
+  "exclude_reason_breakdown": {
+    "no_frontmatter": 2478,
+    "missing_name": 601,
+    "template_marker:todo": 591,
+    "missing_description": 121,
+    "template_marker:<name>": 86,
+    "no_content": 14,
+    "template_marker:<description>": 12,
+    "template_marker:fixme": 8,
+    "template_marker:example-skill": 5,
+    "placeholder_no_body": 1,
+    "template_marker:your-skill-name": 1,
+    "template_marker:replace this": 1,
+    "template_marker:brief description of": 1
+  },
+  "forks_excluded": 90,
+  "included_nonfork_predupe": 105302,
+  "unique_after_dedup": 55698,
+  "duplicate_groups": 12716,
+  "duplicate_raw_records_collapsed": 49604
+}

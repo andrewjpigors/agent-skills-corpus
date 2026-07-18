@@ -1,0 +1,1701 @@
+---
+name: onboarding
+description: Use when starting a new DSO project, joining an existing one, getting started in an unfamiliar codebase, doing a codebase walkthrough, or running project setup. Auto-detects the stack, scans existing docs, runs a Socratic dialogue to capture architecture / infrastructure / CI / design system / enforcement preferences, then writes dso-config.conf, CLAUDE.md, ticket-system seed files, and pre-commit hooks. Optionally installs a project template (nava-platform or Jekyll). Trigger phrases include 'onboard this project', 'set up DSO', 'getting started', 'project setup', 'codebase walkthrough', 'understand the codebase', 'run onboarding', 'init the project'.
+user-invocable: true
+allowed-tools: Read, Write, Edit, Glob, Grep, Bash
+---
+
+<SUB-AGENT-GUARD>
+Requires interactive user session. If running as a sub-agent (dispatched via Task), STOP and return: "ERROR: /dso:onboarding requires main session; invoke directly."
+</SUB-AGENT-GUARD>
+
+# Onboarding: Socratic Project Understanding
+
+Role: **Senior Engineering Lead** conducting a structured onboarding dialogue to build a shared mental model of the project before writing any code or running any automation.
+
+**Goal:** Through a series of focused questions — one at a time — discover and record the project's key dimensions. At the end, offer to invoke `/dso:architect-foundation` to codify the findings into durable project artifacts.
+
+
+---
+
+## Migration Check
+
+Idempotently apply plugin-shipped ticket migrations (marker-gated; no-op once migrated, never blocks the skill):
+
+```bash
+PLUGIN_SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+bash "$PLUGIN_SCRIPTS/migrate-design-notes-to-design-md.sh" 2>/dev/null || true  # shim-exempt: internal orchestration script
+```
+
+---
+
+## Usage
+
+```
+/dso:onboarding          # Start a full onboarding session for the current project
+```
+
+---
+
+## Understanding Areas Checklist
+
+The onboarding session probes seven areas. Track your progress through each:
+
+| # | Area | What to Discover |
+|---|------|-----------------|
+| 1 | **stack** | Languages, frameworks, runtime versions, package managers |
+| 2 | **commands** | How to build, test, lint, format, and run the project locally |
+| 3 | **architecture** | Module structure, service boundaries, data flow, key design patterns |
+| 4 | **infrastructure** | Hosting, deployment targets, databases, external services, secrets management |
+| 5 | **CI** | CI provider, pipeline stages, test gates, deployment triggers |
+| 6 | **design** | UI framework, design system, visual tokens, accessibility targets |
+| 7 | **enforcement** | Linting rules, commit hooks, review gates, code style policies |
+
+---
+
+## Onboarding Overview
+
+**This is a one-time setup.** DSO onboarding configures your project so all DSO workflows (`/dso:sprint`, `/dso:brainstorm`, etc.) know your tech stack, commands, and enforcement rules.
+
+At the end of this process, three artifacts will be written:
+- **`project-understanding.md`** — records your tech stack, architecture, commands, and CI pipeline
+- **`.claude/dso-config.conf`** — configures DSO workflow commands, paths, and enforcement settings
+- **`.claude/scripts/dso`** (shim) — CLI entrypoint for all DSO operations
+
+Work through each phase below. Answer what you know and skip what doesn't apply.
+
+---
+
+## Phase 0: Comfort Assessment (/dso:onboarding)
+
+**Goal:** Before showing any detection output or asking project questions, calibrate explanation style with a single comfort-level question, run detection silently, assign confidence levels to all 7 dimensions, and initialize the CONFIDENCE_CONTEXT object in the scratchpad.
+
+### Step 0.1: Comfort Level Question (first user interaction)
+
+Display the following question **before any auto-detection output, before any dependency scan results, and before any other questions**:
+
+```
+Before we begin, I'd like to calibrate how I explain things.
+Are you more comfortable with technical engineering details, or would you prefer plain-language explanations?
+
+1) Technical — I'm comfortable with engineering terms, CLI commands, and configuration details
+2) Non-technical — Plain language please; skip the jargon where possible
+
+(Enter 1 or 2)
+```
+
+Record the answer as `COMFORT_LEVEL`:
+- If the user enters `1` (or "technical"): `COMFORT_LEVEL="technical"`
+- If the user enters `2` (or "non-technical"): `COMFORT_LEVEL="non_technical"`
+- If no answer or ambiguous: default to `COMFORT_LEVEL="non_technical"` (safer, more guided path)
+
+### Step 0.1a: Permissions Mode Instruction
+
+Immediately after recording `COMFORT_LEVEL`, display this advisory message before proceeding to any detection:
+
+```
+Onboarding writes ~30 files and runs setup scripts. To avoid approving each one individually,
+consider switching to auto-accept mode now: press Shift+Tab in the input box to cycle through
+permission modes until "auto" is shown, or accept all prompts with 'y' when asked.
+
+You can switch back to your preferred mode any time by pressing Shift+Tab again.
+```
+
+This is advisory — do not wait for a response. Continue to Step 0.2 immediately.
+
+### Step 0.2: Stack and Project Auto-Detection
+
+Run detection scripts **silently** (before showing output to the user):
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+DETECT_OUT=$(bash "$REPO_ROOT/.claude/scripts/dso onboarding/project-detect.sh" "$REPO_ROOT" 2>/dev/null || echo "")
+STACK_OUT=$(bash "$REPO_ROOT/.claude/scripts/dso detect-stack.sh" "$REPO_ROOT" 2>/dev/null || echo "unknown")
+```
+
+These results are reused in Phase 1 — do NOT re-run detect-stack.sh or project-detect.sh again in Phase 1 Step 1. Reference the `$DETECT_OUT` and `$STACK_OUT` variables set here.
+
+Also read supporting project files silently:
+
+```bash
+# Node / JavaScript ecosystem
+[ -f "$REPO_ROOT/package.json" ] && PACKAGE_JSON=$(cat "$REPO_ROOT/package.json" 2>/dev/null) || PACKAGE_JSON=""
+
+# Detect pre-commit hooks
+HUSKY_HOOK=""
+[ -f "$REPO_ROOT/.husky/pre-commit" ] && HUSKY_HOOK=$(cat "$REPO_ROOT/.husky/pre-commit" 2>/dev/null)
+PRECOMMIT_CONFIG=""
+[ -f "$REPO_ROOT/.pre-commit-config.yaml" ] && PRECOMMIT_CONFIG=$(cat "$REPO_ROOT/.pre-commit-config.yaml" 2>/dev/null)
+
+# Discover CI workflows
+CI_WORKFLOWS=""
+if [ -d "$REPO_ROOT/.github/workflows" ]; then
+    CI_WORKFLOWS=$(ls "$REPO_ROOT/.github/workflows"/*.yml "$REPO_ROOT/.github/workflows"/*.yaml 2>/dev/null | xargs -I{} basename {} 2>/dev/null || echo "")
+fi
+
+# Discover test directories
+TEST_DIRS=""
+for candidate in tests test spec __tests__ src/__tests__; do
+    [ -d "$REPO_ROOT/$candidate" ] && TEST_DIRS="$TEST_DIRS $candidate"
+done
+TEST_DIRS="${TEST_DIRS# }"
+```
+
+### Step 0.3: Confidence Level Assignment
+
+Assign confidence levels (`high` / `medium` / `low`) for all 7 dimensions based on the detection output collected in Step 0.2:
+
+#### Confidence Assignment Rules
+
+| Dimension | Assignment rule |
+|-----------|----------------|
+| **stack** | `high` if `STACK_OUT` is a recognized named stack (e.g., `"node-npm"`, `"python-poetry"`, `"ruby-rails"`); `low` if `STACK_OUT` is `"unknown"` |
+| **commands** | `high` if `DETECT_OUT` includes test and build command entries; `medium` if test directories were found but commands not confirmed; `low` otherwise |
+| **architecture** | `medium` if multiple source directories were detected; `low` otherwise |
+| **infrastructure** | `low` by default (no automated detection exists for this area) |
+| **ci** | `high` if CI workflow files were found in `.github/workflows/` AND `DETECT_OUT` contains `ci_workflow_confidence=high` with exactly one entry; `medium` if multiple workflows found or `ci_workflow_confidence=low`; `low` if no `.github/workflows/` directory found |
+| **design** | `medium` if `package.json` was found with a UI framework reference; `low` otherwise |
+| **enforcement** | `high` if `.pre-commit-config.yaml` or `.husky/` was found; `low` otherwise |
+
+Apply the rules above to produce a confidence level value (`high`, `medium`, or `low`) for each of the 7 dimensions. Examples:
+
+- `STACK_OUT="node-npm"` → stack confidence: `high`
+- `STACK_OUT="unknown"` → stack confidence: `low`
+- `.github/workflows/ci.yml` found, `ci_workflow_confidence=high` → ci confidence: `high`
+- No `.github/workflows/` → ci confidence: `low`
+
+### Step 0.4: Initialize Confidence Context Object in Scratchpad
+
+After completing Steps 0.1–0.3, write the `CONFIDENCE_CONTEXT` object (the `confidence_context` signal) to the scratchpad under a dedicated section header. Schema contract: `${CLAUDE_PLUGIN_ROOT}/docs/contracts/confidence-context.md`.
+
+```bash
+SCRATCHPAD_PHASE0=$(mktemp /tmp/onboarding-phase0-XXXXXX.md)
+cat > "$SCRATCHPAD_PHASE0" <<EOF
+## CONFIDENCE_CONTEXT
+\`\`\`json
+{
+  "dimensions": {
+    "stack": "<high|medium|low>",
+    "commands": "<high|medium|low>",
+    "architecture": "<high|medium|low>",
+    "infrastructure": "<high|medium|low>",
+    "ci": "<high|medium|low>",
+    "design": "<high|medium|low>",
+    "enforcement": "<high|medium|low>"
+  },
+  "comfort_level": "$COMFORT_LEVEL",
+  "detected_stack": "$STACK_OUT",
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+\`\`\`
+EOF
+```
+
+Replace each `<high|medium|low>` placeholder with the actual confidence level determined in Step 0.3. This object is written to `$SCRATCHPAD_PHASE0` (a temp file) because `$SCRATCHPAD` does not yet exist — Phase 1 Step 2 creates it. After Phase 1 Step 2 initializes `$SCRATCHPAD`, append the Phase 0 context:
+
+```bash
+# Merge Phase 0 context into main scratchpad (after Phase 1 Step 2 creates $SCRATCHPAD)
+cat "$SCRATCHPAD_PHASE0" >> "$SCRATCHPAD"
+rm -f "$SCRATCHPAD_PHASE0"
+# Validate the merge — Phase 2 confidence routing depends on this section
+grep -q "## CONFIDENCE_CONTEXT" "$SCRATCHPAD" || \
+    echo "WARNING: Phase 0 context merge failed — Phase 2 confidence routing will fall back to low for all dimensions"
+```
+
+This makes `## CONFIDENCE_CONTEXT` visible to all downstream parsers (Phase 2 question routing, S2 doc folder scan, S3 routing logic) that scan `$SCRATCHPAD`.
+
+**Phase 1 scratchpad skip**: Because Step 0.2 already ran `detect-stack.sh` and `project-detect.sh`, Phase 1 Step 1 must **not** re-run these scripts. Phase 1 Step 1 should reference the existing `$DETECT_OUT` and `$STACK_OUT` variables.
+
+**Phase plan update**: When Phase 1 Step 2 writes the phase plan to the scratchpad, include Phase 0 at position 1 (before Phase 1: Auto-Detection). The complete phase list should be: Phase 0: Comfort Assessment → Phase 1: Auto-Detection → Phase 1.5 → Phase 1.6 → Phase 1.7 → Phase 2 → Phase 3.
+
+---
+
+## Phase 0.5: Document Folder Pre-Scan (branch — `--doc-folder` flag only)
+
+**Trigger**: `--doc-folder <path>` was supplied on the onboarding invocation. If omitted, skip this phase entirely.
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/0.5-doc-folder-prescan.md` and follow it. It scans the supplied document folder via `scan-docs.sh`, parses extracted facts, and elevates `## CONFIDENCE_CONTEXT` levels (elevation-only, never lower). Output contracts: `## DOC_SCAN_FACTS` scratchpad section; CONFIDENCE_CONTEXT contract preserved per `${CLAUDE_PLUGIN_ROOT}/docs/contracts/confidence-context.md`. Failure-handling: any error in the phase is logged and onboarding continues.
+
+---
+
+## Onboarding Batch Protocol
+
+This skill organizes its commands into **at most 6 batch groups** (fewer when groups are skipped). Before executing any commands in a batch group, the agent presents a single grouped approval prompt to the user and waits for a response.
+
+### Rules
+
+1. **One approval per group boundary.** At each `## Batch: <name>` boundary, present the user with a single grouped approval:
+
+   ```
+   Approve: <group-name> — <brief description of what this batch does>
+   ```
+
+   Wait for the user to approve before executing any commands in that group. Do NOT ask again mid-group or between individual commands within the same group boundary.
+
+2. **Execute all commands under one approval.** Once the user approves a batch group, execute ALL commands in that group without requesting further approval until the next `## Batch:` boundary is reached.
+
+3. **Skip silently when the skip-guard is met.** Each batch group has a `<!-- Skip guard: ... -->` comment that specifies the condition under which the entire group is skipped. When the skip-guard condition is met, skip the entire group without presenting an approval prompt. The total approval count decreases accordingly (at most 6, fewer when groups are skipped).
+
+4. **Approval prompt format.** The prompt must always include the group name so the user knows what they are approving. Example:
+
+   ```
+   Approve: dependency-install — installs required tools (bash 4+, coreutils, git) and optional analysis tools (ast-grep, semgrep)
+   ```
+
+### Batch Inventory
+
+The 6 batches and their skip conditions are:
+
+| Batch | Skip condition |
+|-------|---------------|
+| `dependency-install` | No deps missing AND optional deps already installed |
+| `scaffold-claude-structure` | `.claude/` structure already present and shim already installed |
+| `config-write` | All config files already exist with current content |
+| `initial-commit` | All artifacts already committed |
+| `hook-install` | Hooks already installed AND no new hook artifacts to commit; OR project is not a git repository (skip entirely — ticket system init and hook install both require git) |
+| `final-commit` | No hook artifacts to commit |
+
+---
+
+## Batch: dependency-install
+<!-- Skip guard: if no deps missing AND optional deps already installed, skip this prompt -->
+
+## Phase 1: Auto-Detection (/dso:onboarding)
+
+**Goal:** Pre-fill as many answers as possible by reading project files BEFORE asking the user anything.
+
+### Step 0: Dependency Pre-Scan (Phase 1 of Y)
+
+Run BEFORE any user interaction or scratchpad initialization. Check for required and optional dependencies and resolve any gaps before proceeding.
+
+**Required dependencies:**
+
+```bash
+MISSING_DEPS=()
+
+# Check bash >= 4.0 — use /bin/bash explicitly (macOS ships bash 3.x on PATH)
+BASH_VERSION_STR=$(/bin/bash --version 2>/dev/null | head -1)
+BASH_MAJOR=$(echo "$BASH_VERSION_STR" | grep -oE 'version [0-9]+' | grep -oE '[0-9]+' | head -1)
+if [ -z "$BASH_MAJOR" ] || [ "$BASH_MAJOR" -lt 4 ]; then
+    MISSING_DEPS+=("bash (>= 4.0, detected: ${BASH_MAJOR:-unknown})")
+fi
+
+# Check GNU coreutils (provides GNU date; macOS ships BSD date by default)
+if ! date --version >/dev/null 2>&1 && ! gdate --version >/dev/null 2>&1; then
+    MISSING_DEPS+=("coreutils (GNU date)")
+fi
+
+# Check git
+if ! command -v git >/dev/null 2>&1; then
+    MISSING_DEPS+=("git")
+fi
+
+# Check pre-commit — required for hook management and enforcement gates
+if ! command -v pre-commit >/dev/null 2>&1; then
+    MISSING_DEPS+=("pre-commit")
+fi
+
+# Check flock — required for ticket-lib.sh + cycle-ledger concurrent-writer
+# coordination. macOS does not ship flock; install via Homebrew (`brew install
+# flock` for the discoteq portable build, or `brew install util-linux` for the
+# util-linux build). Linux util-linux usually provides it by default.
+if ! command -v flock >/dev/null 2>&1; then
+    MISSING_DEPS+=("flock (util-linux or discoteq/flock)")
+fi
+```
+
+If `MISSING_DEPS` is non-empty, collect all items into a single install command and **pause for user confirmation before continuing**:
+
+```
+The following required tools are missing:
+  - <item 1>
+  - <item 2>
+
+Install them with:
+  brew install bash coreutils git pre-commit python uv flock
+
+Would you like me to install them for you?
+
+(Adjust the package list to match only what is missing above.)
+```
+
+- If Homebrew is unavailable: explain that automated installation is out of scope, list the missing deps, and ask the user to install them manually before re-running `/dso:onboarding`.
+- If the user requests installation, perform installation automatically
+- If not, wait until the user confirms manual installation.
+- Re-run the checks. Abort if any required dep is still missing.
+
+**Optional dependencies (ast-grep, semgrep):**
+
+```bash
+HAS_ASG=false; HAS_SEMGREP=false
+command -v sg >/dev/null 2>&1 && HAS_ASG=true
+command -v semgrep >/dev/null 2>&1 && HAS_SEMGREP=true
+```
+
+If either is absent, offer installation:
+
+```
+Optional tools not found: ast-grep (sg), semgrep
+These improve code analysis but are not required.
+Install now? [y/N] (press Enter or say "no" to skip)
+```
+
+If the user accepts, run with a 120-second process-level timeout to prevent hanging in restricted network environments. Use pip3 first for semgrep (preferred), then brew as fallback; use brew for ast-grep (no pip3 package):
+
+```bash
+# semgrep: pip3-first (same install path used in Phase 3 Step 2c)
+if ! command -v semgrep >/dev/null 2>&1; then
+    if command -v pip3 >/dev/null 2>&1; then
+        timeout 120 pip3 install semgrep 2>/dev/null || \
+            { command -v brew >/dev/null 2>&1 && timeout 120 brew install semgrep 2>/dev/null; } || true
+    elif command -v brew >/dev/null 2>&1; then
+        timeout 120 brew install semgrep 2>/dev/null || true
+    fi
+fi
+# ast-grep: brew only (no pip3 package)
+if ! command -v sg >/dev/null 2>&1; then
+    command -v brew >/dev/null 2>&1 && timeout 120 brew install ast-grep 2>/dev/null || true
+fi
+```
+
+- Never block progress if they are absent — if no prompt response is received, default to "N" and skip.
+- Never block progress if installation fails or times out — continue without the optional tools.
+- Record availability in a variable for later use (e.g., `HAS_ASG`, `HAS_SEMGREP`).
+
+---
+
+### Step 1: Read Project Files for Auto-Detection
+
+**Note:** Phase 0 Step 0.2 already ran `project-detect.sh` and `detect-stack.sh` and captured the results in `$DETECT_OUT`, `$STACK_OUT`, `$PACKAGE_JSON`, `$HUSKY_HOOK`, `$PRECOMMIT_CONFIG`, `$CI_WORKFLOWS`, and `$TEST_DIRS`. Do NOT re-run those scripts here. Reference the existing variables and supplement only with data not already collected:
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Variables already set by Phase 0 Step 0.2:
+#   DETECT_OUT, STACK_OUT, PACKAGE_JSON, HUSKY_HOOK, PRECOMMIT_CONFIG
+#   CI_WORKFLOWS, TEST_DIRS
+
+# Read additional project files not covered in Phase 0
+# Python ecosystem
+[ -f "$REPO_ROOT/pyproject.toml" ] && PYPROJECT=$(cat "$REPO_ROOT/pyproject.toml" 2>/dev/null)
+```
+
+Note which understanding areas are already answered by the detection output so you can skip or confirm rather than ask from scratch.
+
+### Step 2: Initialize Scratchpad
+
+Create a temp scratchpad file to accumulate findings. Use append-only writes throughout the session to protect against context loss:
+
+```bash
+SCRATCHPAD=$(mktemp /tmp/onboarding-scratchpad-XXXXXX.md)
+cat > "$SCRATCHPAD" <<EOF
+# Onboarding Scratchpad — $(date)
+## Auto-detected
+Stack: $STACK_OUT
+Detection output: $DETECT_OUT
+package.json: ${PACKAGE_JSON:+present}
+.husky/ pre-commit hook: ${HUSKY_HOOK:+present}
+CI workflow filenames: ${CI_WORKFLOWS:-none found}
+Test directories: ${TEST_DIRS:-none found}
+EOF
+# Only write pyproject.toml line when the file actually exists — omitting the key entirely
+# prevents the LLM from listing it in "what I found" output for non-Python projects
+[[ -n "${PYPROJECT:-}" ]] && echo "pyproject.toml: present" >> "$SCRATCHPAD"
+```
+
+After each user answer, append to the scratchpad:
+
+```bash
+echo "## $AREA_NAME" >> "$SCRATCHPAD"
+echo "$USER_ANSWER" >> "$SCRATCHPAD"
+```
+
+After initializing the scratchpad, write the PHASE_PLAN:
+
+```bash
+# Write PHASE_PLAN to scratchpad (line-per-entry for easy removal of skipped phases)
+echo "" >> "$SCRATCHPAD"
+echo "## PHASE_PLAN" >> "$SCRATCHPAD"
+echo "Phase 0: Comfort Assessment" >> "$SCRATCHPAD"
+echo "Phase 1: Auto-Detection" >> "$SCRATCHPAD"
+echo "Phase 1.5: Template Selection Gate" >> "$SCRATCHPAD"
+echo "Phase 1.6: Template Installation" >> "$SCRATCHPAD"
+echo "Phase 1.7: Post-Install Re-Detection" >> "$SCRATCHPAD"
+echo "Phase 2: Socratic Dialogue Loop" >> "$SCRATCHPAD"
+echo "Phase 3: Completion" >> "$SCRATCHPAD"
+```
+
+Then compute and display the phase counter for Phase 1:
+
+```bash
+# Count PHASE_PLAN entries scoped to the ## PHASE_PLAN section (avoids counting "Phase" text elsewhere)
+Y=$(awk '/^## PHASE_PLAN/{flag=1; next} /^##/{flag=0} flag && /^Phase /{count++} END{print count+0}' "$SCRATCHPAD")
+N=1
+echo "(Phase ${N} of ${Y})"  # e.g. "Phase 1 of 6" when all phases are present
+```
+
+Display to user: **(Phase 1 of Y)** where Y = number of phase entries remaining in the `## PHASE_PLAN` section. Y starts at 6 when all phases apply; it decreases as optional phases (1.5, 1.6, 1.7, 2) are removed at their skip points.
+
+### Step 3: Present Detected Configuration for Confirmation
+
+Before asking any questions, present what was found and ask the user to confirm or correct.
+
+**Stack-aware artifact reporting**: Only list Python-specific artifacts (`pyproject.toml`) if they actually exist on disk. Do NOT list `pyproject.toml` for non-Python projects. Use the `$PYPROJECT` variable set in Step 1 — it is only set when the file exists, so `${PYPROJECT:+present}` is safe to use as the guard.
+
+```
+I've scanned the project and found:
+- Stack: [detected stack or "unknown"]
+- Test suites: [detected suites or "none detected"]
+- Test directories: [TEST_DIRS or "none found"]
+- CI workflow filenames: [CI_WORKFLOWS or "none found"]
+- Pre-commit hooks: [.husky/ present / .pre-commit-config.yaml present / "none"]
+- package.json: [present / not found]
+[Include this line ONLY if PYPROJECT is set (i.e., pyproject.toml exists): - pyproject.toml: present]
+
+Does this look right, or is anything missing?
+```
+
+Wait for the user to confirm or correct before continuing. Update the scratchpad with any corrections.
+
+---
+
+## Phase 1.5: Template Selection Gate (branch — `STACK_OUT="unknown"` only)
+
+**Trigger**: `detect-stack.sh` returned `"unknown"`. If a recognized stack was detected, skip this phase entirely and proceed directly to Phase 2.
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/1.5-template-selection.md` and follow it. It loads the template registry via `parse-template-registry.sh`, presents a numbered template menu (with option 0 = decline), routes the chosen `install_method` to Phase 1.6a (`nava-platform`) or Phase 1.6b (`git-clone`), and records the **`## Template Selection Result`** scratchpad section — the wire-format contract consumed by Phases 1.6 and 1.7. Required fields: `name`, `install_method`, `repo_url`, `framework_type`, `required_data_flags`, `collected_data`. Failure-handling: empty/missing registry → silently skip and proceed to Phase 2.
+
+When Phase 1.5 is skipped (recognized stack), also remove Phases 1.5/1.6/1.7 from PHASE_PLAN:
+
+```bash
+# Portable in-place delete (works on BSD and GNU sed)
+for pat in '/^Phase 1\.5: Template Selection Gate$/d' \
+           '/^Phase 1\.6: Template Installation$/d' \
+           '/^Phase 1\.7: Post-Install Re-Detection$/d'; do
+    sed -i.bak "$pat" "$SCRATCHPAD" && rm -f "$SCRATCHPAD.bak"
+done
+```
+
+---
+
+## Phase 1.6a: nava-platform Template Installation
+
+**Trigger**: Run ONLY when Phase 1.5 selected `install_method: nava-platform`.
+
+Read and execute `phases/1.6a-nava-platform-install.md`.
+
+---
+
+## Phase 1.6b: Jekyll Git Clone Installation
+
+**Trigger**: Run ONLY when Phase 1.5 selected `install_method: git-clone` with `framework_type: jekyll`.
+
+This phase performs a `git clone` of the Jekyll USWDS template repository into the current project directory, with pre-flight safety checks (non-empty directory guard) and post-clone validation (captive portal / HTML redirect detection). On any failure, the operator is offered a documented manual install fallback rather than a partially-cloned tree.
+
+Read and execute `phases/1.6b-jekyll-git-clone-install.md`.
+
+---
+
+## Phase 1.7: Post-Install Re-Detection and Phase 2 Skip (branch — only after Phase 1.6 fires)
+
+**Trigger**: Phase 1.6a or Phase 1.6b completed successfully (template was installed). If no template was installed, skip this phase entirely.
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/1.7-post-install-redetection.md` and follow it. It re-runs `detect-stack.sh` and `project-detect.sh` to refresh `POST_INSTALL_STACK`, `POST_INSTALL_DETECT`, `CI_WORKFLOWS`, and `TEST_DIRS`; verifies the detected stack matches the registry's `framework_type` (warns on mismatch, never aborts); promotes post-install values to the primary detection variables; writes `## Post-Install Detection (Phase 1.7)` and `## Phase 2 Status` scratchpad sections; does NOT remove Phase 2 from PHASE_PLAN — Phase 2 still runs for design questions (section 6); and proceeds to Phase 2 at section 6, skipping registry-answerable sections (stack, commands, architecture, CI, enforcement).
+
+---
+
+## Phase 2: Socratic Dialogue Loop (/dso:onboarding)
+
+At the start of this phase, read the `## PHASE_PLAN` section from `$SCRATCHPAD`. Count total entries (Y). Compute this phase's position N. Display to user: **(Phase N of Y)** — e.g. `(Phase 2 of 3)` when phases 1.5/1.6/1.7 were skipped.
+
+**Template fast-path**: Before asking any questions, check the scratchpad for a `## Phase 2 Status` section. If it contains `Phase 2 partial skip — registry pre-answered:`, the following sections are already answered by registry metadata and must be skipped without asking the user: stack (section 1), commands (section 2), architecture (section 3), CI (section 4/5), enforcement (section 7), and Jira bridge / merge strategy (sections 8–14 that are registry-derivable). Record registry-derived values for these sections from the `## Template Selection Result` and `## Post-Install Detection (Phase 1.7)` scratchpad sections. **Proceed directly to section 6 (design)** — this section is never pre-answered by a template and must always run for UI projects.
+
+**Goal:** Fill gaps in the 7 understanding areas through focused, conversational questions. Present detected configuration for confirmation rather than asking open-ended discovery questions.
+
+### Dialogue Rules
+
+**One question at a time** — never present multiple questions in a single message. Pick the most important unknown and ask about it. Do NOT combine questions in a single sentence or append follow-up questions with "and" or "or" (e.g., "Where does this run? And does it connect to external services?" is a violation — ask only the first question, then wait for the response before asking the next). This rule applies to ALL phases, including the extended design questions — ask one, send the message, wait for a response, then ask the next.
+
+**Confirmation over discovery** — when detection already answered an area, present the detected value and ask the user to confirm or correct it. Do not ask from scratch.
+
+**Skip confirmed areas** — if detection already answered an area with confidence, confirm briefly ("I see you're using pytest — is that the main test runner?") rather than asking from scratch.
+
+**Use "Tell me more about..."** to go deeper when an answer is vague or incomplete.
+
+**No rigid menus** — use open-ended questions with natural follow-ups rather than lettered option lists. Ask what the user does, not which letter they pick.
+
+### Confidence Routing
+
+Before asking each question, read the `## CONFIDENCE_CONTEXT` section from `$SCRATCHPAD` and route based on the dimension's confidence level:
+
+| Confidence level | Action |
+|-----------------|--------|
+| **high** | Skip the question entirely. Show a one-line summary: "Detected [value] — skipping [area] question." |
+| **medium** | Show pre-filled detected value: "I detected [value]. Does this look right? [Y/n]" — accept confirmation or correction. |
+| **low** (or missing) | Ask normally using the Question Guide below. |
+
+When CONFIDENCE_CONTEXT is absent or a dimension is missing, default to **low** (ask normally).
+Doc-folder-elevated confidence (from Phase 0.5) is already reflected in CONFIDENCE_CONTEXT — no special handling needed.
+
+### Non-Technical Path
+
+When `comfort_level` is `"non-technical"`, skip or default engineering-specific questions for non-technical users:
+
+| Area | Non-technical handling |
+|------|-----------------------|
+| commands | Use detected commands or defaults (`make test` / `make lint`); never ask about npm vs. Docker invocation style |
+| ci | Use detected CI workflow filename; skip deep CI trigger configuration questions |
+| enforcement | Apply recommended DSO defaults; skip technical gate configuration questions (linting tools, commit message conventions, coverage thresholds) |
+| design | Ask only the high-level UI question ("Does this project have a UI layer?"); skip WCAG standard selection and deep accessibility questions — default to WCAG AA |
+
+For non-technical users: confirm detected values rather than asking open-ended engineering questions. Show summaries, not prompts.
+
+### Question Guide by Area
+
+Work through each area in the checklist order, but adapt based on what detection already found.
+
+#### 1. stack
+
+Apply the Confidence Routing rules above (skip on `high`, confirm on `medium`, ask on `low`) for the **stack** dimension. When asking, cover: primary language and version, framework (if any), package manager, runtime target.
+
+If `package.json` was found, present the detected Node/JavaScript stack for confirmation:
+```
+I see a package.json — it looks like this is a [framework] project using Node [version]. Is that right? What version are you targeting, and is there anything about the runtime or package manager I should know?
+```
+
+If `pyproject.toml` was found, present the detected Python stack for confirmation:
+```
+I see a pyproject.toml — it looks like a Python project. What version are you targeting, and are you using poetry, pip, or something else?
+```
+
+For unknown stacks, ask openly:
+```
+What language and runtime is this project built on? And what's the primary framework or library, if any?
+```
+
+#### 2. commands
+
+Apply the Confidence Routing rules above for the **commands** dimension. When asking, cover: how to run tests, how to start the dev server, how to lint/format, any project-specific Makefile targets.
+
+Present detected test directories for confirmation:
+```
+I found these test directories: [TEST_DIRS]. How do you actually run the test suite — is there a make target, a script, or do you run the test runner directly?
+```
+
+#### 3. architecture
+
+Apply the Confidence Routing rules above for the **architecture** dimension. When asking, cover: top-level module layout, key service boundaries, any notable design patterns (event sourcing, CQRS, hexagonal, etc.), where the main entry point is.
+
+Ask openly:
+```
+How would you describe the top-level structure of this project — is it a single deployable unit, a monorepo, or something else? What's the main entry point?
+```
+
+#### 4. infrastructure
+
+Apply the Confidence Routing rules above for the **infrastructure** dimension. When asking, cover: where it runs (cloud provider, on-prem, local-only), databases used, external services or APIs it calls, how secrets are managed.
+
+Ask openly:
+```
+Where does this project run in production, and what external services or databases does it depend on? How are secrets managed?
+```
+
+#### 5. CI
+
+Apply the Confidence Routing rules above for the **ci** dimension. List the actual `.github/workflows/*.yml` filenames discovered in Step 1 to confirm the CI workflow name rather than asking the user to type it from memory.
+
+```
+I found these workflow filenames: [CI_WORKFLOWS]. Which one is your primary CI gate — the one that runs on pull requests?
+```
+
+If no workflows were found:
+```
+I don't see any CI workflows yet. What CI system are you planning to use, if any?
+```
+
+#### 6. design
+
+Apply the Confidence Routing rules above for the **design** dimension. When asking, cover: whether there is a UI layer, which framework/library is used, any established design system, accessibility targets.
+
+Ask openly:
+```
+Does this project have a UI or frontend layer? If so, what framework are you using and is there an established design system?
+```
+
+##### Design Questions: Conditional Activation (UI Projects Only)
+
+**If the answer is "No" (CLI tool, library, infrastructure, or backend-only project):** skip the deep design questions below and record "backend-only / no UI" in the design area of the scratchpad. Do NOT ask vision, archetype, or visual language questions — they are irrelevant for non-UI projects.
+
+**If the answer is "Yes" (project has a UI/frontend component):** continue with the following focused design questions. Ask them **one at a time** — send each question as a separate message and wait for the user's response before sending the next. Do NOT list multiple questions in a single message.
+
+1. **Vision**: "In one sentence, what is the specific value this UI delivers to the user? (e.g., 'Reduces tax filing time by 50% for freelancers')"
+
+2. **User archetypes**: "Describe 2–3 user archetypes — not just demographics, but behaviors. (e.g., 'The Panicked Auditor' who needs speed vs. 'The Relaxed Browser' who wants to explore)"
+
+3. **Golden paths**: "What are the top 1–2 workflows that must be frictionless? Walk me through the steps."
+
+4. **Anti-patterns**: "What should this UI explicitly avoid? (e.g., 'No pop-ups', 'No endless scrolling', 'No dark patterns')"
+
+5. **Visual language**: "Describe the intended visual feel in 3 adjectives. (e.g., 'Trustworthy, Dense, Clinical' or 'Playful, Round, Airy')"
+
+6. **Accessibility**: "What's your target accessibility standard — WCAG AA, WCAG AAA, or something else?"
+
+After completing these design questions (each answered in a separate turn), append findings to the scratchpad under a `## Design (Extended)` section.
+
+#### 7. enforcement
+
+Apply the Confidence Routing rules above for the **enforcement** dimension. When asking, cover: linting tools, commit message conventions, pre-commit hooks in use, code review requirements, test coverage policies.
+
+Present detected hooks for confirmation:
+```
+I see [.husky/pre-commit present / .pre-commit-config.yaml present / no hooks detected]. What enforcement tools are active — any linters, commit message conventions, or code review requirements a new contributor would need to know?
+```
+
+#### 7.5. DSO Ticket System Overview (preamble for sections 8 and 14)
+
+**Display once at the start of section 8** (or immediately before it fires) so the user has the context needed to answer the Jira and ticket-prefix prompts that follow. Skip this preamble only if the user has already worked with DSO in this repo (registry-derived) or has explicitly said "I know DSO already."
+
+```
+Before the next two questions: DSO ships with its own per-repo ticket tracker
+stored in an orphan `tickets` git branch under `.tickets-tracker/`. It runs
+on every project that uses DSO and does not require Jira.
+
+The next two prompts configure:
+  - Jira project key (optional) — how DSO's tickets sync OUTBOUND to Jira
+    if you use Jira. Decline and DSO still works fully on local tickets.
+  - Ticket prefix — short uppercase code that prefixes DSO's local ticket
+    aliases (e.g. "MA-1234"). It is NOT the Jira project key.
+
+DSO tickets are the source of truth in-repo; the Jira Bridge optionally
+mirrors them bidirectionally to a Jira project (one-way if Jira is read-only).
+```
+
+#### 8. Jira Bridge
+
+**MANDATORY PROMPT — always ask this question. Do NOT skip based on project type or assumptions.**
+
+Ask whether the project uses Jira and, if so, confirm the project key:
+
+```
+Does this project use Jira for issue tracking? If so, what's the Jira project key (e.g., "MYAPP" or "DSO")?
+```
+
+Display to user: "jira.project — records your Jira project key so DSO can sync tickets automatically."
+
+If the user provides a Jira project key, write `jira.project=<KEY>` to `.claude/dso-config.conf` and then **mention the full Jira reconciler surface** so the operator knows what to set up before the reconciler runs in CI. Do NOT bury this in a tooltip — print the block below verbatim:
+
+```text
+Jira reconciler configuration surface
+-------------------------------------
+Required environment variables (set in the GitHub repo and locally if you'll
+run the reconciler from your workstation):
+  - JIRA_URL                 Base URL of your Jira instance (https://...)
+  - JIRA_USER                Service-account email for ACLI authentication
+  - JIRA_API_TOKEN           Service-account ACLI API token (NEVER commit)
+  - JIRA_PROJECT             Project key — same as jira.project in config
+  - BRIDGE_ENV_ID            UUID identifying this reconciler environment;
+                             MUST be set (empty value fails fast). One UUID
+                             per logical project — generate via `uuidgen`.
+  - BRIDGE_USER_MAP          JSON map: {"email@example.com": "<jiraAccountId>"}
+                             Required for outbound assignee sync; lowercased
+                             key lookup is case-insensitive. Empty {} disables.
+
+Optional environment variables (defaults shown):
+  - BRIDGE_BOT_NAME          Author name used when the reconciler commits
+                             events back to the tickets branch.
+                             Default: `dso-bridge[bot]`.
+  - BRIDGE_BOT_EMAIL         Author email used when the reconciler commits
+                             events back to the tickets branch.
+                             Default: `dso-bridge@users.noreply.github.com`.
+  - GH_RUN_ID                CI run ID for traceability (auto-set in Actions)
+
+dso-config.conf keys for Jira sync:
+  - jira.project=<KEY>       Jira project key (written from this prompt)
+  - dso.workflow=<local|ci-pr>  ci-pr mode integrates with the CI llm-review
+                                workflow that the reconciler job depends on
+
+Operational artifacts (written by the reconciler, audit only):
+  - bridge_state/mapping.json                   local↔Jira identity mapping
+  - bridge_state/bootstrap/*.manifest.json      per-band reviewer attestations
+  - bridge_state/health/*.json                  per-pass health signals
+  - bridge_state/bridge_alerts/<date>.jsonl     daily JSONL alert log written
+                                                by alert_store.append. Each
+                                                line is a recoverable soft-fail
+                                                record (one mutation that the
+                                                pass logged and skipped instead
+                                                of aborting). Common kinds:
+                                                  outbound-update-assignee-unresolved
+                                                  fetcher-dedup-suppressed
+                                                  dso-id-label-invariant-violation
+  - .tickets-tracker/<id>/*-BRIDGE_ALERT.json   per-ticket alerts (unbounded
+                                                replay prevented via dedup_key)
+
+Cron cadence and mode:
+  - reconcile-bridge.yml runs every 20 minutes (`*/20 * * * *`) on schedule
+  - default mode is Mode.LIVE (uncapped writes); workflow_dispatch lets
+    operators select dry-run | bootstrap-strict (cap=10) | bootstrap-throttle
+    (cap=100) | live | validate
+  - first live run after enablement may produce a burst of mutations as
+    accumulated local drift flushes outbound
+
+Approved sync exceptions (NOT propagated, by design):
+  - ticket_type / issuetype           NOT synced in either direction. Local
+                                      types (epic/story/task/bug) don't map
+                                      cleanly to Jira's type taxonomy and
+                                      cross-hierarchy transitions are often
+                                      rejected by Jira workflows. Set the
+                                      type once on create; future changes
+                                      live locally only. (bug 36af)
+  - local ticket deletions            NOT propagated to Jira. Delete locally
+                                      then close/delete on the Jira side
+                                      manually if desired.
+  - assignee that doesn't match a     Soft-failed per mutation: logged to
+    real Jira account                 bridge_alerts/<date>.jsonl with kind
+                                      `outbound-update-assignee-unresolved`,
+                                      pass continues. Resolve by clearing
+                                      the local assignee or mapping it via
+                                      BRIDGE_USER_MAP. (bug 17b5)
+
+Label semantics:
+  - dso-id:<local_uuid>               canonical marker the reconciler writes
+                                      onto every Jira issue it creates;
+                                      identifies the local owner. Both
+                                      directions exclude dso-id:*, dso-id-*
+                                      (legacy hyphen form), and imported:*
+                                      from user-label diffs.
+  - local user labels propagate       outbound only when the local user
+                                      explicitly added them (via the local
+                                      event log). Labels acknowledged from
+                                      Jira via inbound apply are NOT
+                                      re-pushed (no echo loop). (bug a06c)
+
+Bidirectional flow (both sides can originate):
+  - Local -> Jira: a local ticket created via `dso ticket create` is
+    pushed outbound on the next reconcile pass; the reconciler writes
+    `dso-id:<local_uuid>` on the new Jira issue to dedupe future passes.
+  - Jira -> local: a Jira issue created directly in the Jira UI (or
+    via Linear sync, automation, etc.) that lacks the dso-id marker is
+    picked up by the snapshot-diff differ and materialized locally as
+    `jira-dig-<NNNN>` with the `imported:reconciler-bootstrap` tag; the
+    reconciler then writes the dso-id marker back to Jira so subsequent
+    passes recognize the issue as bound.
+  - End-to-end latency is the cron cadence (~20 minutes) in either
+    direction.
+
+Verification: after setting the env vars, run
+`python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ticket-bridge-fsck.py` (read-only
+audit; exits 0 when no anomalies, 1 otherwise — safe to run pre-bootstrap).
+For a live end-to-end check, trigger reconcile-bridge.yml via
+`gh workflow run reconcile-bridge.yml` and confirm the run exits 0 with
+ACLI authentication succeeding and the per-pass mutation count under
+the per-pass cap.
+
+Operational gaps still pending (none block enablement; affect blast radius):
+  - No in-pass kill switch yet — to pause, disable the workflow in GHA
+  - No alert routing yet — bridge_alerts JSONL is on disk only; no
+    Slack/dashboard/PR-comment destination
+  - LIVE mode is uncapped — bootstrap-throttle (cap=100) is the most
+    conservative mode an operator can pin via workflow_dispatch
+  - Monitoring: pair Reconcile Bridge with the Reconcile Bridge Canary
+    workflow (reconcile-bridge-canary.yml, 2h staleness threshold) to detect when the cron
+    stops succeeding
+
+Reference: the reconciler package ships under the dso plugin scripts dir —
+see the package docstring and each band module for behavior details.
+```
+
+Credentials (`JIRA_URL`, `JIRA_USER`, `JIRA_API_TOKEN`, and `BRIDGE_USER_MAP` for any internal email addresses) stay as environment variables — NEVER commit them. Only the project key goes in config.
+
+#### 9. Figma Design Collaboration
+
+**MANDATORY PROMPT — always ask this question. The user decides yes/no; the model does NOT pre-decide to skip.**
+*(Enables sprint-level design gating when Figma is used for UI collaboration.)*
+
+Ask whether the project uses Figma for design collaboration:
+
+```
+Does this project use Figma for design collaboration? (yes / no / skip)
+Note: credentials (FIGMA_PAT) stay as environment variables — only the feature flag goes in config.
+```
+
+Display to user: "design.figma_collaboration — enables Figma design integration. Your Figma token stays as an env var (FIGMA_PAT); only the enabled flag goes in config."
+
+On YES: write `design.figma_collaboration=true` to `.claude/dso-config.conf`.
+
+On no or skip: write `design.figma_collaboration=false` to `.claude/dso-config.conf` as an explicit disabled sentinel.
+
+#### 10. Confluence Documentation Space
+
+*(Optional placeholder — Confluence integration is coming soon. Recording the space key now avoids re-running onboarding later.)*
+
+Ask whether the project uses Confluence:
+
+```
+Does this project use Confluence for documentation? If so, what's the space key (e.g., "MYAPP" or "ENG")?
+(yes <KEY> / no / skip)
+```
+
+On YES: write `confluence.space_key=<KEY>` to `.claude/dso-config.conf`.
+
+On no or skip: write `confluence.enabled=false` to `.claude/dso-config.conf` as an explicit disabled sentinel.
+
+#### 11. Merge strategy
+
+**MANDATORY PROMPT — always ask. Apply the Confidence Routing rules above (default to ask normally).**
+
+Before asking, read `dso.workflow` from `.claude/dso-config.conf` (if present). If the key already exists, present the existing value as the prompt default. The chosen answer is always written to config in Phase 3 (Step 2b.1) — never silently kept.
+
+```
+Which workflow mode for this project?
+  (a) local (default — direct merge to main + local enforcement; suitable for solo or non-technical projects)
+  (b) ci-pr (GitHub Ruleset enforcement — PR-based merge with CI gate + attribution; suitable for team projects)
+
+Press Enter or type 'a' for local (recommended for most projects).
+```
+
+Record the choice in the scratchpad as `DSO_WORKFLOW=local` or `DSO_WORKFLOW=ci-pr`. On `ci-pr`, also note: the GitHub Ruleset will be provisioned during the `initial-commit` batch (GitHub bootstrap step). If a 'DSO CI Enforcement' Ruleset already exists on the repo, `github-bootstrap.sh` will exit with an error directing you to disable the Ruleset for the bootstrap window before retrying.
+
+**`ci-pr` reviewer verifier recommendation**: When `DSO_WORKFLOW=ci-pr`, recommend enabling the absence-claim verifier in the Phase 3 config write:
+
+```
+# Recommended for ci-pr workflows: enables the absence-claim verifier agent,
+# which filters false-positive findings before the autonomous resolution loop.
+review.verifier_enabled=true
+```
+
+Write this key to `.claude/dso-config.conf` when `DSO_WORKFLOW=ci-pr` and the key is not already present. For `local` mode, omit the key (verifier adds no value without a CI review pipeline).
+
+#### 12. CI trigger events
+
+**MANDATORY PROMPT — do NOT assume a PR-based workflow.** Apply the Confidence Routing rules above.
+
+```
+What events should trigger CI? Common options:
+- Pull request (on open, sync, reopen)
+- Push to specific branches (e.g., main, develop)
+- Manual dispatch only
+- Scheduled (cron)
+
+This affects ci.workflow_name and any generated workflow templates.
+```
+
+Record the answer in the scratchpad as `CI_TRIGGER_STRATEGY=<value>`. Phase 3 writes it to `dso-config.conf` and `project-understanding.md`.
+
+#### 13. Preplanning interactivity
+
+**MANDATORY PROMPT — operator preference.** Apply the Confidence Routing rules above.
+
+```
+When planning new features, would you like me to check in with you at key decisions, or should I run autonomously?
+(Options: "yes, check in" / "go ahead on your own" — default: check in with you)
+
+Checking in (default): /dso:preplanning pauses at key decisions to confirm story scope, done definitions, and decomposition with you.
+Running autonomously: /dso:preplanning runs without interruption — suitable for CI or batch workflows.
+```
+
+**Response normalization**:
+- yes / y / check in / pause → `true`
+- no / n / autonomous / go ahead → `false`
+- Empty / Enter → default `true`
+- Ambiguous → ask follow-up: "Just to confirm — would you like me to pause for confirmation (yes) or run without interruption (no)?"
+
+Record the answer in the scratchpad as `PREPLANNING_INTERACTIVE=true|false`. Phase 3 always overwrites the config with this value (exception to the general merge-not-overwrite rule, since the repo default is `false` and the operator must be able to flip it).
+
+#### 14. Ticket prefix confirmation
+
+**MANDATORY PROMPT.** Derive a default `tickets.prefix` from the project name by taking the first letter of each hyphen- or underscore-separated word and uppercasing them:
+
+- `my-app` → `MA`
+- `digital-service-orchestra` → `DSO`
+- `myapp` (single word) → first 2–3 characters uppercased → `MYA`
+
+Confirm the derived prefix. The prefix scopes DSO's per-repo ticket aliases (e.g. `MA-1234`) in the local `.tickets-tracker/` system covered in section 7.5. It is NOT the Jira project key (`jira.project`) — those are independent and can differ.
+
+```
+I'll use ticket prefix "MA" for this project (derived from "my-app").
+This prefix scopes DSO's local ticket aliases — it is independent of any
+Jira project key set in section 8.
+Does that work, or would you prefer a different prefix?
+```
+
+Record the confirmed prefix in the scratchpad as `TICKET_PREFIX=<value>`. Phase 3 writes it to `dso-config.conf`.
+
+### Phase 2 Gate
+
+When all 7 core areas (stack, commands, architecture, infrastructure, CI, design, enforcement) have at least a basic answer recorded in the scratchpad, AND sections 8–14 (Jira, Figma, Confluence, merge strategy, CI trigger, preplanning interactivity, ticket prefix) have been asked, ask:
+
+```
+I now have a working model of the project across all 7 core areas, plus the integration and operator-preference questions. Is there anything important I missed — any constraint, convention, or quirk that a new team member would need to know?
+```
+
+Note: sections 8 (Jira), 9 (Figma), and 10 (Confluence) — and continuing through 14 — are mandatory prompts that happen to come after the 7 core areas. "Optional" means the user may decline; it does NOT mean the model may skip asking. The gate requires all 14 sections asked.
+
+Wait for the user's response before proceeding to Phase 3.
+
+---
+
+## Phase 3: Completion (/dso:onboarding)
+
+At the start of this phase, read the `## PHASE_PLAN` section from `$SCRATCHPAD`. Count total entries (Y). This is the final phase, so N = Y. Display to user: **(Phase N of Y)** — e.g. `(Phase 3 of 3)` or `(Phase 6 of 6)`.
+
+**Goal:** Summarize the findings and hand off to the next step.
+
+### Step 0: Snapshot Pre-Onboarding Init State (/dso:onboarding) (bug 7d25-c78e)
+
+Persist a pre-onboarding init signal to `$SCRATCHPAD` before Step 2b writes `dso-config.conf` (and before any code path including `dso-setup.sh` writes `.claude/CLAUDE.md`). the `scaffold-claude-structure` batch reads this from `$SCRATCHPAD` — shell exports do not persist across the skill's separately-evaluated bash blocks; live file checks at scaffold-claude-structure time are unreliable because intervening steps mutate the same files.
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+[[ -f "$REPO_ROOT/.claude/CLAUDE.md" && -f "$REPO_ROOT/.claude/dso-config.conf" ]] \
+    && _INIT="true" || _INIT="false"
+grep -q "^## INITIAL_DSO_STATE" "$SCRATCHPAD" \
+    || printf '\n## INITIAL_DSO_STATE\n_INITIAL_DSO_INSTALLED=%s\n' "$_INIT" >> "$SCRATCHPAD"
+```
+
+### Step 1: Present Understanding Summary
+
+Compile the scratchpad into a readable summary:
+
+```
+=== Project Understanding Summary ===
+
+**Stack**: [language/version, framework, package manager]
+**Commands**: [test command, lint command, dev server command]
+**Architecture**: [brief description]
+**Infrastructure**: [hosting, databases, external services]
+**CI**: [provider, key gates]
+**Design**: [UI framework/design system, or "backend-only"]
+**Enforcement**: [hooks, lint tools, review requirements]
+
+Any corrections before I finalize this?
+```
+
+Wait for the user to confirm or correct. Update the scratchpad with any corrections.
+
+### Step 1.5: Artifact Review Before Writing
+
+Artifact review and approval happens **once at the `config-write` batch boundary**, not per file. Do NOT ask for per-artifact approval inside a batch group. When the `config-write` approval prompt fires, present a consolidated summary of all artifacts to be written in that group, then wait for a single approval before writing any of them.
+
+- **For existing files** (such as `.claude/dso-config.conf` or `CLAUDE.md`), include a diff of existing content vs. proposed changes (lines being added, changed, or removed) in the consolidated Group 3 summary so the user can verify nothing is silently overwritten.
+- One approval covers the entire group. Proceed to write all artifacts in the group without pausing between them.
+
+## Batch: config-write
+<!-- Skip guard: if all config files already exist with current content, skip -->
+
+### Step 2: Write .claude/project-understanding.md
+
+After the user confirms the summary (or provides corrections), write the findings to a structured, human-readable artifact using the Write tool. This file is the lasting record of everything the onboarding conversation learned.
+
+**Attribution convention:**
+- Mark each finding as `(detected)` when it came from `project-detect.sh` or automated discovery.
+- Mark each finding as `(user-stated)` when it came from a direct user answer during the dialogue.
+
+The file is **human-readable and editable** — the user can update it at any time without re-running onboarding.
+
+Write `.claude/project-understanding.md` using this template:
+
+```markdown
+# Project Understanding
+<!-- Generated by /dso:onboarding — human-readable and editable. Last updated: <date> -->
+
+## Stack
+- Language/runtime: <value> (detected|user-stated)
+- Framework: <value> (detected|user-stated)
+- Package manager: <value> (detected|user-stated)
+- Runtime versions: <value> (detected|user-stated)
+
+## Architecture
+- Structure: <monolith|monorepo|microservices|plugin|other> (detected|user-stated)
+- Module layout: <description> (user-stated)
+- Key design patterns: <description> (user-stated)
+- Entry point: <path or description> (detected|user-stated)
+
+## Design Summary
+- UI layer: <yes/no and description, or "backend-only"> (user-stated)
+- UI framework: <value or "N/A"> (user-stated)
+- Design system: <value or "none"> (user-stated)
+- Accessibility targets: <value or "not specified"> (user-stated)
+
+## Commands
+- Test: <command> (detected|user-stated)
+- Lint: <command> (detected|user-stated)
+- Format: <command> (detected|user-stated)
+- Dev server: <command or "N/A"> (user-stated)
+- Build: <command or "N/A"> (detected|user-stated)
+
+## Infrastructure
+- Hosting: <provider or "local-only"> (user-stated)
+- Databases: <list or "none"> (user-stated)
+- External services: <list or "none"> (user-stated)
+- Secrets management: <approach or "not specified"> (user-stated)
+
+## CI
+- Provider: <value or "none"> (detected|user-stated)
+- Pipeline stages: <description> (user-stated)
+- Test gates: <description> (detected|user-stated)
+- Deployment triggers: <description or "not specified"> (user-stated)
+
+## Enforcement
+- Pre-commit hooks: <list or "none"> (detected|user-stated)
+- Linting tools: <list> (detected|user-stated)
+- Commit message convention: <description or "none"> (user-stated)
+- Review requirements: <description or "none"> (user-stated)
+- Test coverage policy: <description or "none"> (user-stated)
+
+## Additional Notes
+<!-- Anything the user flagged as important that doesn't fit above -->
+<notes from Phase 2 Gate response, or "none">
+```
+
+Populate each field from the scratchpad. Use the appropriate `(detected)` or `(user-stated)` tag for each entry. Leave fields as "not specified" or "N/A" where the conversation produced no answer — do not fabricate.
+
+### Step 2a: Write DESIGN.md (branch — UI projects only)
+
+**Trigger**: The design-area conversation in Phase 2 confirmed a UI/frontend layer. Skip for CLI tools, libraries, infrastructure, or backend-only projects.
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/3-conditional-paths.md` (Step 4 section) and follow it.
+
+### Step 2b: Generate dso-config.conf
+
+Display to user: "dso-config.conf — the workflow settings file that tells DSO how your project is structured (stack, test commands, CI setup). Written to .claude/dso-config.conf."
+
+After writing `.claude/project-understanding.md`, generate a starter `.claude/dso-config.conf` from the conversation findings. This file configures DSO for the host project.
+
+#### Detect and Merge with Existing Config
+
+Before writing any values, check whether a `.claude/dso-config.conf` already exists:
+
+```bash
+EXISTING_CONFIG="$REPO_ROOT/.claude/dso-config.conf"
+if [ -f "$EXISTING_CONFIG" ]; then
+    # Detect existing config — merge new keys, do NOT overwrite existing values
+    EXISTING_CONTENT=$(cat "$EXISTING_CONFIG")
+fi
+```
+
+If an existing dso-config.conf is found, merge the new keys into it rather than overwriting. Only add keys that are not already present. Existing config values take precedence — do not overwrite them unless the user explicitly confirms the new value.
+
+#### Deprecated key auto-migration: `merge.ci_workflow_name` → `ci.workflow_name` (branch)
+
+**Trigger**: The deprecated `merge.ci_workflow_name` key is present in the existing config.
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/3-conditional-paths.md` (auto-migration section) and follow it. Both key names (`merge.ci_workflow_name` and `ci.workflow_name`) are wire-format identifiers preserved across the migration — never delete one without the other being present.
+
+#### Per-Stack Command Defaults
+
+When writing initial config, use these per-stack defaults if the config key is absent:
+
+| Stack | commands.lint | commands.format | commands.format_check |
+|-------|--------------|-----------------|----------------------|
+| python-poetry | `poetry run ruff check .` | `poetry run ruff format .` | `poetry run ruff format --check .` |
+| node-npm / node-yarn | `npx eslint --no-error-on-unmatched-pattern .` | `npx prettier --write .` | `npx prettier --check .` |
+| ruby / ruby-bundler | `bundle exec rubocop` | `bundle exec rubocop --autocorrect` | `bundle exec rubocop --format simple` |
+| go | `go vet ./...` | `gofmt -w .` | `gofmt -l .` |
+
+These defaults preserve existing behavior for Python-poetry projects and add first-class support for Node.js, Ruby, and Go projects.
+
+**Key-presence skip rule**: If a key already exists in the config with a non-empty value, do NOT overwrite it. Emit `[DSO INFO] commands.lint already set — skipping` (or the equivalent for `commands.format` / `commands.format_check`) and leave the existing value intact. An empty string is treated as not-set and triggers the per-stack default.
+
+**Ordering constraint**: Always write `commands.test_runner` before `commands.lint`, `commands.format`, and `commands.format_check`. Stack detection populates the test runner; lint/format defaults depend on the confirmed stack and should follow.
+
+#### Required Config Keys
+
+Generate all of the following config keys (flat `KEY=VALUE` format). For each key that cannot be auto-detected, apply the fallback behavior described below.
+
+**DSO plugin location** (optional — auto-resolved by the shim in most cases):
+
+The shim resolves the plugin root in this priority order:
+1. `$CLAUDE_PLUGIN_ROOT` env var (never committed; set per-developer if needed)
+2. `dso.plugin_root` config key (only write this for non-standard install paths)
+3. Auto-detect the marketplace cache under `$HOME/.claude/` via sentinel (home install)
+4. Self-detect the in-repo plugin directory via sentinel `.claude-plugin/plugin.json` (in-repo install)
+
+**Plugin root key rules by install location:**
+- **Marketplace cache (`$HOME/.claude/plugins/marketplaces/.../dso`)**: omit the key — the shim's step (2.5) sentinel auto-detects it. Writing the path encodes the developer's `$HOME` and breaks other developers.
+- **In-repo vendored install (plugin directory is inside the repo)**: use a repo-relative path (e.g., `dso.plugin_root=<repo-relative-path-to-plugin>`). Repo-relative paths work for all clones.
+- **Out-of-repo install (shared location, sibling checkout, `/opt/...`)**: use an absolute path. These paths are typically machine-specific and should only be committed if all developers share the same path (e.g., a CI image with a known install location).
+- **Developer-local absolute paths** (e.g., `/Users/<name>/...`): never commit — they work only on the installing developer's machine.
+
+**Format settings** (detected from stack):
+```
+format.extensions=<e.g., .py or .ts,.js>
+format.source_dirs=<e.g., src or app,lib>
+```
+
+Detect from `package.json` (TypeScript/JavaScript) or `pyproject.toml` (Python) if present.
+
+**Test gate** (detected from test directory scan):
+```
+test_gate.test_dirs=<e.g., tests or test,spec>
+```
+
+Populate from the `$TEST_DIRS` variable discovered in Phase 1 auto-detection.
+
+**Validate command** (composed from detected test/lint/format commands):
+```
+commands.validate=<e.g., make test || poetry run pytest || npm test>
+```
+
+Compose from the test and lint commands confirmed in the commands area of Phase 2.
+
+**Tickets and checkpoints** (use documented defaults):
+```
+tickets.directory=.tickets-tracker
+checkpoint.marker_file=.checkpoint-pending-rollback
+```
+
+**Behavioral patterns** (semicolon-delimited globs based on project structure):
+```
+# Semicolon-delimited glob patterns for review behavioral analysis
+review.behavioral_patterns=<e.g., src/**/*.py;tests/**/*.py;*.sh>
+```
+
+Generate from the detected source and test directories. The value is semicolon-delimited — multiple glob patterns separated by `;` with no spaces around the semicolons.
+
+**CI workflow name** (confirmed from actual workflow filenames):
+
+Use the workflow filenames discovered in Phase 1 (`$CI_WORKFLOWS`) to confirm the `ci.workflow_name`. Present the actual filenames rather than asking the user to type a name from memory:
+```
+# CI workflow filename confirmation
+ci.workflow_name=<filename confirmed from .github/workflows/ scan>
+```
+
+**CI job and integration workflow keys** (populated from `project-detect.sh` `ci_workflow_names` output):
+
+```
+ci.fast_gate_job=<job name for fast gate — e.g., lint-and-unit>
+ci.fast_fail_job=<job name for fast-fail gate — e.g., fast-fail>
+ci.test_ceil_job=<job name for test ceiling — e.g., test-all>
+ci.integration_workflow=<integration workflow filename from ci_workflow_names>
+```
+
+> **Key distinction**: `ci.workflow_name` is the primary CI workflow used by `merge-to-main.sh` for `gh workflow run` (CI trigger recovery). `ci.integration_workflow` identifies the integration test workflow for `/dso:sprint` Phase G verification. They may reference the same file or different ones.
+
+Populate these keys from the `ci_workflow_names` (comma-separated) and `ci_workflow_confidence` (high|low) output of `project-detect.sh`.
+
+#### Confidence-Gated CI Workflow Selection
+
+After running `project-detect.sh`, inspect `ci_workflow_confidence` and `ci_workflow_names`:
+
+**When `ci_workflow_confidence=high` AND `ci_workflow_names` contains exactly one entry**: skip the clarification dialogue — use the single detected workflow filename as `ci.integration_workflow` without asking.
+
+**When `ci_workflow_confidence=low` OR `ci_workflow_names` contains 2+ comma-separated entries (branch)**: load `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/3-conditional-paths.md` (multi-workflow CI selection section) and follow it to present the numbered selection dialogue and populate `ci.integration_workflow` plus CI job keys (`ci.fast_gate_job`, `ci.fast_fail_job`, `ci.test_ceil_job`).
+
+> **CI LLM review — classifier-driven tier selection**: The CI review job selects the reviewer tier automatically per-PR based on the complexity classifier score (0–2 → light/haiku, 3–6 → standard/sonnet, 7+ → deep/opus). Tier selection is fully automatic — there is no manual override environment variable. `ci.dso_plugin_version` lets projects override the DSO plugin version used in CI LLM review without editing the workflow file (Tier 2 of the 3-tier version resolution chain). `DSO_ASSETS_DIR` is a CI environment variable required in host-project CI when running `ci-llm-review-runner.sh` outside the DSO source checkout (the script is a shim in S3+; delegates to `python3 -m dso_ci_review.runner`). See `${CLAUDE_PLUGIN_ROOT}/docs/CONFIGURATION-REFERENCE.md` for full details.
+
+**Additional categories to populate**:
+
+| Category | Keys to set | Source |
+|----------|-------------|--------|
+| `format` | `format.line_length`, `format.indent` | Enforcement answers |
+| `ci` | `ci.workflow_name`, `ci.fast_gate_job`, `ci.fast_fail_job`, `ci.test_ceil_job`, `ci.integration_workflow` | Confirmed from workflow filenames + `ci_workflow_names` detection (`ci.workflow_name` replaces deprecated `merge.ci_workflow_name`; see auto-migration above) |
+| `commands` | `commands.test`, `commands.lint`, `commands.format`, `commands.format_check` | Commands area answers |
+| `dso.workflow` | `dso.workflow` (write `local` or `ci-pr` per Phase 2 section 11 answer; idempotent — skip if key already present; on `ci-pr`, the GitHub Ruleset is provision-ruleset during the `initial-commit` batch via `github-bootstrap.sh`) | Phase 2 workflow strategy dialogue answer |
+| `jira` | `jira.project` (if Jira integration desired) | User-stated |
+| `design` | `design.system_name`, `design.component_library` | Design area answers |
+| `tickets` | `tickets.prefix` | Derived from project name (see below) |
+| `version` | `version.file_path` | Detected from `version_files` output or user-stated |
+| `stack` | `stack` | Detected from `detect-stack.sh` output |
+| `test` | `test.suite.<name>.command`, `test.suite.<name>.speed_class` | Commands + detection |
+
+#### version.file_path — Detection from version_files
+
+Populate `version.file_path` from the `version_files` key emitted by `project-detect.sh`. The `version_files` output is a comma-separated list of file paths relative to the project root.
+
+**When `version_files` contains exactly one path**: write that path directly to `version.file_path`:
+```
+version.file_path=package.json
+```
+
+**When `version_files` contains 2 or more paths**: present a numbered selection dialogue so the user can choose the canonical version file:
+```
+I found multiple version files in this project:
+  1. package.json
+  2. pyproject.toml
+
+Which file is the single source of truth for the project version? [1/2]
+```
+Write only the selected repo-root-relative path to `version.file_path`.
+
+**When `version_files` is empty or absent**: omit `version.file_path` from the config and add an explanatory comment:
+```
+# version.file_path — not detected; set to the file that carries your project version
+# Example: version.file_path=package.json
+```
+
+#### stack — Detection from detect-stack.sh
+
+Populate the `stack` config key from the `$STACK_OUT` variable detected in Phase 1 (via `detect-stack.sh`). This value is already available in the scratchpad:
+```
+stack=<value from STACK_OUT — e.g., python, node, ruby-rails, unknown>
+```
+
+If `STACK_OUT` is `"unknown"`, write `stack=unknown` and note that the user can update it after framework installation or manual configuration.
+
+#### Fallback Behavior for Undetected Config
+
+When a config key cannot be auto-detected and the user does not provide a value, apply this fallback priority:
+
+1. **Prompt user** — ask one focused question to get the value
+2. **Documented default** — if a well-known default exists (e.g., `tickets.directory=.tickets-tracker`), use it and note it was defaulted
+3. **Omit with explanatory comment** — if no default is safe to assume, omit the key and add an explanatory comment in the config file:
+
+```
+# commands.validate — could not be auto-detected; set to your validation command
+# Example: commands.validate=make test
+```
+
+Never silently skip a required key — always leave a comment so the user knows what to fill in.
+
+#### Ticket prefix
+
+Write the `TICKET_PREFIX` value captured in Phase 2 question 14 to `tickets.prefix` in `.claude/dso-config.conf`. No mid-stream prompt — the value was already confirmed in Phase 2.
+
+#### CI workflow examples
+
+When the conversation reveals **no `.github/workflows/` files exist**, offer example workflow templates before prompting for workflow names:
+
+```
+I don't see any CI workflows yet. Would you like me to create starter workflows?
+I can generate:
+- ci.yml — fast-gate tests on pull requests
+- ci-slow.yml — slow/integration tests on push to main
+- both, or skip if you plan to set up CI manually
+
+Accepted examples will be auto-populated into dso-config.conf and generated
+via ci-generator.sh using the test suites discovered during onboarding.
+```
+
+If the user accepts, invoke `ci-generator.sh` via the detected test suite list from `project-detect.sh` — do not prompt for workflow names separately.
+
+#### ACLI_VERSION auto-suggestion
+
+When the project uses Claude Code (Claude CLI / `acli`), suggest the current version and checksum automatically by running:
+
+```bash
+bash "$REPO_ROOT/.claude/scripts/dso" onboarding/acli-version-resolver.sh 2>/dev/null
+```
+
+If the script is unavailable or returns non-zero, fall back to a WebFetch of the latest release from the acli releases endpoint. Present the suggestion as a pre-filled config value:
+
+```
+Suggested ACLI_VERSION: 1.x.y  (resolved via acli-version-resolver.sh)
+Suggested ACLI_SHA256: <checksum>
+
+Accept these values? [Y/n]
+```
+
+Write `commands.acli_version` and `commands.acli_sha256` to `.claude/dso-config.conf` on acceptance.
+
+### Step 2b.1: dso.workflow
+
+For new projects, write `dso.workflow=<value>` to `.claude/dso-config.conf` using the output of `detect-dso-workflow.sh`. Do NOT write legacy config keys for new projects — only write `dso.workflow`. See `${CLAUDE_PLUGIN_ROOT}/scripts/migrate-dso-workflow-config.sh` for the list of deprecated keys that must not be used. # shim-exempt: internal script documentation reference, not an invocation
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+_PLUGIN_SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+DSO_WORKFLOW=$(bash "$_PLUGIN_SCRIPTS/onboarding/detect-dso-workflow.sh" "$REPO_ROOT" 2>/dev/null || echo "local")
+echo "dso.workflow=$DSO_WORKFLOW" >> "$EXISTING_CONFIG"
+```
+
+The written line must use bare `KEY=VALUE` format with LF line endings, no inline comments on the value line, and no quotes around the value. On `DSO_WORKFLOW=ci-pr`, the GitHub Ruleset is provisioned during the `initial-commit` batch (`github-bootstrap.sh` → `provision-ruleset.sh`); if a 'DSO CI Enforcement' Ruleset already exists on the repo, the bootstrap will exit with an error directing the operator to disable the existing Ruleset before retrying.
+
+### Step 2c: Infrastructure Initialization
+
+After writing `.claude/dso-config.conf`, set up the supporting infrastructure for the host project. These steps ensure the enforcement gates, ticket system, and documentation templates are in place before the first commit.
+
+## Batch: scaffold-claude-structure
+<!-- Skip guard: if .claude/ structure already present and shim already installed, skip -->
+
+#### DSO Shim Installation
+
+Display to user: "Installing the DSO shim — a short command-line shortcut (.claude/scripts/dso) that routes all DSO operations to the plugin scripts. You will use this for running tickets, tests, and merges."
+
+Before any other infrastructure steps, install the `.claude/scripts/dso` shim that all subsequent commands depend on.
+
+Branch on the `_INITIAL_DSO_INSTALLED` signal persisted in `$SCRATCHPAD` by Phase 3 Step 0:
+- **true** — host was previously onboarded → `update-shim.sh` (file-copy only, idempotent).
+- **false** — fresh init → `dso-setup.sh` (full init: config supplements, CLAUDE.md, KNOWN-ISSUES.md, CI skeleton, pre-commit, hook registration, artifact stamps, gitignore). Do NOT run `dso-setup.sh` on an already-onboarded host — it is NOT idempotent across these artifact installs.
+
+The shim template lives at `${CLAUDE_PLUGIN_ROOT}/templates/host-project/dso`; both scripts consume it.
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+PLUGIN_SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+if [[ ! -f "${CLAUDE_PLUGIN_ROOT}/templates/host-project/dso" ]]; then
+    echo "ERROR: shim template missing at ${CLAUDE_PLUGIN_ROOT}/templates/host-project/dso" >&2
+    exit 1
+fi
+# Read the snapshot persisted by Phase 3 Step 0 (scratchpad — shell exports do not
+# persist across separately-evaluated bash blocks in this skill).
+INITIAL_INSTALLED=$(grep -E "^_INITIAL_DSO_INSTALLED=" "$SCRATCHPAD" 2>/dev/null \
+    | tail -1 | cut -d= -f2)
+if [[ "${INITIAL_INSTALLED:-false}" == "true" ]]; then
+    bash "$PLUGIN_SCRIPTS/update-shim.sh" "$REPO_ROOT"  # shim-exempt: bootstrap repair
+else
+    bash "$PLUGIN_SCRIPTS/onboarding/dso-setup.sh" "$REPO_ROOT" "${CLAUDE_PLUGIN_ROOT}"  # shim-exempt: bootstrap install
+fi
+```
+
+## Batch: initial-commit
+<!-- Skip guard: if all artifacts already committed, skip -->
+
+#### Hook Installation
+
+**ORDERING CONSTRAINT — hooks MUST be installed LAST, after all other onboarding artifacts have been committed.** Installing hooks before the initial commit creates a bootstrap deadlock: the review gate requires a passing review, but the review system depends on the files being committed. The correct sequence is:
+
+1. Write all artifacts (project-understanding.md, dso-config.conf, CLAUDE.md, .semgrep.yml, etc.)
+2. Create the initial commit containing those artifacts (hooks are not yet active — this commit succeeds)
+3. Install hooks after the initial commit completes
+
+Do NOT install hooks earlier in Step 2c, even if the install step appears earlier in the instructions above. Hook installation is always the final infrastructure action.
+
+## Batch: hook-install
+<!-- Skip guard: if hooks already installed, skip -->
+<!-- hook-install: bypass-gates -->
+
+**Bypass note:** The hook installation commit uses `--no-verify` to skip the review and test gates. This is intentional and safe: hooks are pre-built plugin components, not custom project code, so there is no meaningful review to perform at this step. The gates are not yet active prior to this commit, and bypassing them here is the designed bootstrap sequence. This does NOT set a precedent for bypassing gates on project code changes.
+
+**Reliability note:** If onboarding is interrupted after group 4 but before group 5 completes, re-running `/dso:onboarding` will detect that artifacts are committed but hooks are not installed, and will resume from group 5.
+
+**Git state validation:** Before committing hook artifacts, verify there is something to commit:
+
+```bash
+if git diff --quiet && git diff --staged --quiet; then
+    echo "No hook artifacts to commit — skipping hook-install commit."
+else
+    git add -A
+    git commit --no-verify -m "chore: install DSO pre-commit hooks"
+fi
+```
+
+Display to user: "Installing pre-commit hooks — automated quality checks that run before each git commit to verify tests pass and code has been reviewed. Required for the DSO enforcement pipeline."
+
+Install the DSO git pre-commit hooks (`pre-commit-test-gate.sh` and `pre-commit-review-gate.sh`) into the project's hooks directory. Hook installation must account for the detected hook manager:
+
+**Detect hook manager and install accordingly:**
+
+1. **Husky** — if `.husky/` exists, add DSO hook calls to `.husky/pre-commit` (create if absent). **Idempotency**: check whether the hook call already exists before appending to avoid duplicates on re-run:
+   ```bash
+   HOOKS_DIR="$REPO_ROOT/.husky"
+   grep -qF 'pre-commit-test-gate' "$HOOKS_DIR/pre-commit" 2>/dev/null || \
+     echo 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-test-gate.sh"' >> "$HOOKS_DIR/pre-commit"
+   grep -qF 'pre-commit-review-gate' "$HOOKS_DIR/pre-commit" 2>/dev/null || \
+     echo 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-review-gate.sh"' >> "$HOOKS_DIR/pre-commit"
+   ```
+
+2. **pre-commit framework** — if `.pre-commit-config.yaml` exists, add DSO hooks as local hooks in the config.
+
+3. **Bare `.git/hooks/`** — if neither Husky nor the pre-commit framework is detected, install directly into the git hooks directory. Use `git rev-parse --git-common-dir` to find the correct hooks path (supports worktrees and submodules where `.git` may be a file rather than a directory):
+   ```bash
+   GIT_COMMON_DIR=$(git rev-parse --git-common-dir)
+   HOOKS_DIR="$GIT_COMMON_DIR/hooks"
+   cp "${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-test-gate.sh" "$HOOKS_DIR/pre-commit-test-gate"
+   cp "${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-review-gate.sh" "$HOOKS_DIR/pre-commit-review-gate"
+   # Ensure the pre-commit hook calls both
+   PRECOMMIT_HOOK="$HOOKS_DIR/pre-commit"
+   if [[ ! -f "$PRECOMMIT_HOOK" ]]; then
+       echo '#!/usr/bin/env bash' > "$PRECOMMIT_HOOK"
+       chmod +x "$PRECOMMIT_HOOK"
+   fi
+   echo 'bash "$(git rev-parse --git-common-dir)/hooks/pre-commit-test-gate"' >> "$PRECOMMIT_HOOK"
+   echo 'bash "$(git rev-parse --git-common-dir)/hooks/pre-commit-review-gate"' >> "$PRECOMMIT_HOOK"
+   ```
+
+**lint-staged guard (1c71-2e90):** If adding `npx lint-staged` to any pre-commit hook (Husky or bare), first verify that lint-staged is configured — check for a `"lint-staged"` key in `package.json` or a `.lintstagedrc` / `lint-staged.config.js` file. If no lint-staged configuration exists, do NOT add the `npx lint-staged` call to the hook without also adding a configuration. Either (a) ask the user what linters to run on staged files and add a `"lint-staged"` key to `package.json`, or (b) skip the lint-staged hook call entirely. Adding `npx lint-staged` without configuration causes silent no-op pre-commit hooks.
+
+After hook installation, confirm with the user which hook manager was used and where the hooks were installed.
+
+#### Ticket System Initialization
+
+**Git repository guard:** Before running any ticket system init commands, verify this is an initialized git repository. If not, skip this section and warn the user:
+
+```bash
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "WARNING: Not a git repository. Run 'git init' first, then re-run /dso:onboarding to initialize the ticket system."
+    # skip ticket system init — cannot create orphan branch without git
+fi
+```
+
+If the git guard passes, initialize the DSO ticket system by creating an orphan branch and setting up the `.tickets-tracker/` directory:
+
+```bash
+# Create orphan branch for ticket event storage
+cd "$REPO_ROOT"
+# Capture staged files before orphan checkout clears the index
+_STAGED_BEFORE=$(git diff --name-only --cached 2>/dev/null || true)
+git checkout --orphan tickets
+git rm -rf . --quiet 2>/dev/null || true
+mkdir -p .tickets-tracker
+echo "# DSO Ticket System" > .tickets-tracker/README.md
+git add .tickets-tracker/README.md
+git commit -m "chore: initialize ticket system"
+git checkout -  # return to previous branch
+# Re-stage only the files that were staged before the orphan checkout
+# (do NOT use git add -A which would stage untracked application code)
+# Use while/read with IFS= to handle filenames with spaces safely
+if [ -n "$_STAGED_BEFORE" ]; then
+    while IFS= read -r _staged_file; do
+        [ -n "$_staged_file" ] && git add -- "$_staged_file"
+    done <<< "$_STAGED_BEFORE"
+fi
+```
+
+**Push verification:** After creating the orphan branch, push it to the remote and verify push success. If the push fails, warn the user:
+
+```bash
+if git push origin tickets 2>&1; then
+    echo "Ticket system initialized and pushed successfully."
+else
+    echo "WARNING: push to origin tickets failed. The ticket system is initialized locally but not synced to remote. Run 'git push origin tickets' when remote access is available."
+fi
+```
+
+#### Prettier ignore configuration (branch — Prettier projects only)
+
+**Trigger**: Host project uses Prettier (any of `.prettierrc`, `.prettierrc.json`, `.prettierrc.js`, `prettier.config.js`, `.prettierignore`).
+
+**Load**: `${CLAUDE_PLUGIN_ROOT}/skills/onboarding/phases/3-conditional-paths.md` (Prettier ignore section) and follow it to add the ticket-tracker and UI-discovery-cache directories to `.prettierignore`.
+
+#### Ticket Smoke Test
+
+After initialization, perform a ticket smoke test to verify the system works end-to-end. Create a test ticket and read it back. Note: in production workflows, before closing a bug with `Fixed:`, invoke the bug classifier (3-step): dispatch `bug-classifier-haiku` sub-agent with the ticket ID → extract slug → `CLASSIFIER_OUTPUT=<slug> .claude/scripts/dso classify-bug-at-closure.sh <ticket-id> "Fixed:"`
+
+```bash
+# Smoke test: create and read a ticket
+TEST_ID=$(.claude/scripts/dso ticket create task "DSO smoke test — delete me" 2>/dev/null | tail -1)
+if [[ -n "$TEST_ID" ]]; then
+    .claude/scripts/dso ticket show "$TEST_ID" > /dev/null 2>&1 && echo "Ticket smoke test PASSED (id: $TEST_ID)" || echo "WARNING: ticket smoke test failed — show returned non-zero"
+    .claude/scripts/dso ticket transition "$TEST_ID" open closed --reason="Fixed: smoke test cleanup" 2>/dev/null
+else
+    echo "WARNING: ticket smoke test failed — could not create test ticket"
+fi
+```
+
+#### GitHub Repository Configuration
+
+After the ticket system is initialized, configure the GitHub repository with CI enforcement. This step pushes the CI workflow file to the main branch first (chicken-and-egg ordering: the workflow must be on main before the Ruleset can require its status checks), then provisions the Ruleset.
+
+Display to user: "Configuring GitHub repository with CI workflow and Ruleset enforcement..."
+
+```bash
+PLUGIN_SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+bash "$PLUGIN_SCRIPTS/onboarding/github-bootstrap.sh"  # shim-exempt: bootstrap install — shim may not yet exist
+```
+
+**Fail-open guarantee**: `github-bootstrap.sh` exits 0 in all pre-flight failure cases (missing `gh` CLI, insufficient permissions, missing `.github/required-checks.txt`, network errors). It emits a warning with manual instructions when it cannot complete the setup automatically. Onboarding **must continue** regardless of the outcome of this step.
+
+**Skip condition**: This step is a no-op if no GitHub remote is configured or if the Ruleset already exists — `github-bootstrap.sh` detects both conditions and exits 0 silently.
+
+#### Generate Test Index
+
+If test directories were detected during Phase 1 auto-detection, run `generate-test-index.sh` to build the initial `.test-index` file mapping source files to test files:
+
+```bash
+PLUGIN_SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+if [[ -n "$TEST_DIRS" ]]; then
+    bash "$PLUGIN_SCRIPTS/generate-test-index.sh" "$REPO_ROOT" 2>/dev/null && \  # shim-exempt: internal orchestration script
+        echo "Test index generated." || \
+        echo "NOTE: generate-test-index.sh unavailable — create .test-index manually if needed."
+fi
+```
+
+#### Generate CLAUDE.md
+
+Generate a `CLAUDE.md` at the HOST PROJECT root (not the plugin's `CLAUDE.md`) using the `/dso:generate-claude-md` skill. This file should include:
+- Project-specific defaults drawn from `project-understanding.md` and `dso-config.conf`
+- Ticket command references (the ticket commands table: create, show, list, transition, etc.)
+- CI trigger strategy notes from the onboarding conversation (do NOT assume PR-based workflow)
+
+```
+Invoke: /dso:generate-claude-md
+```
+
+The generated `CLAUDE.md` must include a Quick Reference table of ticket commands so that future Claude sessions can manage work items without re-reading the full DSO documentation.
+
+**NAMESPACE CONSTRAINT — applies to ALL generated files (CLAUDE.md, project-understanding.md, and any other artifacts written during onboarding):** Every skill reference written into a generated file MUST use the fully-qualified `/dso:` prefix (e.g., `/dso:sprint`, `/dso:brainstorm`, `/dso:fix-bug`). Short-form references without the namespace prefix (e.g., `/<skill-name>` instead of `/dso:<skill-name>`) are invalid — they violate the DSO namespace policy and will be rejected by `check-skill-refs.sh`. Never write a skill reference without the `/dso:` prefix.
+
+#### Copy KNOWN-ISSUES Template
+
+Copy the DSO `KNOWN-ISSUES` template to `.claude/docs/` in the host project:
+
+```bash
+KNOWN_ISSUES_SRC="${CLAUDE_PLUGIN_ROOT}/docs/templates/KNOWN-ISSUES.md"
+KNOWN_ISSUES_DEST="$REPO_ROOT/.claude/docs/KNOWN-ISSUES.md"
+if [[ -f "$KNOWN_ISSUES_SRC" ]] && [[ ! -f "$KNOWN_ISSUES_DEST" ]]; then
+    mkdir -p "$REPO_ROOT/.claude/docs"
+    cp "$KNOWN_ISSUES_SRC" "$KNOWN_ISSUES_DEST"
+    echo "KNOWN-ISSUES template copied to .claude/docs/KNOWN-ISSUES.md"
+fi
+```
+
+#### Optional Tools
+
+After completing required infrastructure setup, recommend optional tools that enhance the DSO workflow. These tools are not required — all workflows fall back to standard alternatives when unavailable.
+
+Present the following as a brief, non-blocking note (do not prompt for input — just inform):
+
+```
+Optional recommended tool:
+
+  ast-grep (sg) — structural code search for cross-file dependency discovery
+  Install (macOS):  brew install ast-grep
+  Install (Linux):  cargo install ast-grep --locked
+
+  When ast-grep is available, dependency discovery uses structural search for
+  more precise results. All workflows fall back to grep when it is unavailable.
+```
+
+Do NOT block onboarding progress on tool installation — present the suggestion and continue immediately.
+
+#### Semgrep Installation and Test Quality Configuration
+
+After optional tool recommendations, install Semgrep as a static analysis tool and configure test quality settings based on the detected project stack and language.
+
+**Step 1: Install Semgrep**
+
+Attempt to install Semgrep for the detected language stack. Semgrep provides language-aware static analysis rules for Python, JavaScript, TypeScript, Go, Java, and other languages:
+
+```bash
+# Attempt Semgrep installation
+if command -v semgrep >/dev/null 2>&1; then
+    echo "Semgrep already installed: $(semgrep --version)"
+elif command -v pip3 >/dev/null 2>&1; then
+    timeout 120 pip3 install semgrep 2>/dev/null && echo "Semgrep installed successfully" || SEMGREP_INSTALL_FAILED=true
+elif command -v brew >/dev/null 2>&1; then
+    timeout 120 brew install semgrep 2>/dev/null && echo "Semgrep installed successfully" || SEMGREP_INSTALL_FAILED=true
+else
+    SEMGREP_INSTALL_FAILED=true
+fi
+```
+
+**Graceful degradation:** If Semgrep installation fails, disable the Semgrep gate rather than blocking onboarding. Set `test_quality.tool=bash-grep` as a fallback and continue:
+
+```bash
+if [[ "${SEMGREP_INSTALL_FAILED:-}" == "true" ]]; then
+    echo "NOTE: Semgrep installation failed — falling back to bash-grep for test quality analysis."
+    echo "You can install Semgrep later: pip3 install semgrep"
+fi
+```
+
+**Step 2: Generate Semgrep config for detected languages**
+
+Based on the project language detection from Phase 1, generate a `.semgrep.yml` config file with language-appropriate Semgrep rules:
+
+```bash
+# Generate .semgrep.yml based on detected stack
+SEMGREP_CONFIG="$REPO_ROOT/.semgrep.yml"
+if [[ ! -f "$SEMGREP_CONFIG" ]]; then
+    cat > "$SEMGREP_CONFIG" <<SEMGREP_EOF
+rules: []
+# Auto-generated by /dso:onboarding
+# Add project-specific Semgrep rules here
+# Language detected: $STACK_OUT
+# See: https://semgrep.dev/docs/writing-rules/
+SEMGREP_EOF
+    echo "Generated .semgrep.yml for $STACK_OUT"
+fi
+```
+
+For Python projects, include `p/python` rulesets. For JavaScript/TypeScript projects, include `p/javascript` and `p/typescript` rulesets. Tailor the Semgrep rules to the detected project languages.
+
+**Step 3: Configure test quality settings**
+
+Add test quality configuration to `dso-config.conf`. The `test_quality` config keys control test quality tooling:
+
+```bash
+# Test quality configuration keys for dso-config.conf
+# test_quality.enabled — enable/disable test quality gates (default: true)
+# test_quality.tool — analysis tool: semgrep | bash-grep (fallback if Semgrep unavailable)
+```
+
+Write the `test_quality` section to `dso-config.conf`:
+
+```
+# Test quality configuration
+test_quality.enabled=true
+test_quality.tool=semgrep
+```
+
+If Semgrep installation failed, write `test_quality.tool=bash-grep` instead. The test quality gate will still function using grep-based pattern matching as a fallback.
+
+## Batch: final-commit
+<!-- Skip guard: if no hook artifacts to commit, skip -->
+
+#### CI trigger and preplanning interactivity
+
+Write the values captured in Phase 2 questions 12 and 13 to `.claude/dso-config.conf`:
+
+- `CI_TRIGGER_STRATEGY` → record under `ci.workflow_name` and in `.claude/project-understanding.md`'s CI section.
+- `PREPLANNING_INTERACTIVE` → write `preplanning.interactive=<value>` with **explicit overwrite** (exception to the general merge-not-overwrite rule, since the repo default is `false` and the operator must be able to flip it):
+
+```bash
+# Always overwrite preplanning.interactive — exception to merge-not-overwrite rule
+if grep -q "^preplanning\.interactive" "$EXISTING_CONFIG" 2>/dev/null; then
+    sed -i.bak "s|^preplanning\.interactive.*|preplanning.interactive=$PREPLANNING_INTERACTIVE|" "$EXISTING_CONFIG" && rm -f "$EXISTING_CONFIG.bak"
+else
+    echo "preplanning.interactive=$PREPLANNING_INTERACTIVE" >> "$EXISTING_CONFIG"
+fi
+```
+
+No mid-stream prompts at this step — both values were captured in Phase 2.
+
+---
+
+## Step 8: Wrap-up — architect-foundation offer (/dso:onboarding)
+
+After all artifacts are written and committed, decide whether to offer `/dso:architect-foundation`.
+
+**Artifact detection**: Check whether `ARCH_ENFORCEMENT.md` already exists at the repo root (produced by a prior `/dso:architect-foundation` run). If it does, skip this step entirely — onboarding integration is already complete.
+
+**When `ARCH_ENFORCEMENT.md` does not exist**, offer the next step:
+
+```
+I can run /dso:architect-foundation now to codify this understanding into durable
+project artifacts (produces ARCH_ENFORCEMENT.md with architecture enforcement rules,
+registers test suites and commands in .claude/dso-config.conf, and captures
+enforcement preferences and CI pipeline structure).
+
+1) Run /dso:architect-foundation
+2) Skip — setup is complete, no additional steps
+
+Which would you like?
+```
+
+**On option 1**: invoke `/dso:architect-foundation`. Pass `--auto` when `COMFORT_LEVEL="non_technical"` (skips interactive prompts, applies sensible defaults); invoke without flags otherwise.
+
+```
+Skill tool:
+  skill: "dso:architect-foundation"
+  args: "--auto"   # omit when COMFORT_LEVEL != "non_technical"
+```
+
+**On option 2**: setup is complete. Summarize what was learned and close the session.
+
+---
+
+## Guardrails
+
+**One question at a time** — never ask multiple questions in a single message.
+
+**Socratic, not interrogative** — frame questions as collaborative discovery, not a form to fill out.
+
+**Ground in detection output** — always start from what `project-detect.sh` found; ask to confirm, not to re-discover from scratch.
+
+**Append-only scratchpad** — never overwrite scratchpad entries; only append to preserve the conversation history.
+
+**No code changes** — this skill is read-only; it discovers and records but does not modify project files (that is `/dso:architect-foundation`'s job).
+
+---
+
+## Quick Reference
+
+| Phase | Goal | Key Activities |
+|-------|------|---------------|
+| 1: Auto-Detection | Pre-fill answers | Run project-detect.sh, initialize scratchpad temp file, summarize findings |
+| 1.5: Template Selection Gate | Offer starter templates (empty projects only) | Only when detect-stack returns "unknown"; load parse-template-registry.sh; numbered menu; handle select → store result + route to install path; handle decline → proceed to Phase 2 unchanged; missing registry → skip silently |
+| 1.6a: nava-platform Install | Install nava-platform templates | Probe uv/pipx, install CLI, verify, run app install with --data flags, timeout handling, error fallback to manual flow |
+| 1.6b: Jekyll Git Clone | Install Jekyll USWDS template | Clone via git, non-empty dir check, captive portal detection, error fallback to manual flow |
+| 1.7: Post-Install Re-Detection | Re-detect after template install; partial Phase 2 skip | Re-run detect-stack.sh + project-detect.sh; verify registry framework_type match (warn on mismatch, do not crash); record post-install detection in scratchpad; write `## Phase 2 Status` marking registry-answerable sections (stack, commands, architecture, CI, enforcement) as pre-answered; do NOT remove Phase 2 from PHASE_PLAN — Phase 2 still runs for design questions (section 6); proceed to Phase 2 at section 6 only |
+| 2: Socratic Dialogue | Fill gaps in 7 areas | One question at a time, confirmation-based (not rigid menus), skip confirmed areas |
+| 3: Completion | Finalize and hand off | Present summary, write .claude/project-understanding.md (detected/user-stated tags), write DESIGN.md (UI projects only: vision, archetypes, golden paths, visual language, accessibility; path configurable via design.design_notes_path, default DESIGN.md), generate dso-config.conf (ticket prefix, CI workflow examples, ACLI_VERSION), infrastructure init (hook install with Husky/pre-commit framework/.git/hooks manager detection, git-common-dir for worktree support, ticket system orphan branch + .tickets-tracker/ + push verification + smoke test, generate-test-index.sh, CLAUDE.md with ticket commands, KNOWN-ISSUES template, CI trigger strategy), offer /dso:architect-foundation |

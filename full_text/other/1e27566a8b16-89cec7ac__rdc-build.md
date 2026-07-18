@@ -1,0 +1,563 @@
+---
+name: rdc:build
+description: "Usage `rdc:build <epic-id>` — You have a planned epic with tasks ready to execute. Dispatches parallel typed agents, each commits atomically to develop, runs a mandatory per-wave code-review gate (pr-review-toolkit:code-reviewer), closes work items, and runs the validator gate. Call after rdc:plan or when told to build."
+---
+
+> **⚠️ OUTPUT CONTRACT (READ FIRST):** `guides/output-contract.md`
+> Checklist-only output. No tool-call narration. No raw MCP/JSON/log dumps.
+> One checklist upfront, updated in place, shown again at end with a 1-line verdict.
+
+> **Sandbox contract:** This skill honors `RDC_TEST=1` per `guides/agent-bootstrap.md` § RDC_TEST Sandbox Contract. Destructive external calls short-circuit under the flag.
+
+
+# rdc:build — Typed Agent Dispatch Engine
+
+## When to Use
+- Plan is approved and ready to execute
+- Project lead says "build it", "go", "execute", "do not stop"
+- An epic exists with child tasks ready for implementation
+- Called by `rdc:overnight` as part of the automated build loop
+
+## Arguments
+- `rdc:build <epic-id>` — build from a specific Supabase epic
+- `rdc:build <topic>` — find the epic by label/title match
+- `rdc:build` (no args) — show open epics and ask which to build (interactive only)
+- `rdc:build <epic-id> --unattended` — silent mode for overnight builds
+
+## Agent Types & Guide Files
+
+Every dispatched agent MUST read two files before starting — in this order:
+1. `{PROJECT_ROOT}/.rdc/guides/agent-bootstrap.md` — credentials, git rules, completion report format
+   (fallback: `.rdc/guides/agent-bootstrap.md` relative to cwd if `{PROJECT_ROOT}` is not substituted)
+2. `{PROJECT_ROOT}/.rdc/guides/engineering-behavior.md` — assumptions, minimal changes, surgical scope, verification evidence
+   (fallback: `.rdc/guides/engineering-behavior.md` relative to cwd if `{PROJECT_ROOT}` is not substituted)
+3. `{PROJECT_ROOT}/.rdc/guides/<type>.md` — role-specific guide
+   (fallback: `.rdc/guides/<type>.md` relative to cwd if `{PROJECT_ROOT}` is not substituted)
+
+Include both lines in every agent prompt:
+```
+"Read {PROJECT_ROOT}/.rdc/guides/agent-bootstrap.md first (fallback: .rdc/guides/agent-bootstrap.md), then {PROJECT_ROOT}/.rdc/guides/engineering-behavior.md (fallback: .rdc/guides/engineering-behavior.md), then {PROJECT_ROOT}/.rdc/guides/<type>.md (fallback: .rdc/guides/<type>.md) before starting."
+```
+
+| Agent Type | Guide File | When to dispatch |
+|-----------|-----------|-----------------|
+| `frontend` | `.rdc/guides/frontend.md` | React components, pages, UI, Tailwind, animation |
+| `backend` | `.rdc/guides/backend.md` | API routes, server components, database queries, auth |
+| `data` | `.rdc/guides/data.md` | Migrations, schema changes, RPC functions |
+| `design` | `.rdc/guides/design.md` | Visual design, brand palettes, OG images, token work |
+| `infra` | `.rdc/guides/infrastructure.md` | CI/CD, deployment, DNS, SSL |
+| `content` | `.rdc/guides/content.md` | Marketing copy, messaging, tone |
+| `cs2` | `.rdc/guides/cs2.md` | CS 2.0 paradigm work (generic) |
+| `hail` | `.rdc/guides/cs2.md` + `packages/hail/CLAUDE.md` | Grammar, DSL compiler, evolution |
+| `pal` | `.rdc/guides/cs2.md` + `packages/pal/CLAUDE.md` | Sessions, moment windows, graph memory |
+| `bpmn` | `.rdc/guides/cs2.md` + `docs/systems/<domain>/flowable-bpmn-architecture.md` | BPMN flows, governance |
+| `virtue` | `.rdc/guides/cs2.md` + `packages/virtue-engine/CLAUDE.md` | Virtue weights, coherence, certification |
+| `viz` | `.rdc/guides/frontend.md` + `.rdc/guides/design.md` | Custom viz components, charts, diagrams |
+
+### How to classify a task → agent type
+
+Read the task title and description, then:
+- Mentions React, component, page, UI, Tailwind → `frontend`
+- Mentions API route, server, database query, auth → `backend`
+- Mentions migration, schema, table, RPC → `data`
+- Mentions brand, palette, typography, OG image → `design`
+- Mentions deploy, infrastructure, CI, DNS → `infra`
+- Mentions copy, messaging, email template → `content`
+- Mentions grammar, DSL, compiler → `hail`
+- Mentions session, moment, memory graph → `pal`
+- Mentions BPMN, flow, governance → `bpmn`
+- Mentions virtue, coherence, certification → `virtue`
+- Mentions visualization, chart, diagram, SVG → `viz`
+- Multiple types? Dispatch multiple agents, each with its guide.
+
+## Procedure
+
+1. **Load the epic and run pre-flight gate:**
+   ```sql
+   SELECT get_work_items_by_epic('<epic-id>', 'todo');
+   ```
+
+   **Session lock — claim the epic immediately (before any agent dispatch):**
+
+   After loading the epic, check its status:
+   - If `status = 'in_progress'` → **ABORT** with:
+     ```
+     SKIP: epic <id> is already in_progress — claimed by another session. Pick a different epic.
+     ```
+     Do NOT proceed. Do NOT dispatch any agents.
+   - If `status = 'todo'` or `status = 'blocked'` → immediately claim it:
+     ```sql
+     SELECT update_work_item_status('<epic-id>'::uuid, 'in_progress',
+       '["Claimed by build session — dispatching agents"]'::jsonb
+     );
+     ```
+     This is an atomic Supabase write. A concurrent session that loads the same epic after this point will see `in_progress` and abort. **Do this before any classification, planning, or agent dispatch.**
+
+   **Pre-flight gate — run after claiming:**
+
+   | Condition | Action |
+   |-----------|--------|
+   | No child tasks returned | → Invoke `rdc:plan` on this epic. Do NOT proceed with build. |
+   | Tasks exist but all have empty `description` fields | → Invoke `rdc:plan` on this epic. Tasks without descriptions cannot be safely dispatched. |
+   | Plan doc missing `## Checklist Decomposition Matrix` | → Invoke `rdc:plan` on this epic. Do NOT dispatch agents. |
+   | Plan doc missing `## Checklist Quality Gate` with `verdict: PASS` | → Invoke `rdc:plan` on this epic. Do NOT dispatch agents. |
+   | Any implementation task lacks `decomp-*` items, has < 10 attested rows, or leaves a declared surface (screen/api/db/tool) uncovered | → Invoke `rdc:plan` on this epic. Coarse/under-decomposed checklists cannot be safely dispatched. |
+   | Any `decomp-*` item lacks route/file, action, expected result, or evidence artifact | → Invoke `rdc:plan` on this epic. Do NOT dispatch agents. |
+   | Tasks exist and have descriptions | → Continue with build. |
+
+   **Re-planning is not a failure — it is correct behavior.** The build skill is the last gate before agent dispatch; catching an under-specified epic here is cheaper than a wasted agent run.
+
+   **How to re-plan:**
+   - Interactive: tell the user — "Epic has no tasks / tasks lack descriptions — invoking rdc:plan first." Then invoke `rdc:plan <epic-id>`.
+   - Unattended: invoke `rdc:plan <epic-id> --unattended` inline, wait for it to complete, then reload tasks and re-run this gate once. If tasks still missing after re-plan, escalate via advisor.
+
+   **Interactive (no args):** show open epics, ask which to build.
+
+2. **CHECK FOR EXISTING WORK (mandatory — never skip):**
+   ```sql
+   -- Check if prototypes exist from earlier sessions
+   SELECT name, component, source_path, status, notes
+   FROM prototype_registry
+   WHERE status IN ('prototype', 'converting')
+   ORDER BY created_at DESC;
+
+   -- Check for design decisions on this topic
+   SELECT topic, context_type, summary, source
+   FROM design_context
+   WHERE topic ILIKE '%<epic-topic>%'
+   ORDER BY created_at DESC;
+   ```
+   **If a prototype exists: ADAPT IT. Do not build from scratch.**
+   Tell the agent: "Read <source_path> first and convert it to the production contract."
+   
+   **If design decisions exist: follow them.** Include the summary in the agent prompt.
+
+3. **Load the plan** (mandatory): check `.rdc/plans/` for matching topic (fallback: `.rdc/plans/`).
+
+3b. **Checklist decomposition quality gate (mandatory before code):**
+
+   `rdc:build` is the final gate before implementation. It MUST reject any plan or work item that is too coarse for an agent to execute and verify independently.
+
+   Required plan sections:
+   - `## Checklist Decomposition Matrix`
+   - `## Checklist Quality Gate`
+   - `verdict: PASS`
+
+   Required task checklist shape:
+   - Every implementation work item has >= 10 attested `decomp-*`/`test-*` rows and meets the
+     per-surface completeness floors from rdc:plan (each declared surface covered; a multi-surface
+     WP carries the SUM of its surface floors, typically 12-20). A flat 5-6-row checklist for a
+     feature WP is REJECTED — reopen the epic to rdc:plan for full surface-area decomposition.
+   - Every implementation work item has at least one `decomp-*` checklist row and one `test-*` checklist row.
+   - Every `decomp-*` row names a concrete route or file path.
+   - Every `decomp-*` row names one user/agent action.
+   - Every `decomp-*` row names one expected UI/API/DB result.
+   - Every `decomp-*` row names one verification artifact: test name, route probe, Playwright screenshot, SQL query, API response, type-check, migration proof, or CLI transcript.
+
+   Atomicity rubric:
+   - One observable behavior per `decomp-*` row.
+   - The row can pass or fail without reading hidden intent from the plan narrative.
+   - The row is small enough for a worker to implement, tick, and cite evidence for directly.
+   - Vague rows such as "theme management works", "UI implemented", "verified", "all screens", or "integration complete" are failures.
+
+   Minimum decomposition heuristics:
+   - UI route: at least empty/loading/loaded/error or the documented reason a state does not apply.
+   - CRUD surface: at least list, create, edit, detail, duplicate/delete/archive where applicable, and validation failure.
+   - API route: at least successful read/write, validation failure, and unauthorized/forbidden or documented auth bypass.
+   - DB/migration task: at least schema object, relationship/guard, policy/permission, seed/fixture or backfill, and smoke query.
+   - Editor/sidebar/CLI workflow: at least start, attach/open, enqueue action, observe result, timeout/error, and live refresh where applicable.
+
+   HARD FLOOR (mirrors rdc:plan): every implementation task carries >= 10 attested rows; a
+   multi-surface WP carries the SUM of its per-surface floors (typically 12-20). A flat 5-6-row
+   feature checklist, or any declared surface (screen/api/db/tool) left uncovered, is a REJECT —
+   reopen to rdc:plan. Every row must name its surface + one verification artifact (attested).
+
+   ### ⛔ Deliverable / acceptance check-off table — show BEFORE any implementation
+   Before dispatching the first wave, render a deliverable/acceptance table and
+   keep it visible through the build (lesson 2026-06-16-build-poor-goal-execution-mdk-brain:
+   a build satisfied generic checklist rows — tsc clean, route 200 — while never
+   touching the surface the user actually named, because no row anchored the
+   user's TARGET SURFACE). The table MUST contain:
+   - **One mandatory row for the user-named TARGET SURFACE** — the exact screen,
+     endpoint, file, or behavior the user asked for, by name. Its acceptance check
+     is what proves THAT surface renders/works, not a proxy.
+   - **At least one NEGATIVE verifier row** — a check that proves the WRONG thing
+     does NOT happen (e.g. "mock data is NOT rendered", "old route returns 404",
+     "stub component is absent from the bundle"). A positive-only suite passes
+     even when the deliverable is wired to the wrong source.
+
+   | Deliverable | Target surface? | Acceptance check | Negative verifier | Status |
+   |---|---|---|---|---|
+
+   **Gating rule:** any work item whose deliverable maps to the TARGET SURFACE row
+   stays in `review` (never `done`) until that target-surface acceptance check
+   passes. Generic gates (tsc, route 200) clearing is NOT sufficient to advance
+   the target-surface item.
+
+   If the gate fails:
+   - Interactive: show the failing rows and invoke `rdc:plan <epic-id>` to repair the matrix before dispatch.
+   - Unattended: invoke `rdc:plan <epic-id> --unattended`, reload tasks, and run this gate once more.
+   - If the second gate fails, abort the build and return the failure list. Do not dispatch implementation agents.
+
+   **Plan verifier escalation:** A separate verifier agent is optional, not default. Dispatch one only when the plan touches 5+ UI routes, 3+ data/API boundaries, auth/security, production deployment, or when this rubric fails twice. The verifier reads the plan and work-item checklists only; it does not write code.
+
+4. **Read CLAUDE.md files** for all affected packages.
+
+5. **Classify each task** → assign agent type from the table above.
+
+5b. **Write or refresh the checklist into every work item before dispatching:**
+    For each task, append the exact `decomp-*` and `test-*` checklist rows to its notes BEFORE setting to `in_progress`:
+    ```sql
+    SELECT update_work_item_status('<id>'::uuid, 'in_progress',
+      '["CHECKLIST: [ ] decomp-ui-route-state: <route/file> | action=<action> | expect=<result> | evidence=<artifact>, [ ] test-smoke-route: <route probe>, [ ] committed"]'::jsonb
+    );
+    ```
+    The agent must complete every item on this checklist and return it checked off in AGENT_COMPLETE.
+    A checklist with unchecked items = incomplete work. Do not proceed to next wave with unchecked items.
+
+6. **Group tasks into waves** — parallelize tasks with no file overlap:
+   - Wave 1: independent tasks (different packages/files)
+   - Wave 2: tasks that depend on Wave 1 outputs
+   - Wave 3: integration tasks
+
+7. **For each wave — dispatch typed agents in parallel:**
+
+   ### ⛔ Agent Dispatch Non-Negotiable Defaults
+   Every `Agent()` call MUST include these parameters:
+   ```
+   model: <chosen per the routing table below>
+   max_turns: 70
+   ```
+   `isolation` is chosen per the dispatch-mode rule below — it is NOT a blanket
+   default. Worktree isolation is reserved for true parallel MULTI-committer waves
+   in the same repo; doc-only and single-committer waves default to NON-isolated.
+
+   ### ⛔ Dispatch mode — non-isolated is the default for single-committer / doc-only waves
+   Worktree isolation exists to protect a SHARED working tree from a git-index race
+   between MULTIPLE agents committing in parallel. When there is only ONE committer,
+   that race cannot occur, and the stale-base hazard of worktrees (see the HARD GATE
+   below — recurring across 2026-06-10/11/15/16/17/23) is pure downside. Pick the
+   dispatch mode by committer count, not by reflex:
+
+   | Wave shape | Dispatch mode | isolation |
+   |---|---|---|
+   | **Doc-only wave** (markdown/docs/plans, no code build) | NON-isolated, one committer on `develop` | omit `isolation` |
+   | **Single-committer wave** (only one agent commits, or work serializes to the supervisor) | NON-isolated, one committer on `develop` | omit `isolation` |
+   | **True parallel MULTI-committer wave** (2+ agents committing concurrently in the same repo, disjoint files) | worktree-isolated, supervisor merges | `isolation: "worktree"` |
+
+   - **Default = NON-isolated.** Only escalate to `isolation: "worktree"` when the
+     wave genuinely has 2+ concurrent committers in the same repo.
+   - A pure docs wave is single-committer by default: either dispatch ONE doc agent,
+     or have parallel doc agents return diffs/patches that the supervisor commits
+     serially. Do NOT fan out 2+ concurrent committers onto one shared `develop`
+     tree (lesson 2026-06-13-build-concurrent-agents-same-branch-git-race: three
+     parallel doc agents on one `develop` tree raced on the git index/stash — one
+     commit swept in another agent's staged-but-uncommitted files under the wrong
+     message, two agents reported the SAME SHA, a pre-commit `sync:docs` ref-lock
+     race misattributed authorship). The fix for that race is single-committer
+     serialization, NOT blanket worktree isolation.
+   - When you DO need a true MULTI-committer parallel wave, worktree isolation is
+     mandatory AND the HARD GATE below (base == develop HEAD) MUST pass before
+     dispatch — a stale-base worktree wave is a build failure, not a warning.
+
+   ### ⛔ Foreign concurrent session guard — `git status` BEFORE the build
+   Worktree isolation protects against THIS build's own agents, not against a
+   DIFFERENT session (another cell, a Codex run, a human) already committing on
+   the same shared tree (lesson 2026-06-16-build-concurrent-session-shared-tree-commit-corruption:
+   a foreign session's staged-but-uncommitted files were swept into this build's
+   commit under the wrong message). Before dispatching any wave, run `git status`
+   to detect foreign-dirty files you did not create. If foreign-dirty files are
+   present: do NOT fan out concurrent committers — **serialize ALL committers to
+   the supervisor** (agents return diffs/patches; the supervisor stages and
+   commits each one alone). After every supervisor commit, assert the exact file
+   set landed and nothing foreign leaked in:
+   ```bash
+   git show --stat <sha>   # confirm ONLY the files this commit owns are listed
+   ```
+   A `git show --stat` that lists a file the agent did not touch = a foreign file
+   leaked into the commit; reset and re-stage by explicit path.
+
+   **Agent model routing — pick per task, not per wave.** The supervisor session model does NOT cascade to agents; you must set `model` explicitly on every dispatch.
+
+   | Task character | Model | When to pick it |
+   |---|---|---|
+   | Updates, edits, mechanical refactors, small fixes, content tweaks, config patches, doc/copy edits, straightforward API wiring | `claude-sonnet-4-6` | Default for `frontend.md`/`content.md`/`infrastructure.md` work whose checklist is mostly "change X to Y" or "wire up endpoint Z". Budget-safe for parallel dispatch. |
+   | Harder coding tasks — non-trivial algorithm, migration with backfill, schema reshape, multi-file refactor with subtle invariants, performance-sensitive code, anything where correctness is the bar | `claude-opus-4-6` | Default for `backend.md`/`data.md` work and any `frontend.md` task that involves state machines, race conditions, or cross-package contracts. |
+   | Design or innovative thought — new component design, brand/UX work, CS 2.0 paradigm work (HAIL/Quad Pixel/AEMG/Virtue), grammar evolution, architecture-first design, anything where the *shape* of the solution is the deliverable rather than the implementation | `claude-opus-4-8` | Default for `design.md`/`cs2.md` work. Also use for `backend.md`/`data.md` tasks tagged with `architecture` or `design-decision` in work item labels. |
+
+   **How to choose when the task straddles categories:**
+   - If the task's checklist contains the word "design", "decide", "propose", "evaluate alternatives", "novel", or any CS 2.0 primitive → **Opus 4.8**.
+   - If the task touches `packages/cs2*`, `packages/hail`, `packages/quad-pixel`, `packages/virtue-engine`, `packages/aemg`, `packages/planetary-ontology`, or `packages/being-state-processor` → **Opus 4.8** (CS 2.0 paradigm requires innovative thought, not transcription).
+   - If the task is a Supabase migration that drops/renames/reshapes anything, or a refactor across ≥5 files → **Opus 4.6**.
+   - Otherwise → **Sonnet 4.6**.
+
+   **State the choice in the wave plan.** Before dispatching a wave, the supervisor must log one line per agent in the form `[wave-N agent-K] role=<role> task=<id> model=<chosen> reason=<one phrase>`. This keeps routing decisions reviewable in the transcript and lets `rdc:report` summarize the fleet mix.
+
+   **Cost guardrail.** If a single wave would dispatch more than 3 Opus 4.8 agents in parallel, downshift the lowest-priority Opus-4.8 tasks to Opus 4.6 unless their work items are tagged `priority=urgent`. Opus 4.8 fast-mode is cheap individually but still ~5× a Sonnet agent at scale.
+   Without `max_turns: 70`, agents hit the default turn cap mid-task and stop.
+   `isolation: "worktree"` gives each agent its own git worktree and branch — eliminates push race conditions and index lock contention when multiple agents commit in parallel. The supervisor merges worktree branches after each wave (Step 9).
+
+   ### ✅ PREVENTION FIRST — create worktrees fresh off origin/develop (kills stale-base by construction)
+   The repeated stale-base failures below come from creating worktrees off a
+   local/old ref. Eliminate the failure mode at the source: ALWAYS create agent
+   worktrees with a fresh fetch + `origin/develop` base, e.g.
+   `git fetch origin develop && git worktree add <dir> -b <branch> origin/develop`
+   — or use the canonical launcher `node scripts/wt.mjs add <name>`, which does
+   exactly that. A worktree cut from `origin/develop` HEAD **cannot** be stale.
+   The HARD GATE below remains as the blocking backstop (detection), but
+   construction-from-`origin/develop` is the primary defense.
+
+   ### ⛔ HARD GATE — Worktree base MUST equal develop HEAD (blocking, not advisory)
+   The worktree-isolation harness has shipped worktrees pinned to a STALE base
+   commit (lessons 2026-06-10-build-worktree-stale-base, 2026-06-11-build-worktree-stale-base,
+   2026-06-15-build-worktree-stale-base, 2026-06-16-build-worktree-stale-base,
+   2026-06-17-build-worktree-stale-base, 2026-06-23-build-worktree-stale-base:
+   agents branched hundreds of commits / multiple days behind develop HEAD, on a
+   tree where the target app did not yet exist — their diffs would have silently
+   reverted merged work or operated on a deleted structure). This is a recurring
+   harness defect, so the check is a **HARD BLOCKING GATE, not a suggestion.**
+
+   **Before dispatching ANY `isolation:"worktree"` wave**, the supervisor MUST run
+   the base==HEAD assertion and MUST abort isolation on any mismatch — there is no
+   "proceed anyway" path:
+   ```bash
+   DEV_HEAD=$(git rev-parse develop)
+   # After worktrees are created, for each agent worktree:
+   git worktree list   # compare each agent worktree's SHA to $DEV_HEAD
+   # If ANY worktree base != $DEV_HEAD (it is behind), the wave is UNSAFE — ABORT.
+   ```
+   - **MANDATORY ABORT:** if ANY worktree base != `$DEV_HEAD`, you MUST abort
+     isolation for this wave. Do NOT merge stale worktree output. Do NOT "fast-forward
+     and continue". Do NOT proceed with the isolated wave under any circumstance.
+     Pivot to **sequential, non-isolated dispatch on a real `develop` checkout**
+     (one disjoint WP at a time to avoid `.git/index` races; the supervisor pushes) —
+     the same reason the validator runs non-isolated (it must see merged develop).
+   - This gate is blocking by design: an isolated wave dispatched on a stale base
+     is treated as a build failure, not a warning. Skipping or downgrading this
+     assertion to advisory is a contract violation.
+   - Also at every merge: `git show <branch>:<key-file> | grep -c <symbol-a-prior-wave-introduced>`
+     — a 0 where there should be ≥1 means the branch is stale or deleted a shared
+     export; resolve to `--ours` and re-apply that wave's real delta on current HEAD.
+     esbuild/tsc PASS is necessary, not sufficient — pair it with a grep gate on
+     the symbols a refactor must preserve.
+
+   ### Forked agents vs. standalone agents
+
+   **When the supervisor has already read the plan** (via a prior `Read` tool call in the same session),
+   dispatch **forked agents** with short prompts. Forked agents inherit the full conversation context —
+   including every file the supervisor has read — so you do NOT need to copy plan sections, file specs,
+   or architecture details into the prompt. The agent already sees them.
+
+   Short forked prompt template:
+   ```
+   You are a frontend agent building <WP name>. Work item: <uuid>.
+   Scope: <one sentence>. Files: <list>. Verification: tsc --noEmit.
+   Set item to review when done, return AGENT_COMPLETE with verification evidence.
+   Read .rdc/guides/agent-bootstrap.md + .rdc/guides/engineering-behavior.md + .rdc/guides/frontend.md before starting.
+   ```
+
+   **When the supervisor has NOT read the plan** (e.g. dispatching from a fresh `rdc:build` call with
+   only an epic ID), the agent has no plan context — write a full briefing prompt with all specs.
+
+   ### ⛔ Reuse contract — when a WP builds on an existing subsystem
+   When a work package extends an existing subsystem, "compose adapter + X"
+   under-specifies reuse and lets an agent legitimately re-author markup/logic the
+   subsystem already exposes (lesson 2026-06-11-build-reuse-existing-engine-prompt:
+   an agent set up to reinvent a grid when the card engine already shipped four
+   `CardLayout` display types + a full `parseCommand → CardSpec → adapter → CardModel[]`
+   calling sequence). The dispatch prompt MUST:
+   1. **Enumerate the existing public API the agent must reuse, BY FILE** — types/enums
+      (`packages/.../types.ts:NN`), calling-sequence functions, AND the existing
+      display/render components — not just the data adapter.
+   2. **Mark which seams are extend/delegate-only.** State explicitly: "thread a
+      pass-through prop (e.g. `layout`) to the existing components; do NOT
+      reimplement layout/render." Verify at WP review that the agent reused the
+      named parser/adapter/components and did not hand-roll a parallel implementation.
+
+   ---
+
+   ### Required agent prompt contents
+   - Set work item to `in_progress` before dispatching
+   - Each agent prompt MUST include:
+     - `"Read {PROJECT_ROOT}/.rdc/guides/agent-bootstrap.md first (fallback: .rdc/guides/agent-bootstrap.md), then {PROJECT_ROOT}/.rdc/guides/<type>.md (fallback: .rdc/guides/<type>.md) before starting."`
+     - `"Read {PROJECT_ROOT}/.rdc/guides/engineering-behavior.md (fallback: .rdc/guides/engineering-behavior.md) before editing; follow it for assumptions, minimal changes, surgical scope, evidence, and escalation."`
+     - Specific files to create/modify (or omit if forked agent inherits plan context)
+     - Exact deliverables and commit message
+     - `"NEVER run pnpm build/test. NEVER modify files outside your scope."`
+     - **`"You are running in an isolated git worktree. Commit your work normally. Do NOT push to origin — the supervisor merges your branch after the wave completes."`**
+     - **`"When done, set your work item to 'review' (NOT 'done') and return AGENT_COMPLETE with a verification field. The validator closes work items — you do not."`**
+     - **`"COMPLETION PROOF REQUIRED in AGENT_COMPLETE: list every file written, the exact commit hash, and paste the vitest/tsc output. A report without this evidence will be rejected."`**
+     - **`"If you find that a file or feature already exists: you MUST still verify it satisfies the full task spec before marking review. Finding a file is not completion. Run verification, check every requirement, and report what you found vs. what was required."`**
+     - **The decomposition items from the work item's checklist** (all `decomp-*` prefixed items). Include them verbatim in the prompt and instruct the agent:
+       ```
+       DECOMPOSITION CHECKLIST — you MUST implement/verify each row and tick it immediately via update_checklist_item(..., p_actor_session_id := '<your-session-id>', p_actor_role := 'agent'):
+       - decomp-ui-xxx: <route/file> | action=<action> | expect=<result> | evidence=<artifact>
+       - decomp-api-xxx: <route/file> | action=<action> | expect=<result> | evidence=<artifact>
+       Tick each item as soon as that specific behavior is implemented and proven. Do NOT batch.
+       ```
+     - **The test plan items from the work item's checklist** (all `test-*` prefixed items). Include them verbatim in the prompt and instruct the agent:
+       ```
+       TEST PLAN — you MUST implement/verify each of these and tick them off via update_checklist_item(..., p_actor_session_id := '<your-session-id>', p_actor_role := 'agent'):
+       - test-assert-xxx: <description> → write a vitest test that proves this
+       - test-smoke-xxx: <description> → run the command and confirm the result
+       - test-visual-xxx: <description> → note: delegate to UI audit (you cannot verify this yourself)
+       - test-contract-xxx: <description> → verify the export/type/shape exists
+       Tick each item as you complete it. Do NOT batch — tick immediately after each verification.
+       ```
+   - Use `run_in_background: true` for parallel execution
+   - NEVER let agents overlap on the same files
+
+   ### ⛔ Agent Definition-of-Done additions (include in every prompt)
+   - **Declare every import in the package's OWN package.json.** Every import an
+     agent adds MUST be present in that package's own `package.json`
+     dependencies/devDependencies — never rely on monorepo-hoisted deps. A pnpm
+     worktree can import a root-hoisted dep (e.g. `vitest`,
+     `@supabase/supabase-js`) so `tsc`/`vitest` PASS in the worktree, then `tsc`
+     FAILS on a clean develop checkout after merge (lesson
+     2026-06-10-build-card-engine-agent-deps). Agent prompt line: *"Verify that
+     every import you add is declared in this package's own package.json — do not
+     rely on hoisted monorepo deps."*
+   - **A server/MCP/API task is NOT done without a committed automated test that
+     ships in the SAME commit and exercises EVERY surface.** Manual curl / a single
+     `/health` 200 is a proxy, not coverage (lesson 2026-06-10-build-weak-dod-no-tests).
+     For a collection (MCP skills, API routes, CLI commands): loop over ALL items
+     and assert `output == source` — never a single spot check. Wire an npm script
+     and run it green before the item leaves `review`. Agent prompt line: *"This
+     task is not done until a committed test in the same commit exercises every
+     surface; for collections, loop all items and assert output == source."*
+
+8. **Post-wave test gate (mandatory):**
+   After all agents in a wave complete, before proceeding:
+   ```bash
+   # For each package modified in this wave:
+   cd packages/<name> && npx vitest run 2>&1 | tail -20
+   ```
+   - All tests must pass before proceeding to next wave
+   - If tests fail: fix before proceeding
+   - NEVER use `pnpm build` or `pnpm turbo test` — vitest only per package
+   - New code must have tests: if a modified package shows 0 new test files, flag it
+
+9. **After all wave agents complete — merge worktrees and push:**
+
+   Each completed agent returns a worktree branch (e.g. `claude/agent-frontend-abc123`). Merge them all to develop before running the test gate:
+
+   ```bash
+   # For each worktree branch returned by agents in this wave:
+   git merge --no-ff <worktree-branch> -m "merge(<agent-type>): <task-title>"
+   ```
+
+   - Resolve any conflicts before proceeding — do not skip
+   - Worker agents set items to `review` — **do NOT close to `done` yet**
+   - After all branches merged, push once:
+     ```bash
+     if [ "$RDC_TEST" != "1" ]; then
+       git push origin develop
+     else
+       echo "[RDC_TEST] skipping git push"
+     fi
+     ```
+   - Then run the post-wave test gate (Step 8) on the merged state
+   - Then run the code-review gate (Step 9b) before the next wave dispatches
+   - Continue to next wave
+
+   **If an agent fails (returns no worktree branch):**
+   - Interactive: diagnose before retrying
+   - Unattended: retry once; on second failure escalate via advisor
+     ```
+     BUILD_STATUS: { wave, tasks_done, tasks_failed, commits, escalated: true }
+     ```
+
+9b. **Mandatory per-wave code-review gate (runs after merge + test gate, BEFORE next wave dispatches):**
+
+    ⛔ **NO wave may dispatch until the previous wave's code-review pass clears.** Memory `feedback_code_review_per_wave.md` — Davesend 2026-05-24 incident.
+
+    Dispatch ONE `pr-review-toolkit:code-reviewer` agent with the wave's merged diff:
+
+    ```
+    Agent({
+      subagent_type: "pr-review-toolkit:code-reviewer",
+      description: "Wave <N> code review",
+      prompt: "Review the diff `git diff <wave-base-sha>..HEAD` on develop.
+               Focus on: bugs, logic errors, security vulnerabilities, project-convention adherence
+               (.claude/rules/*, CLAUDE.md). Apply confidence-based filtering — high-confidence
+               findings only. Report severity per finding: critical | high | medium | low.
+               Return CODE_REVIEW_COMPLETE with: { critical_count, high_count, medium_count,
+               low_count, findings: [{severity, file:line, issue, suggested_fix}] }."
+    })
+    ```
+
+    **Severity gate (default — high+ blocks):**
+    - `critical` or `high` findings → reopen affected work items to `todo` with finding text in notes; fix in a new wave before continuing
+    - `medium` or `low` findings → append to each work item's `implementation_report.flags`; do NOT reopen; validator sees them
+    - Zero findings → log `CODE_REVIEW: CLEAN` and proceed to next wave
+
+    Under `RDC_TEST=1`: echo `[RDC_TEST] skipping code-review dispatch` and proceed.
+
+10. **Mandatory validator gate (runs after ALL waves complete — before any work item closes):**
+
+    ⛔ **NO work item may be set to `done` without the validator passing it.**
+
+    Dispatch ONE validator agent with the complete list of `review` work items and the full git diff.
+    ⚠️ The validator does NOT use `isolation: "worktree"` — it must read the fully merged develop branch. Omit the isolation parameter for this dispatch only.
+
+    ```
+    "Read {PROJECT_ROOT}/.rdc/guides/agent-bootstrap.md then {PROJECT_ROOT}/.rdc/guides/verify.md.
+     Read {PROJECT_ROOT}/.rdc/guides/engineering-behavior.md before validating scope, deviations, and evidence.
+     Validate these work items: [list of IDs and titles].
+     Apps touched: [list].
+     Git diff since build start: [attach or reference].
+     You are the ONLY agent that closes work items to done.
+     Follow verify.md procedure exactly: tsc → vitest → dev server route probes → record result per item."
+    ```
+
+    The validator:
+    - Runs `npx tsc --noEmit` for every touched app/package
+    - Starts the dev server and probes every modified route (expects HTTP 200, not 500)
+    - Runs vitest for every touched package
+    - **Verifies checklist decomposition quality per work item before functional validation:**
+      - Every implementation work item has >= 10 attested `decomp-*`/`test-*` items, meets the per-surface completeness floors (each declared surface covered), and no feature WP ships a 5-6-row checklist
+      - Every `decomp-*` item includes route/file, action, expected result, and evidence artifact
+      - Any unchecked `decomp-*` item with `required: true` = work item CANNOT be set to `done`
+      - Any coarse or non-falsifiable `decomp-*` item = reopen to `todo` with the specific failure
+    - **Verifies test plan completion per work item:**
+      - For each `test-assert-*` checklist item: confirm a corresponding vitest test exists and passes
+      - For each `test-smoke-*` checklist item: run the command and confirm exit code / HTTP status
+      - For each `test-visual-*` checklist item: note as "delegated to UI audit" (validator cannot verify visuals)
+      - For each `test-contract-*` checklist item: verify the export/type/shape exists in the built code
+      - Any unchecked `test-*` item with `required: true` = work item CANNOT be set to `done` (DB enforces this)
+    - Sets passing items to `done`, failing items back to `todo` with failure detail
+    - Returns `VALIDATOR_COMPLETE` report with test plan status per item
+
+    **If the validator finds failures:** fix them in a new wave, then re-run the validator. Do not skip.
+    **File existence alone is NOT verification.** A route returning 500 is a failure regardless of tsc passing.
+    **Unchecked test plan items are a hard gate** — `update_work_item_status('done', ..., p_actor_role := 'validator')` will raise an exception if any `required: true` checklist item is unchecked, missing agent-session tick evidence, or re-ticked by a supervisor/validator.
+
+11. **After verification passes:**
+    - All wave commits are already on develop and pushed (Step 9 pushes after each wave merge).
+    - Update epic version: `bump_epic_version()`
+    - Report summary with verification evidence quoted
+
+## Agent TDD Requirements
+
+When dispatching agents, include in every prompt:
+```
+TDD REQUIREMENT: Write tests FIRST for new functions/modules.
+Run: npx vitest run packages/<name> to verify red → implement → verify green.
+NEVER run pnpm build or pnpm turbo. Use npx vitest run only.
+```
+
+## Rules
+- Branch: development branch only (auto-commit, no confirmation needed)
+- NEVER let two agents edit the same file
+- NEVER run `pnpm build` (crashes system) — code only
+- Every agent reads its guide file — no exceptions
+- Update Supabase work items IN REAL TIME — not batch at end
+- Push after each wave, not just at the end
+- Unattended: NEVER pause — continue automatically
+- Unattended: max 2 retries per task before escalating to advisor
+- Every Agent() dispatch: `model: <routed>` + `max_turns: 70` — non-negotiable. `isolation` is per the dispatch-mode rule in Step 7: NON-isolated (omit `isolation`) for doc-only and single-committer waves; `isolation: "worktree"` ONLY for true parallel MULTI-committer waves, and only after the HARD GATE (worktree base == develop HEAD) passes — a stale-base isolated wave is a build failure. Model is chosen per task per the routing table in Step 7: Sonnet 4.6 for updates/edits, Opus 4.6 for harder coding, Opus 4.8 for design/innovative thought (CS 2.0, brand/UX, architecture). Supervisor logs `model=<chosen> reason=<phrase>` per agent. Exception: validator agent in Step 10 always omits isolation; validator model stays `claude-sonnet-4-6` (verification, not generation).
+- Finding an existing file is NOT task completion — verify it satisfies the spec
+
+## Capture lessons (exit step)
+
+Before the final verdict line, follow `.rdc/guides/lessons-learned-spec.md` § Capture procedure. If this run taught something non-obvious — a first root-cause theory that turned out wrong, the documented/standard path not working, a missing gate or check that cost a round, or a surprising tool/infra behavior — write one `.rdc/lessons/<YYYY-MM-DD>-build-<short-slug>.md` per lesson using the schema in that spec. Set `scope` (`simple` | `architectural`) and `status` (`open`, or `applied` if you shipped the fix in this same run, with the commit linked). Commit the lesson file(s) on `develop` alongside the run's other commits, and note "N lessons captured" in your verdict/summary. A run that taught nothing writes nothing — absence is the default.

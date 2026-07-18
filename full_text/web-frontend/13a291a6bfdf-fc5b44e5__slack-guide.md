@@ -1,0 +1,907 @@
+---
+name: slack-guide
+description: >
+  Access Slack: search messages, read threads, send messages,
+  send threads, edit messages, upload files, look up users
+  and channels, manage reactions. Use when asked to "check
+  Slack", "find messages", "search Slack", "send a message",
+  "post a thread", "send these as a thread", "edit that
+  message", "fix that message", "update what I said",
+  "upload a file", "share this file", "attach this", "what
+  did X say", "show me the thread", "who is", "react to",
+  or any query about Slack messages, channels or users.
+---
+
+# Slack
+
+Access Slack through the `slack` tool. Translates natural
+language requests into structured API calls.
+
+When composing messages on behalf of the user (not just
+relaying information), follow the user's writing voice and
+prose style guides. The message should sound like the user
+wrote it.
+
+## Authentication
+
+User must run `/slack-setup` once to authenticate. Credentials
+persist across sessions. The tool auto-prompts if not set up.
+
+## User Identity
+
+The extension tracks the authenticated user's Slack handle in
+session state. Once populated, it's injected into agent context
+automatically so you always know who you're acting on behalf of.
+
+**First session**: call `get_user` with the user's handle early
+in the conversation to verify identity and populate the session
+state. Don't guess handles from project context; verify them.
+
+**Subsequent sessions**: the identity is restored automatically.
+Use the known handle for `from:` queries without re-verifying.
+
+## Core Principle: Present Results, Don't Parrot
+
+After a tool call returns, **summarise the results conversationally**.
+Don't just say "here are the results" — the user already sees
+the collapsed tool output. Add value by highlighting what matters:
+
+- Name the people involved and what they said
+- Call out the key topic or decision
+- Note dates/timing if relevant
+- Mention thread depth or follow-up if the user might want more
+
+**Bad:** "Here are your last 5 messages to Chao Duan."
+**Good:** "Your last 5 messages to Chao Duan were yesterday evening,
+discussing M5 risk areas and an upcoming call. You offered to help
+with triaging issues."
+
+## Identifier Resolution
+
+The `channel` parameter accepts **any identifier format**
+uniformly across all actions:
+
+- Channel names: `"gitstream"` or `"#gitstream"`
+- Channel IDs: `"C0AJY0FLK8Q"`
+- User IDs: `"U093FQUHEJG"` (resolves to the DM conversation)
+- Slack permalink URLs: passed as `target`, parsed automatically
+
+The tool resolves all identifiers before processing. You don't
+need to worry about which format a particular action expects;
+use whatever you have from previous context.
+
+**One exception**: `search_messages` and `search_files` cannot
+search inside DM or group DM conversations. If you pass a user
+ID or DM channel ID as `channel` to a search action, the tool
+returns a clear error directing you to use `list_messages`
+instead. This is a Slack API limitation, not a tool limitation.
+
+## Translating User Intent
+
+### "Check Slack for X" / "Search Slack for X"
+→ `search_messages` with `query: "X"`
+
+### "Messages from [person]" / "What did [person] say"
+→ `search_messages` with `from: "person"` (and optionally `query`)
+- Use the person's Slack handle (first.last format)
+- `query` is optional when structured params (`from`, `with`,
+  `channel`, `after`, `before`) are present — it defaults to `*`
+
+### "Messages in [channel] about X"
+→ `search_messages` with `query: "X"` and `channel: "channel-name"`
+
+### "Messages I sent to [person]"
+→ `list_messages` with the person's user ID as `channel`,
+  then filter output to messages from the authenticated user.
+  Falls back to `search_messages` with `from: "me"` and
+  `with: "person"` when keyword filtering is needed, but
+  note that search results include shared channels.
+
+### "My DMs with [person]" / "Conversations with [person]"
+→ **Always** use `list_messages` with the person's user ID
+  as the `channel`. The resolver calls `conversations.open`
+  to find the DM automatically. This returns only DM messages
+  — complete and in order.
+
+  **Do not** use `search_messages` with `with:` for DM
+  history. Search mixes in shared channel results, misses
+  messages the index doesn't match, and is unreliable for
+  comprehensive queries. Only use `with:` when you need
+  keyword filtering across all conversations (DMs, group
+  DMs and channels together) and tell the user the results
+  include shared channel messages.
+
+  To get the user ID, call `get_user` first if you only
+  have a handle.
+
+### "Last thread I started in [channel]"
+→ `search_messages` with `from: "me"` and `channel: "channel-name"`
+  Slack has no "thread parent only" operator. `is:thread`
+  matches replies too. To find threads the user *started*,
+  look for messages with `[N replies]` in the output — these
+  are thread parents. Messages without a reply count are
+  either top-level posts with no thread or replies within
+  someone else's thread.
+
+### "Show me the thread" / "Get the full thread"
+→ `get_thread` with the message's `channel` + `ts`, or with
+  `target` if you have a permalink URL from search results.
+  Both approaches work identically — use whichever you have.
+
+  Every message in tool results includes a `(ts:...)` value
+  in its header line. Use that exact value. **Never fabricate
+  or guess a timestamp** — Slack timestamps are precise
+  identifiers, not derivable from human-readable dates.
+
+### "Get that specific message from the thread"
+→ `get_message` with `channel`, `ts` (the reply's ts) and
+  `thread_ts` (the thread parent's ts).
+
+  Without `thread_ts`, `get_message` only finds top-level
+  channel messages. Thread replies require both timestamps
+  because Slack's API uses the parent ts to locate the thread
+  and the reply ts to find the specific message within it.
+
+  The thread parent's ts is the first message's `(ts:...)`
+  in a `get_thread` result.
+
+### "What's happening in #channel" / "Last N messages in #channel"
+→ `list_messages` with `channel: "channel-name"` and a `limit`
+  This uses `conversations.history`, which returns every
+  message in the channel. Pass `limit: 0` for unlimited.
+  **Always use `list_messages` for channel history**, not
+  `search_messages`. Slack's search index doesn't guarantee
+  returning every message; a wildcard query like `*` will
+  miss messages that the indexer doesn't match.
+
+### "Who is [person]"
+→ `get_user` with `user: "person"` (handle or @handle)
+
+### "Tell me about #channel"
+→ `get_channel` with `channel: "channel-name"`
+
+### "Send [person/channel] a message saying…"
+→ `send_message` with `channel` and `text`
+- The user sees a confirmation gate before it sends
+
+### "Start a group DM with [person] and [person]"
+→ `send_message` with `channel` set to comma-separated user
+  IDs or @handles, and `text` for the message body.
+  Examples:
+  - `channel: "W018HTJBU1H,U09HTCT9YLU"`
+  - `channel: "@katie.laliberte,@jonathan.feng"`
+
+  The tool calls `conversations.open` with multiple users to
+  create or find the group DM, then sends the message.
+  Handles are resolved to user IDs automatically. If you
+  already have user IDs from a previous `get_user` call, use
+  those directly.
+
+### "Reply to that thread saying…"
+→ `reply_to_thread` with `channel`, `ts` (from previous context), and `text`
+
+  The thread parent's timestamp goes in `ts`, not `thread_ts`.
+  `reply_to_thread` reads only `ts`; it ignores `thread_ts`
+  and fails with `Missing required parameter: channel + ts or
+  target` when `ts` is empty. `thread_ts` exists solely for
+  `get_message` of a reply inside a thread. The parameter
+  name is a trap: "reply to a thread" does not mean "fill in
+  thread_ts."
+
+### "Edit that message" / "Fix that" / "Update what I said"
+→ `edit_message` with `target` (or `channel`+`ts`) and the
+  new `text` (and optional `table`)
+- Only edits messages the authenticated user authored.
+  Slack rejects edits to anyone else's messages.
+- The full message text is **replaced**, not merged. Pass
+  the complete new text, not just the part that changed.
+- Cannot add or remove file attachments — Slack's
+  `chat.update` API only changes text and blocks. If the
+  user wants to swap attachments, delete the message and
+  re-upload.
+- The confirmation gate shows the new text exactly as it
+  will appear after the edit. The user approves, rejects
+  or redirects with notes — the same flow as `send_message`.
+- Works on top-level messages and thread replies
+  identically. Use the reply's own `ts`, not the thread
+  parent's.
+
+```
+slack({ action: "edit_message", target: "https://...permalink...",
+        text: "Updated draft — fixed the typo and added the link" })
+```
+
+### "Reply to that thread with these messages…" / "Send these as replies"
+→ `reply_to_thread` with `channel`, `ts` and a `messages`
+  array (same shape as `send_thread`)
+- Use this when the user has several thoughts that belong
+  on an existing thread and you want to queue them up for
+  a single review pass.
+- Mutually exclusive with `text`, `file_path`/`file_paths`
+  and `table`. Pick one mode.
+- The tabbed review gate works the same as `send_thread`:
+  one tab per reply, all must be approved, any rejection
+  halts everything. The role label on each tab says
+  "Reply N of M" so the gate can't be confused with the
+  thread-creation flow.
+
+### "React to that with :emoji:"
+→ `add_reaction` with `target` or `channel`+`ts`, and `emoji`
+
+### "Send this file to #channel" / "Share this in #channel"
+→ `upload_file` with `file_path` and `channel`
+- The file path must be an absolute path or relative to the
+  current working directory.
+- Add `text` for an initial comment introducing the file.
+
+### "Reply with this file attached" / "Share this in the thread"
+→ `upload_file` with `file_path`, `channel`+`ts` (or
+  `target`), and optionally `text`
+- Thread targeting works the same as `reply_to_thread`:
+  use `target` for a permalink or `channel`+`ts` for
+  explicit targeting.
+
+### "Send a message with this file" / "Message them with the report"
+→ `send_message` with `text`, `channel`, and `file_path`
+- When `file_path` or `file_paths` is present on
+  `send_message` or `reply_to_thread`, the file gets
+  uploaded and shared alongside the message text.
+- This is the natural choice when the user wants both a
+  message and a file attachment in a single action.
+
+### "Upload these files" / "Share all of these"
+→ `upload_file` with `file_paths` (array) and `channel`
+- Multiple files are uploaded individually and shared
+  together in a single message.
+- `file_path` (singular) and `file_paths` (array) can be
+  combined; duplicates are ignored.
+
+### "Post a thread about X" / "Send these as a thread"
+→ `send_thread` with `channel` and `messages` array
+- The first message becomes the thread parent; the rest
+  become replies in order.
+- Each message object has `text` and optional `file_path`
+  / `file_paths` for attachments.
+- A tabbed review gate shows every message for approval
+  before anything is sent. Rejecting or redirecting any
+  single message halts the entire thread and nothing is
+  sent.
+- When the user rejects or steers a message, their note
+  tells you what to change. Rewrite the affected
+  message(s) based on their feedback and resubmit the
+  full `messages` array. Don't drop the rejected message;
+  fix it. Don't resend only the rejected one; the whole
+  thread must be reviewed together.
+- Every message must be reviewed. If the user submits
+  early (Ctrl+Enter) without reviewing all tabs, the
+  gate rejects with a note asking them to review
+  everything.
+- The same `messages` array works on `reply_to_thread`
+  when the user wants to queue several replies on an
+  existing thread instead of starting a new one. See
+  the "Reply to that thread with these messages" entry
+  above.
+
+```
+slack({ action: "send_thread", channel: "#team-updates",
+        messages: [
+          { text: "Weekly update for the team" },
+          { text: "Progress: shipped the new dashboard" },
+          { text: "Blockers: waiting on API access" }
+        ] })
+```
+
+### Ambiguous Date Ranges
+
+When the user says "last 3 months", "recently" or "this
+quarter", state the exact date range you're using (e.g.,
+"Searching from December 27 to today") so the user can
+correct it if it doesn't match their intent.
+
+### "Messages I reacted to" / "Where did I react"
+→ Multiple `search_messages` calls, one per common emoji.
+  Use `hasmy::thumbsup:`, `hasmy::heart:`, `hasmy::fire:`,
+  etc. as the query. See "Enterprise Grid Limitations" for
+  the full approach.
+  **Do not** try `hasmy:reaction` — it returns nothing.
+
+## Search Operators
+
+Slack search supports these operators embedded in the `query`:
+- `from:username` — messages from a person
+- `to:username` — direct messages to a person
+- `with:@person` — DMs and threads with a specific person
+  (also available as the `with` parameter)
+- `in:#channel` — messages in a channel
+- `has:reaction` — messages that have **any** reaction on them
+  (from anyone). Does NOT mean "messages I reacted to."
+- `has:link` / `has:pin` — message properties
+- `hasmy::thumbsup:` — messages **you** reacted to with a
+  **specific** emoji. There is no wildcard form: `hasmy:reaction`
+  does NOT work. You must name the exact emoji.
+  Do not confuse with `has:reaction` which is unrelated.
+- `is:thread` — only thread messages
+- `is:saved` — your saved items
+- `after:YYYY-MM-DD` / `before:YYYY-MM-DD` — date range.
+  **These are exclusive**: `after:2026-03-26` means messages
+  from March 27 onward, not from March 26. To include today,
+  use yesterday's date.
+- `on:YYYY-MM-DD` — exact date
+- `during:month` / `during:year` — relative dates (e.g. `during:march`)
+- `"exact phrase"` — quoted exact phrase match
+- `term -excluded` — exclude results containing a word
+- `rep*` — wildcard prefix match (min 3 characters)
+
+Structured parameters (`from`, `with`, `channel`, `after`,
+`before`) get appended as operators to the query string.
+
+**No "starts with" operator**: Slack search matches a phrase
+anywhere in the message body, not just at the start. When
+the user asks for messages starting with a phrase, search
+for that phrase and tell the user that results include any
+message containing it. Post-filtering on returned text is
+approximate since message text in results may be truncated.
+
+## URL and ID Handling
+
+All identifier formats are resolved automatically:
+
+- **Permalink URLs**: pass as `target` — works for any
+  message-targeting action (`get_message`, `get_thread`,
+  `get_reactions`, `reply_to_thread`, `add_reaction`,
+  `remove_reaction`).
+- **Channel + ts**: pass as `channel` + `ts` — works for
+  the same actions. Equivalent to using a permalink.
+- **Channel names**: with or without `#`. Resolved to the
+  conversation automatically.
+- **User IDs as channel**: resolves to the DM conversation
+  automatically via `conversations.open`.
+- **Comma-separated user IDs or @handles**: resolves to a
+  group DM via `conversations.open` with multiple users.
+- **User handles**: with or without `@`. Resolved to user
+  IDs automatically.
+- **Timestamps**: the `ts` field from previous results.
+
+## Context Management
+
+### Remember Previous Results
+
+After `search_messages`, remember the message list. The user
+may say:
+- "Show me the thread for the first one" → use the permalink
+  or channel + ts from the result
+- "What's the context for that third message" → get_thread
+- "Reply to that" → use channel + ts from the message
+
+After `list_messages` in a channel, the user may say:
+- "What's that thread about" → get_thread with channel + ts
+- "Send a reply" → reply_to_thread
+
+After `get_user`, the user may ask:
+- "Send them a message" → use the user ID as channel
+
+### Thread Navigation
+
+The most common follow-up after a search is reading a thread.
+When results show messages with thread context, proactively
+mention that threads are available.
+
+## File Attachments
+
+Slack messages can carry file attachments: images,
+screenshots, code snippets, JSON configs, etc. The tool
+automatically downloads and exposes file content for
+targeted fetches (`get_message` and `get_thread`).
+
+**Images** (png, jpeg, gif, webp) are downloaded and
+returned as image content the model can see directly.
+
+**Text files** (`text/*` types plus json, xml, yaml,
+javascript, typescript, sh, sql, graphql, toml) are
+downloaded and returned as text content.
+
+**Other file types** are not downloaded but their URLs
+are rendered as markdown links (`📄 [name](url)`) so
+the user can access them manually.
+
+**Bulk fetches** (`list_messages`, `search_messages`)
+don't auto-download files — they show file references
+with URLs. Use `get_message` to download a specific
+file on demand.
+
+Limits: max 10 files per request, 5 MB per image,
+128 KB per text file. Oversized or inaccessible files
+are skipped silently; the filename still appears in
+the rendered text.
+
+## Response Formatting
+
+When presenting results to the user:
+
+1. **Lead with a summary**: "Found 5 messages from you to
+   Chao Duan, all from yesterday evening."
+2. **Highlight the substance**: what topics, decisions, or
+   requests appear in the messages.
+3. **Offer next steps**: "Want me to pull up the full thread
+   for any of these?" or "Should I reply to that?"
+
+Don't re-list every message — the tool output already shows
+them. Add interpretation and context the raw output doesn't
+provide.
+
+## Pagination
+
+The tool auto-paginates internally for `search_messages`,
+`search_files` and `list_messages`. You don't need to manage
+pages yourself; just set the `limit` parameter and the tool
+fetches as many pages as needed.
+
+- **Default limit**: 20 results. Fine for quick lookups.
+- **"Show me all"**: pass `limit: 0` for unlimited results.
+- **Specific count**: pass any number. `limit: 1000` fetches
+  up to 1000, paging through internally.
+
+**When the user asks a question that requires comprehensive
+data** (e.g. "how many times did I…", "find all messages
+about…", "what did I say over the past N months"), **always
+pass `limit: 0`** with appropriate `oldest`/`latest` params.
+The default limit of 20 is useless for these queries. Drawing
+conclusions from partial data is worse than fetching too much.
+
+For search results, when the total exceeds what was fetched,
+the output says so. Relay this to the user and offer to fetch
+the rest with a higher limit.
+
+## Efficiency: Minimise Tool Calls
+
+The Slack API has no "top DM partners" or "most active
+channels" endpoint. Complex questions require creative
+querying. Aim to extract maximum information from each call.
+
+**Use `list_messages` for DM history**: pass the person's
+user ID as the `channel` — it resolves to the DM
+automatically via `conversations.open`. This returns only
+DM messages, complete and in order. Use `with:` on
+`search_messages` only when you need keyword filtering
+across DMs *and* shared channels.
+
+**Batch over serial**: a single `search_messages` with 100
+results gives you conversation metadata, user IDs,
+timestamps and text. Extract patterns from that data before
+making more calls. Don't look up each user or channel
+individually unless you need details beyond what the search
+gave you.
+
+**User mentions are auto-resolved**: the tool resolves raw
+Slack user IDs (U08ME9KASG7) to @handles automatically,
+both in message author fields and in message text mentions.
+You don't need to call `get_user` just to learn someone's
+name — it already appears in message output.
+
+**Conversation types are resolved automatically**: each
+message includes conversation metadata with a `displayName`
+and `kind`. Kinds are `dm` (1:1 direct message), `group_dm`
+(multi-person DM), or `channel` (public or private channel).
+Use these to filter results instead of guessing from ID
+prefixes.
+
+**Use search operators aggressively**: combine operators to
+narrow results. `from:me with:@person after:2025-03-01` is
+far more efficient than broad searches filtered after the
+fact.
+
+**For "who do I DM most"**: search `from:me` with a high
+limit. Each result has a conversation `kind` of `dm`,
+`group_dm` or `channel`. Filter to `dm` and `group_dm`
+entries and count by conversation to rank DM partners.
+Display names show who the DM is with (e.g. "@chao.duan"
+or "@chao.duan, @xiao.li, @henrique.andrade").
+
+## Enterprise Grid Limitations
+
+Some Slack APIs are blocked on enterprise workspaces even
+with browser session tokens:
+
+- **`reactions.list`**: blocked (`not_allowed_token_type`).
+  Cannot list all messages a user reacted to.
+- **`users.conversations`**: blocked (`enterprise_is_restricted`).
+  Cannot list DM channels or group DMs.
+- **`conversations.list`**: blocked. Cannot enumerate channels.
+
+These limitations mean some queries require creative
+workarounds through search. Never fall back to raw shell
+commands or curl — always use the tool's search actions.
+
+### "Messages I reacted to" / "Where did I react"
+
+The `hasmy::emoji:` operator requires a specific emoji name.
+There is no wildcard. Search common emojis individually:
+
+```
+hasmy::thumbsup: after:2025-03-20
+hasmy::heart: after:2025-03-20
+hasmy::fire: after:2025-03-20
+hasmy::joy: after:2025-03-20
+hasmy::raised_hands: after:2025-03-20
+hasmy::tada: after:2025-03-20
+hasmy::100: after:2025-03-20
+```
+
+Run multiple `search_messages` calls with these queries.
+Deduplicate across results and filter by conversation `kind`
+if the user asks about DMs specifically.
+
+**Warn the user** that this only covers common emojis. Custom
+or unusual reactions may be missed.
+
+## Message Formatting
+
+The tool accepts a hybrid of Slack mrkdwn and standard
+markdown and converts the message to Block Kit before
+sending. Both spellings of bold, italic, strikethrough and
+links are accepted. Lists, headings, dividers, blockquotes
+and code blocks render natively. Not all markdown features
+translate — see "Unsupported Syntax" below for what to
+never include.
+
+### Text Formatting
+- **Bold**: `*text*` or `**text**`
+- **Italic**: `_text_`
+- **Strikethrough**: `~text~` or `~~text~~`
+- **Inline code**: `` `code` ``
+- **Code block**: triple backticks on their own lines.
+  No language hints — Slack ignores them.
+
+### Structure
+- **Headings**: `# Title`, `## Subtitle`, etc. Slack only
+  has one heading style, so all levels render the same
+  (large bold text). The tool emits a Block Kit `header`
+  block.
+- **Dividers**: a line containing only `---`, `***` or
+  `___` becomes a horizontal rule (Block Kit `divider`).
+- **Bulleted lists**: start each line with `- `, `* ` or
+  `+ ` (a marker then a space). The tool converts consecutive
+  bullet lines into a native Slack `rich_text_list` block, so
+  wrapped lines indent correctly. Never use a `•`, `‣`, `◦`,
+  `▪`, `·` or any other manual bullet glyph: Slack renders those
+  as literal characters, not a list, and they defeat the native
+  list block. Markdown markers only.
+- **Ordered lists**: start each line with `1. `, `2. ` and
+  so on. Slack always renumbers from 1 regardless of the
+  digits you write — the digits are just a marker.
+- **Nested lists**: indent sub-items by two spaces (or one
+  tab) per level. Mixing bullet and ordered styles or
+  changing indent starts a new list block.
+- **Blockquotes**: start each line with `> `. Consecutive
+  quote lines become a single `rich_text_quote` block.
+- **Line breaks**: newlines inside a paragraph are
+  preserved. A blank line between paragraphs (or between a
+  paragraph and a list/quote/code) renders as visible
+  vertical space.
+
+### Links and Mentions
+- **Links**: `[display text](https://example.com)` or
+  Slack's native `<https://example.com|display text>` —
+  both work. Bare URLs (`https://example.com`) auto-link.
+- **User mentions**: write `@first.last` and the tool
+  resolves the handle to a user ID. `<@U12345>` is also
+  accepted.
+- **Channel mentions**: `<#C12345>` with the channel ID.
+
+### Avoiding Auto-Detected Colour Swatches
+
+Slack auto-renders any `#` followed by 3, 4, 6 or 8 hex
+digits as a colour swatch — which catches PR numbers like
+`#675891`. The tool defends against this automatically by
+splitting the `#` and the digits across two adjacent text
+elements, so the rendered output looks identical but the
+swatch detector doesn't fire. No special syntax needed.
+
+### Unsupported Syntax (Never Use)
+
+These render as raw text or break formatting. Never include
+them in Slack messages:
+
+- ` ```python ` — language hints are ignored. Use bare
+  triple backticks with no language identifier.
+- `![alt](image-url)` — image embedding does not exist.
+  Upload images with `file_path` instead.
+- `| col | col |` — pipe tables render as broken
+  plaintext. Always use the `table` parameter for
+  tabular data (see Tables below).
+
+## Tables
+
+**Always use the `table` parameter for tabular data.** Never
+format tables as pipe-delimited markdown in the `text`
+field — Slack renders pipe tables as broken plaintext.
+
+Tables appear in received messages (rendered as pipe tables
+in tool output for readability) and are sent using the
+`table` parameter on `send_message`, `reply_to_thread` or
+individual `send_thread` messages.
+
+### Reading Tables
+
+When a message contains a Slack table block, the tool
+renders it as a pipe-delimited markdown table in the
+output. Bold text appears as `**text**`, links as
+`[text](url)`, mentions as `@handle` — the same format
+as regular message text.
+
+### Sending Tables
+
+Use the `table` parameter on `send_message`,
+`reply_to_thread`, or individual `send_thread` messages.
+
+```
+slack({
+  action: "send_message",
+  channel: "#ops",
+  text: "Outstanding issues by director:",
+  table: {
+    columns: ["Director", "Issue Count"],
+    rows: [
+      ["*Patrick Burke*", "3"],
+      ["<https://github.com/org/repo/pulls|Andrew McNamara>", "2"],
+      ["Brad Wright", "2"]
+    ],
+    column_settings: [null, { align: "right" }]
+  }
+})
+```
+
+**Cell formatting**: cells are mrkdwn strings — the same
+formatting as message text. Use `*bold*`, `_italic_`,
+`~strike~`, `` `code` ``, `<url|text>` for links, and
+`@handle` for mentions. Cells without formatting are sent
+as plain text.
+
+**Column settings**: optional per-column display settings.
+Each entry can have:
+- `align`: `"left"` (default), `"center"`, or `"right"`
+- `is_wrapped`: `true` to wrap text instead of truncating
+
+Use `null` to skip a column and keep defaults.
+
+**Notification fallback**: the `text` field becomes the
+notification preview when a table is present. If `text`
+is omitted, a fallback like "Table with N rows" is
+generated.
+
+**Constraints**:
+- 1 table per message (Slack limit)
+- Max 100 rows, 20 columns
+- Each row must have the same number of cells as there
+  are columns
+
+### "Send a table showing…" / "Post this data as a table"
+→ `send_message` with `table: { columns, rows }`
+- Tables render as native Slack table blocks (not ASCII art
+  or code blocks)
+- A confirmation gate shows a box-drawing preview of the
+  table before sending
+
+## Uploading Files
+
+The `upload_file` action uploads local files to Slack using
+the V2 external upload API. Files can also be attached to
+`send_message` and `reply_to_thread` by adding `file_path`
+or `file_paths` to the call.
+
+### When to Use Which
+
+**File only (no message text):**
+```
+slack({ action: "upload_file", channel: "team-updates",
+        file_path: "/path/to/report.pdf" })
+```
+
+**File with an introductory comment:**
+```
+slack({ action: "upload_file", channel: "team-updates",
+        file_path: "/path/to/report.pdf",
+        text: "Here's the weekly report" })
+```
+
+**Message with file attachment:**
+```
+slack({ action: "send_message", channel: "team-updates",
+        text: "Here's the weekly report",
+        file_path: "/path/to/report.pdf" })
+```
+The `send_message` and `reply_to_thread` approach is the
+natural choice when the user's intent is "send a message
+with an attachment."
+
+**Thread reply with file:**
+```
+slack({ action: "reply_to_thread", channel: "C0AJY0FLK8Q",
+        ts: "1743044006.509399",
+        text: "Updated version attached",
+        file_path: "/path/to/updated.png" })
+```
+Alternatively, use `upload_file` with `target` or
+`channel`+`ts` for thread targeting.
+
+**Multiple files:**
+```
+slack({ action: "upload_file", channel: "design-reviews",
+        file_paths: ["/path/to/mockup-v1.png",
+                     "/path/to/mockup-v2.png"],
+        text: "Two options for the new layout" })
+```
+`file_path` and `file_paths` can be combined; duplicates
+are ignored.
+
+### File Path Resolution
+
+File paths must be absolute or relative to the current
+working directory. The tool reads the file from disk and
+uploads the raw bytes to Slack. It supports any file type:
+images, PDFs, code files, documents and anything else Slack
+accepts.
+
+**Thread messages with attachments:**
+```
+slack({ action: "send_thread", channel: "design-reviews",
+        messages: [
+          { text: "Two layout options for review" },
+          { text: "Option A",
+            file_path: "/path/to/mockup-v1.png" },
+          { text: "Option B",
+            file_path: "/path/to/mockup-v2.png" }
+        ] })
+```
+Each message in a `send_thread` call can have its own
+attachments. Files are uploaded into the thread after
+each message is sent.
+
+### Confirmation Gate
+
+All file uploads show a confirmation gate before uploading.
+The gate displays file names, sizes and the destination
+channel or thread. The user can approve, reject or redirect.
+
+`send_thread` uses a tabbed confirmation gate: one tab per
+message showing the text and any attached files. All
+messages must be approved before anything is sent. If the
+user rejects or steers any message, the entire thread is
+halted. Rewrite the affected message(s) based on the
+user's feedback and resubmit the full array.
+
+## Common Mistakes to Avoid
+
+**DON'T** just echo "here are the results":
+```
+# ❌ Bad
+"Here are your last 5 messages to Chao Duan."
+
+# ✅ Good
+"Your recent conversation with Chao Duan (yesterday evening)
+was about M5 risk areas — you offered to help triage issues
+and mentioned having a call scheduled. Want me to pull up
+the full thread?"
+```
+
+**DON'T** forget context from previous results:
+```
+# ❌ Bad: asking for a URL the results already provided
+"What's the thread URL?"
+
+# ✅ Good: use the permalink or channel + ts from the result
+slack({ action: "get_thread", target: "https://...permalink..." })
+slack({ action: "get_thread", channel: "C0AJY0FLK8Q", ts: "1743044006.509399" })
+```
+
+**DON'T** fabricate or guess Slack timestamps:
+```
+# ❌ Bad: inventing a timestamp that looks plausible
+slack({ action: "get_thread", channel: "C0AJY0FLK8Q", ts: "1776349731.307559" })
+
+# ✅ Good: use the (ts:...) value from a previous result
+# Result showed: **@user** Apr 16, 10:02 AM (ts:1776348171.653739) [6 replies]
+slack({ action: "get_thread", channel: "C0AJY0FLK8Q", ts: "1776348171.653739" })
+```
+
+**DON'T** pass raw user IDs when the user gave a name:
+```
+# ❌ Bad
+slack({ action: "get_user", user: "U08ME9KASG7" })
+
+# ✅ Good
+slack({ action: "get_user", user: "joel.gerber" })
+```
+
+**DON'T** fall back to raw curl or shell commands when an API
+is blocked. Use the tool's search actions creatively instead.
+The user should never see curl scripts in the output.
+
+**DON'T** use `search_messages` to get channel history:
+```
+# ❌ Bad: search index doesn't return all messages
+slack({ action: "search_messages", query: "*",
+        channel: "privacy-engineering", limit: 1000 })
+
+# ✅ Good: conversations.history returns every message
+slack({ action: "list_messages",
+        channel: "privacy-engineering", limit: 1000 })
+```
+
+**DON'T** use `search_messages` to search DMs:
+```
+# ❌ Bad: search can't target DM conversations
+slack({ action: "search_messages", channel: "U093FQUHEJG" })
+
+# ✅ Good: list_messages resolves user IDs to DMs
+slack({ action: "list_messages", channel: "U093FQUHEJG" })
+```
+
+**DON'T** patch an edit by appending only the change:
+```
+# ❌ Bad: chat.update replaces the entire message
+slack({ action: "edit_message", target: "...",
+        text: "(typo fix)" })
+
+# ✅ Good: send the full new message text
+slack({ action: "edit_message", target: "...",
+        text: "Here's the report — fixed the table totals." })
+```
+
+**DON'T** try to swap attachments via `edit_message`:
+```
+# ❌ Bad: chat.update can't change attachments
+slack({ action: "edit_message", target: "...",
+        text: "updated", file_path: "/new/file.png" })
+
+# ✅ Good: delete and re-upload, or post a follow-up reply
+# explaining the change.
+```
+
+**DON'T** format tabular data as markdown in the text field:
+```
+# ❌ Bad: pipe tables render as broken plaintext in Slack
+slack({ action: "send_message", channel: "#ops",
+        text: "| Name | Count |\n|------|-------|\n| Alice | 3 |" })
+
+# ✅ Good: use the table parameter for native Block Kit tables
+slack({ action: "send_message", channel: "#ops",
+        text: "Outstanding issues:",
+        table: { columns: ["Name", "Count"],
+                 rows: [["Alice", "3"]] } })
+```
+
+**DON'T** try non-existent search operators:
+```
+# ❌ These don't exist
+hasmy:reaction
+has:myreaction
+
+# ✅ Must name a specific emoji
+hasmy::thumbsup:
+hasmy::heart:
+```
+
+**DON'T** put the thread parent's ts in `thread_ts` when
+replying. `reply_to_thread` reads only `ts`:
+```
+# ❌ Bad: fails with "Missing required parameter: channel + ts or target"
+slack({ action: "reply_to_thread", channel: "C0AJY0FLK8Q",
+        thread_ts: "1781112262.653269", text: "..." })
+
+# ✅ Good: the parent ts goes in ts
+slack({ action: "reply_to_thread", channel: "C0AJY0FLK8Q",
+        ts: "1781112262.653269", text: "..." })
+```
+
+**DON'T** use `•` or other glyph bullets for lists. They
+render as literal text, not a Slack list:
+```
+# ❌ Bad: • is a literal character, not a list marker
+slack({ action: "send_message", channel: "#ops",
+        text: "• Safe: gt restack\n• Not safe: gt get" })
+
+# ✅ Good: markdown markers become a native rich_text_list
+slack({ action: "send_message", channel: "#ops",
+        text: "- Safe: gt restack\n- Not safe: gt get" })
+```

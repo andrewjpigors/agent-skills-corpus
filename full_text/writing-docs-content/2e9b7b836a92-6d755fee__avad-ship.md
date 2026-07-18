@@ -1,0 +1,1069 @@
+---
+name: avad-ship
+version: 2.11.7
+description: |
+  Ship workflow: validate branch state, sync with target branch, run tests,
+  pre-landing review, push, and create PR. Project-aware — reads target branch,
+  test commands, and review checklist from docs/GIT_WORKFLOW.md.
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+---
+<!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
+<!-- Regenerate: bun run gen:skill-docs -->
+
+# Ship: Validate, Review, and Ship
+
+You are running the `/ship` workflow. This is **automated by default** — run straight through
+and output the PR URL at the end.
+
+**Only stop for:**
+- Being on a protected branch (ask user: create work branch / commit directly / abort)
+- Merge conflicts that can't be auto-resolved (show conflicts)
+- Validation failures (show failures)
+- Pre-landing review ASK items that need user judgment
+- Cannot discover target branch or test commands (ask once)
+
+**Never stop for:**
+- Commit message wording (auto-compose)
+- PR body content (auto-generate)
+- Auto-fixable review findings (dead code, N+1, stale comments — fixed automatically)
+- Test coverage gaps (auto-generate and commit, or flag in PR body)
+
+---
+
+## Safety Check
+
+Before anything else, check if you are on a known protected branch:
+
+```bash
+branch=$(git branch --show-current)
+```
+
+If `$branch` is `main` or `master`, use **AskUserQuestion** with options:
+- **A) Create a work branch** — move changes to a new branch and continue shipping
+- **B) Commit on `<branch>` directly** — bypass branch protection rule
+- **C) Abort** — stop shipping
+
+This prevents accidentally committing onto a protected branch while still giving the user control.
+
+---
+
+## Step 0: Read Project Configuration
+
+Read `docs/GIT_WORKFLOW.md`.
+
+### If `docs/GIT_WORKFLOW.md` exists:
+
+Read it. Extract everything you need:
+- **Target branch** (e.g. `dev`, `main`)
+- **Protected branches** and their protection levels
+- **Branch naming** conventions and allowed prefixes
+- **Merge strategy** (squash, merge commit, rebase)
+- **Commit message format** (Conventional Commits, scopes, etc.)
+- **PR requirements** (CI checks, approvals, CODEOWNERS)
+- **Version numbering** scheme (if any)
+
+Also read:
+- `CLAUDE.md` — for **test/lint/typecheck commands**
+- `AGENTS.md` — for **domain rules** (canonical values, API whitelist, etc.)
+- `~/.avadbot/projects/<repo>/review-checklist.md` — for **pre-landing review checklist** (if it exists)
+
+### If `docs/GIT_WORKFLOW.md` does NOT exist:
+
+Generate it. Read the project's available context to infer the workflow:
+
+1. **Scan for signals:**
+   - `CLAUDE.md`, `AGENTS.md` — rules, commands, conventions
+   - `git log --oneline -20` — commit message style, branch merge patterns
+   - `git branch -r` — what remote branches exist
+   - `git config pull.rebase` — merge vs rebase preference
+   - `pyproject.toml` / `package.json` / `Cargo.toml` / `go.mod` — language and tooling
+   - `.github/workflows/` — CI configuration
+
+2. **Ask the user key questions** (one AskUserQuestion, all at once):
+   - What is your target integration branch? (e.g. `dev`, `main`)
+   - Do you use squash merge, merge commits, or rebase?
+   - Any branch naming conventions?
+   - Any required CI checks before merge?
+
+3. **Generate `docs/GIT_WORKFLOW.md`** covering:
+   - Branch structure (diagram + table of branches and their purpose)
+   - Workflow steps (create branch → commit → push → PR)
+   - Commit message format with project-specific scopes
+   - Merge strategy per PR type
+   - Protected branches and their rules
+   - Version numbering (if applicable)
+   - Agent-specific rules (what agents must/must not do)
+
+4. **Write the file but do NOT commit yet.**
+   Step 1 must validate the branch first. The file will be committed
+   in Step 7 along with other changes (or on its own if there are no other changes).
+
+   This file persists — future `/ship` runs read it directly.
+
+---
+
+## Step 1: Pre-flight
+
+1. Run `git status --short --branch` (never use `-uall`).
+
+2. Confirm the current branch is a valid work branch:
+   - Must NOT be a protected branch (as defined in `docs/GIT_WORKFLOW.md`)
+   - Must follow the branch naming conventions from `docs/GIT_WORKFLOW.md`
+   - If on a protected branch, use **AskUserQuestion** with options:
+     - **A) Create a work branch** — move changes to a new branch (e.g. `chore/description`) and continue shipping
+     - **B) Commit on `<branch>` directly** — bypass branch protection rule
+     - **C) Abort** — stop shipping
+
+3. Check for uncommitted changes:
+   - If there are uncommitted changes, auto-recommend an option based on context:
+     - **Recommend "Stage and include"** when: changed files are in the same area as
+       branch commits (same directories/modules), OR the branch has no prior commits
+       yet (all work is uncommitted)
+     - **Recommend "Stash and exclude"** when: changed files are unrelated to the
+       branch's commit history (different directories/modules)
+     - **Recommend "Delete and discard"** when: files are clearly throwaway (e.g. `test.md`
+       in root with no meaningful content, temp debug files, scratch files)
+   - Use **AskUserQuestion** with options (mark the recommended option with `(Recommended)`):
+     - **A) Stage and include** — changes are related to this branch's work
+     - **B) Stash and exclude** — changes are unrelated, stash them before shipping
+     - **C) Delete and discard** — files are throwaway, delete them before shipping
+     - **D) Show me the changes** — display the diff so I can decide
+   - If user picks A: stage all and continue
+   - If user picks B: `git stash push -u -m "ship: stashed unrelated changes"` and continue
+   - If user picks C: delete the throwaway files (`rm <files>`) and continue
+   - If user picks D: show `git diff` and `git status`, then re-ask A/B/C
+
+4. **Detect already-merged branches:**
+
+   ```bash
+   git ls-remote --heads origin <branch>
+   git diff --stat origin/<target>...HEAD
+   ```
+
+   If the branch does NOT exist on remote AND the diff against `<target>` is empty
+   (all commits already upstream), the branch was already merged and deleted.
+
+   In this case, check for uncommitted changes:
+   - **If uncommitted changes exist:** use **AskUserQuestion** with options:
+     - **A) Move to a new branch** — create a new branch from `origin/<target>` with these changes
+     - **B) Abort** — stop shipping
+   - **If no uncommitted changes:** report "Branch already merged via PR. Nothing to ship." and **stop**.
+
+   Do NOT offer "Commit and ship as-is" — the branch is dead, pushing to it would
+   recreate a branch for a closed PR.
+
+5. Confirm the branch represents one logical change only.
+   If the branch history mixes unrelated work, stop and require splitting.
+
+6. Review the shipment scope:
+
+   ```bash
+   git diff --stat origin/<target>...HEAD
+   git log --oneline origin/<target>..HEAD
+   ```
+
+7. **Check review readiness:**
+
+   ```bash
+   SLUG=$(basename "$(git remote get-url origin 2>/dev/null)" .git 2>/dev/null || echo "unknown")
+   BRANCH=$(git branch --show-current | tr '/' '-')
+   cat ~/.avadbot/projects/$SLUG/$BRANCH-reviews.jsonl 2>/dev/null || echo "NO_REVIEWS"
+   ```
+
+   Parse the output. Find the most recent entry for each skill (plan-ceo-review, plan-eng-review,
+   plan-design-review, design-review-lite). Ignore entries with timestamps older than 7 days. Display:
+
+   ```
+   +====================================================================+
+   |                    REVIEW READINESS DASHBOARD                       |
+   +====================================================================+
+   | Review          | Runs | Last Run            | Status    | Required |
+   |-----------------|------|---------------------|-----------|----------|
+   | Eng Review      |  1   | 2026-03-16 15:00    | CLEAR     | YES      |
+   | CEO Review      |  0   | —                   | —         | no       |
+   | Design Review   |  0   | —                   | —         | no       |
+   +--------------------------------------------------------------------+
+   | VERDICT: CLEARED — Eng Review passed                                |
+   +====================================================================+
+   ```
+
+   **Review tiers:**
+   - **Eng Review (required by default):** The only review that gates shipping. Covers architecture,
+     code quality, tests, performance.
+   - **CEO Review (optional):** Use your judgment. Recommend it for big product/business changes,
+     new user-facing features, or scope decisions. Skip for bug fixes, refactors, infra, and cleanup.
+   - **Design Review (optional):** Use your judgment. Recommend it for UI/UX changes. Skip for
+     backend-only, infra, or prompt-only changes.
+
+   **Verdict logic:**
+   - **CLEARED**: Eng Review has >= 1 entry within 7 days with status "clean"
+   - **NOT CLEARED**: Eng Review missing, stale (>7 days), or has open issues
+   - CEO and Design reviews are shown for context but never block shipping
+
+   **If Eng Review is NOT "CLEAR":**
+
+   1. **Check for a prior override on this branch:**
+      ```bash
+      grep '"skill":"ship-review-override"' ~/.avadbot/projects/$SLUG/$BRANCH-reviews.jsonl 2>/dev/null || echo "NO_OVERRIDE"
+      ```
+      If an override exists, display the dashboard and note "Review gate previously accepted — continuing."
+      Do NOT ask again.
+
+   2. **If no override exists,** use AskUserQuestion:
+      - Show that Eng Review is missing or has open issues
+      - RECOMMENDATION: Choose C if the change is obviously trivial (< 20 lines, typo fix, config-only);
+        Choose B for larger changes
+      - Options:
+        A) Ship anyway
+        B) Abort — run /avad-plan-eng-review first
+        C) Change is too small to need eng review
+      - If CEO Review is missing, mention as informational ("CEO Review not run — recommended for
+        product changes") but do NOT block
+      - If Design Review is missing and the diff touches frontend files (CSS/HTML/JSX/TSX/view files),
+        mention: "Design Review not run — this PR changes frontend code. Consider running /avadbot:avad-review
+        with design checks." Still never block.
+
+   3. **If the user chooses A or C,** persist the decision so future `/ship` runs on this branch
+      skip the gate:
+      ```bash
+      mkdir -p ~/.avadbot/projects/$SLUG
+      echo '{"skill":"ship-review-override","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","decision":"USER_CHOICE"}' >> ~/.avadbot/projects/$SLUG/$BRANCH-reviews.jsonl
+      ```
+      Substitute USER_CHOICE with "ship_anyway" or "not_relevant".
+
+---
+
+## Step 2: Sync with Target Branch
+
+Use the integration strategy defined in `docs/GIT_WORKFLOW.md`:
+
+```bash
+git fetch origin
+
+# If GIT_WORKFLOW.md specifies rebase:
+git rebase --autostash origin/<target>
+
+# If GIT_WORKFLOW.md specifies merge (or no preference):
+git merge origin/<target> --no-edit
+```
+
+If conflicts appear:
+- Auto-resolve trivial mechanical conflicts (whitespace, ordering)
+- If conflicts are ambiguous or affect behavior, **stop** and show them
+
+If already up to date, continue silently.
+
+---
+
+## Step 2.5: Post-Sync Gate — STOP if branch is dead
+
+**This is a hard gate. Do NOT continue past this step if the branch has no diff.**
+
+After rebase/merge, verify the branch still has changes:
+
+```bash
+git diff --stat origin/<target>...HEAD
+```
+
+If the diff is **not empty**, continue to Step 3.
+
+If the diff is **empty** (all commits were dropped as already-upstream), the branch
+is dead — it was already merged. **STOP** and follow one of these paths:
+
+1. **If uncommitted changes exist** (e.g. from autostash): use **AskUserQuestion**:
+   - **A) Move to a new branch** — create a new branch from `origin/<target>` with
+     these changes and restart `/ship` from Step 1
+   - **B) Abort** — stop shipping
+
+2. **If no uncommitted changes exist:**
+   Report "All branch commits already upstream. Nothing to ship." and **stop**.
+
+Do NOT continue shipping on the dead branch. Do NOT push it. Do NOT create a PR from it.
+Pushing a dead branch recreates a branch for a closed PR.
+
+This gate catches cases where Step 1 pre-flight didn't detect the merged state (e.g. the
+branch still existed on remote when Step 1 ran, but rebase revealed all content was upstream).
+
+---
+
+## Step 2.75: Test Framework Bootstrap
+
+**Detect existing test framework and project runtime:**
+
+```bash
+# Detect project runtime
+[ -f Gemfile ] && echo "RUNTIME:ruby"
+[ -f package.json ] && echo "RUNTIME:node"
+[ -f requirements.txt ] || [ -f pyproject.toml ] && echo "RUNTIME:python"
+[ -f go.mod ] && echo "RUNTIME:go"
+[ -f Cargo.toml ] && echo "RUNTIME:rust"
+[ -f composer.json ] && echo "RUNTIME:php"
+[ -f mix.exs ] && echo "RUNTIME:elixir"
+# Detect sub-frameworks
+[ -f Gemfile ] && grep -q "rails" Gemfile 2>/dev/null && echo "FRAMEWORK:rails"
+[ -f package.json ] && grep -q '"next"' package.json 2>/dev/null && echo "FRAMEWORK:nextjs"
+# Check for existing test infrastructure
+ls jest.config.* vitest.config.* playwright.config.* .rspec pytest.ini pyproject.toml phpunit.xml 2>/dev/null
+ls -d test/ tests/ spec/ __tests__/ cypress/ e2e/ 2>/dev/null
+# Check opt-out marker
+[ -f .avadbot/no-test-bootstrap ] && echo "BOOTSTRAP_DECLINED"
+```
+
+**If test framework detected** (config files or test directories found):
+Print "Test framework detected: {name} ({N} existing tests). Skipping bootstrap."
+Read 2-3 existing test files to learn conventions (naming, imports, assertion style, setup patterns).
+Store conventions as prose context for use in Step 3.5 test generation. **Skip the rest of bootstrap.**
+
+**If BOOTSTRAP_DECLINED** appears: Print "Test bootstrap previously declined — skipping." **Skip the rest of bootstrap.**
+
+**If NO runtime detected** (no config files found): Use AskUserQuestion:
+"I couldn't detect your project's language. What runtime are you using?"
+Options: A) Node.js/TypeScript B) Ruby/Rails C) Python D) Go E) Rust F) PHP G) Elixir H) This project doesn't need tests.
+If user picks H → write `.avadbot/no-test-bootstrap` and continue without tests.
+
+**If runtime detected but no test framework — bootstrap:**
+
+### B2. Research best practices
+
+Use WebSearch to find current best practices for the detected runtime:
+- `"[runtime] best test framework 2025 2026"`
+- `"[framework A] vs [framework B] comparison"`
+
+If WebSearch is unavailable, use this built-in knowledge table:
+
+| Runtime | Primary recommendation | Alternative |
+|---------|----------------------|-------------|
+| Ruby/Rails | minitest + fixtures + capybara | rspec + factory_bot + shoulda-matchers |
+| Node.js | vitest + @testing-library | jest + @testing-library |
+| Next.js | vitest + @testing-library/react + playwright | jest + cypress |
+| Python | pytest + pytest-cov | unittest |
+| Go | stdlib testing + testify | stdlib only |
+| Rust | cargo test (built-in) + mockall | — |
+| PHP | phpunit + mockery | pest |
+| Elixir | ExUnit (built-in) + ex_machina | — |
+
+### B3. Framework selection
+
+Use AskUserQuestion:
+"I detected this is a [Runtime/Framework] project with no test framework. I researched current best practices. Here are the options:
+A) [Primary] — [rationale]. Includes: [packages]. Supports: unit, integration, smoke, e2e
+B) [Alternative] — [rationale]. Includes: [packages]
+C) Skip — don't set up testing right now
+RECOMMENDATION: Choose A because [reason based on project context]"
+
+If user picks C → write `.avadbot/no-test-bootstrap`. Tell user: "If you change your mind later, delete `.avadbot/no-test-bootstrap` and re-run." Continue without tests.
+
+If multiple runtimes detected (monorepo) → ask which runtime to set up first, with option to do both sequentially.
+
+### B4. Install and configure
+
+1. Install the chosen packages (npm/bun/gem/pip/etc.)
+2. Create minimal config file
+3. Create directory structure (test/, spec/, etc.)
+4. Create one example test matching the project's code to verify setup works
+
+If package installation fails → debug once. If still failing → revert with `git checkout -- package.json package-lock.json` (or equivalent for the runtime). Warn user and continue without tests.
+
+### B4.5. First real tests
+
+Generate 3-5 real tests for existing code:
+
+1. **Find recently changed files:** `git log --since=30.days --name-only --format="" | sort | uniq -c | sort -rn | head -10`
+2. **Prioritize by risk:** Error handlers > business logic with conditionals > API endpoints > pure functions
+3. **For each file:** Write one test that tests real behavior with meaningful assertions. Never `expect(x).toBeDefined()` — test what the code DOES.
+4. Run each test. Passes → keep. Fails → fix once. Still fails → delete silently.
+5. Generate at least 1 test, cap at 5.
+
+Never import secrets, API keys, or credentials in test files. Use environment variables or test fixtures.
+
+### B5. Verify
+
+```bash
+# Run the full test suite to confirm everything works
+{detected test command}
+```
+
+If tests fail → debug once. If still failing → revert all bootstrap changes and warn user.
+
+### B5.5. CI/CD pipeline
+
+```bash
+# Check CI provider
+ls -d .github/ 2>/dev/null && echo "CI:github"
+ls .gitlab-ci.yml .circleci/ bitrise.yml 2>/dev/null
+```
+
+If `.github/` exists (or no CI detected — default to GitHub Actions):
+Create `.github/workflows/test.yml` with:
+- `runs-on: ubuntu-latest`
+- Appropriate setup action for the runtime (setup-node, setup-ruby, setup-python, etc.)
+- The same test command verified in B5
+- Trigger: push + pull_request
+
+If non-GitHub CI detected → skip CI generation with note: "Detected {provider} — CI pipeline generation supports GitHub Actions only. Add test step to your existing pipeline manually."
+
+### B6. Create TESTING.md
+
+First check: If TESTING.md already exists → read it and update/append rather than overwriting. Never destroy existing content.
+
+Write TESTING.md with:
+- Framework name and version
+- How to run tests (the verified command from B5)
+- Test layers: Unit tests (what, where, when), Integration tests, Smoke tests, E2E tests
+- Conventions: file naming, assertion style, setup/teardown patterns
+
+### B7. Update CLAUDE.md
+
+First check: If CLAUDE.md already has a `## Testing` section → skip. Don't duplicate.
+
+Append a `## Testing` section:
+- Run command and test directory
+- Reference to TESTING.md
+- Test expectations:
+  - When writing new functions, write a corresponding test
+  - When fixing a bug, write a regression test
+  - When adding error handling, write a test that triggers the error
+  - When adding a conditional (if/else, switch), write tests for BOTH paths
+  - Never commit code that makes existing tests fail
+
+### B8. Commit
+
+```bash
+git status --porcelain
+```
+
+Only commit if there are changes. Stage all bootstrap files (config, test directory, TESTING.md, CLAUDE.md, .github/workflows/test.yml if created):
+`git commit -m "chore: bootstrap test framework ({framework name})"`
+
+---
+
+## Step 3: Run Validation
+
+Run all discovered test/lint/type-check commands **in parallel** where possible.
+
+Use a unique temp directory to avoid collisions with concurrent runs,
+and capture exit codes explicitly:
+
+```bash
+_land_tmp=$(mktemp -d)
+
+(set -o pipefail; <test-cmd> 2>&1 | tee "$_land_tmp/tests.txt"; echo $? > "$_land_tmp/tests.exit") &
+(set -o pipefail; <lint-cmd> 2>&1 | tee "$_land_tmp/lint.txt"; echo $? > "$_land_tmp/lint.exit") &
+(set -o pipefail; <typecheck-cmd> 2>&1 | tee "$_land_tmp/types.txt"; echo $? > "$_land_tmp/types.exit") &
+wait
+```
+
+After all complete, check each `*.exit` file. If any contains a non-zero code,
+show that command's output and **stop**.
+
+Rules:
+- If any command fails, show the failures and **stop**
+- If all pass, note the counts briefly and continue
+- Capture output — it goes into the PR body
+- **Always clean up `$_land_tmp`** — run `rm -rf "$_land_tmp"` before any exit,
+  whether validation passed, failed, or the workflow stops for any reason.
+  Since the agent runs individual shell commands (not a script), `trap` does not
+  persist between calls. Instead, run the cleanup explicitly before stopping.
+
+If the project has no test commands, warn the user and continue.
+
+---
+
+## Step 3.5: Test Coverage Audit
+
+100% coverage is the goal — every untested path is a path where bugs hide and vibe coding becomes yolo coding. Evaluate what was ACTUALLY coded (from the diff), not what was planned.
+
+### Test Framework Detection
+
+Before analyzing coverage, detect the project's test framework:
+
+1. **Read CLAUDE.md** — look for a `## Testing` section with test command and framework name. If found, use that as the authoritative source.
+2. **If CLAUDE.md has no testing section, auto-detect:**
+
+```bash
+# Detect project runtime
+[ -f Gemfile ] && echo "RUNTIME:ruby"
+[ -f package.json ] && echo "RUNTIME:node"
+[ -f requirements.txt ] || [ -f pyproject.toml ] && echo "RUNTIME:python"
+[ -f go.mod ] && echo "RUNTIME:go"
+[ -f Cargo.toml ] && echo "RUNTIME:rust"
+# Check for existing test infrastructure
+ls jest.config.* vitest.config.* playwright.config.* cypress.config.* .rspec pytest.ini phpunit.xml 2>/dev/null
+ls -d test/ tests/ spec/ __tests__/ cypress/ e2e/ 2>/dev/null
+```
+
+3. **If no framework detected:** falls through to the Test Framework Bootstrap step (Step 2.75) which handles full setup.
+
+**0. Before/after test count:**
+
+```bash
+# Count test files before any generation
+find . -name '*.test.*' -o -name '*.spec.*' -o -name '*_test.*' -o -name '*_spec.*' | grep -v node_modules | wc -l
+```
+
+Store this number for the PR body.
+
+**1. Trace every codepath changed** using `git diff origin/<base>...HEAD`:
+
+Read every changed file. For each one, trace how data flows through the code — don't just list functions, actually follow the execution:
+
+1. **Read the diff.** For each changed file, read the full file (not just the diff hunk) to understand context.
+2. **Trace data flow.** Starting from each entry point (route handler, exported function, event listener, component render), follow the data through every branch:
+   - Where does input come from? (request params, props, database, API call)
+   - What transforms it? (validation, mapping, computation)
+   - Where does it go? (database write, API response, rendered output, side effect)
+   - What can go wrong at each step? (null/undefined, invalid input, network failure, empty collection)
+3. **Diagram the execution.** For each changed file, draw an ASCII diagram showing:
+   - Every function/method that was added or modified
+   - Every conditional branch (if/else, switch, ternary, guard clause, early return)
+   - Every error path (try/catch, rescue, error boundary, fallback)
+   - Every call to another function (trace into it — does IT have untested branches?)
+   - Every edge: what happens with null input? Empty array? Invalid type?
+
+This is the critical step — you're building a map of every line of code that can execute differently based on input. Every branch in this diagram needs a test.
+
+**2. Map user flows, interactions, and error states:**
+
+Code coverage isn't enough — you need to cover how real users interact with the changed code. For each changed feature, think through:
+
+- **User flows:** What sequence of actions does a user take that touches this code? Map the full journey (e.g., "user clicks 'Pay' → form validates → API call → success/failure screen"). Each step in the journey needs a test.
+- **Interaction edge cases:** What happens when the user does something unexpected?
+  - Double-click/rapid resubmit
+  - Navigate away mid-operation (back button, close tab, click another link)
+  - Submit with stale data (page sat open for 30 minutes, session expired)
+  - Slow connection (API takes 10 seconds — what does the user see?)
+  - Concurrent actions (two tabs, same form)
+- **Error states the user can see:** For every error the code handles, what does the user actually experience?
+  - Is there a clear error message or a silent failure?
+  - Can the user recover (retry, go back, fix input) or are they stuck?
+  - What happens with no network? With a 500 from the API? With invalid data from the server?
+- **Empty/zero/boundary states:** What does the UI show with zero results? With 10,000 results? With a single character input? With maximum-length input?
+
+Add these to your diagram alongside the code branches. A user flow with no test is just as much a gap as an untested if/else.
+
+**3. Check each branch against existing tests:**
+
+Go through your diagram branch by branch — both code paths AND user flows. For each one, search for a test that exercises it:
+- Function `processPayment()` → look for `billing.test.ts`, `billing.spec.ts`, `test/billing_test.rb`
+- An if/else → look for tests covering BOTH the true AND false path
+- An error handler → look for a test that triggers that specific error condition
+- A call to `helperFn()` that has its own branches → those branches need tests too
+- A user flow → look for an integration or E2E test that walks through the journey
+- An interaction edge case → look for a test that simulates the unexpected action
+
+Quality scoring rubric:
+- ★★★  Tests behavior with edge cases AND error paths
+- ★★   Tests correct behavior, happy path only
+- ★    Smoke test / existence check / trivial assertion (e.g., "it renders", "it doesn't throw")
+
+### E2E Test Decision Matrix
+
+When checking each branch, also determine whether a unit test or E2E/integration test is the right tool:
+
+**RECOMMEND E2E (mark as [→E2E] in the diagram):**
+- Common user flow spanning 3+ components/services (e.g., signup → verify email → first login)
+- Integration point where mocking hides real failures (e.g., API → queue → worker → DB)
+- Auth/payment/data-destruction flows — too important to trust unit tests alone
+
+**RECOMMEND EVAL (mark as [→EVAL] in the diagram):**
+- Critical LLM call that needs a quality eval (e.g., prompt change → test output still meets quality bar)
+- Changes to prompt templates, system instructions, or tool definitions
+
+**STICK WITH UNIT TESTS:**
+- Pure function with clear inputs/outputs
+- Internal helper with no side effects
+- Edge case of a single function (null input, empty array)
+- Obscure/rare flow that isn't customer-facing
+
+### REGRESSION RULE (mandatory)
+
+**IRON RULE:** When the coverage audit identifies a REGRESSION — code that previously worked but the diff broke — a regression test is written immediately. No AskUserQuestion. No skipping. Regressions are the highest-priority test because they prove something broke.
+
+A regression is when:
+- The diff modifies existing behavior (not new code)
+- The existing test suite (if any) doesn't cover the changed path
+- The change introduces a new failure mode for existing callers
+
+When uncertain whether a change is a regression, err on the side of writing the test.
+
+Format: commit as `test: regression test for {what broke}`
+
+**4. Output ASCII coverage diagram:**
+
+Include BOTH code paths and user flows in the same diagram. Mark E2E-worthy and eval-worthy paths:
+
+```
+CODE PATH COVERAGE
+===========================
+[+] src/services/billing.ts
+    │
+    ├── processPayment()
+    │   ├── [★★★ TESTED] Happy path + card declined + timeout — billing.test.ts:42
+    │   ├── [GAP]         Network timeout — NO TEST
+    │   └── [GAP]         Invalid currency — NO TEST
+    │
+    └── refundPayment()
+        ├── [★★  TESTED] Full refund — billing.test.ts:89
+        └── [★   TESTED] Partial refund (checks non-throw only) — billing.test.ts:101
+
+USER FLOW COVERAGE
+===========================
+[+] Payment checkout flow
+    │
+    ├── [★★★ TESTED] Complete purchase — checkout.e2e.ts:15
+    ├── [GAP] [→E2E] Double-click submit — needs E2E, not just unit
+    ├── [GAP]         Navigate away during payment — unit test sufficient
+    └── [★   TESTED]  Form validation errors (checks render only) — checkout.test.ts:40
+
+[+] Error states
+    │
+    ├── [★★  TESTED] Card declined message — billing.test.ts:58
+    ├── [GAP]         Network timeout UX (what does user see?) — NO TEST
+    └── [GAP]         Empty cart submission — NO TEST
+
+[+] LLM integration
+    │
+    └── [GAP] [→EVAL] Prompt template change — needs eval test
+
+─────────────────────────────────
+COVERAGE: 5/13 paths tested (38%)
+  Code paths: 3/5 (60%)
+  User flows: 2/8 (25%)
+QUALITY:  ★★★: 2  ★★: 2  ★: 1
+GAPS: 8 paths need tests (2 need E2E, 1 needs eval)
+─────────────────────────────────
+```
+
+**Fast path:** All paths covered → "Step 3.5: All new code paths have test coverage." Continue.
+
+**5. Generate tests for uncovered paths:**
+
+If test framework detected (or bootstrapped in Step 2.75):
+- Prioritize error handlers and edge cases first (happy paths are more likely already tested)
+- Read 2-3 existing test files to match conventions exactly
+- Generate unit tests. Mock all external dependencies (DB, API, Redis).
+- For paths marked [→E2E]: generate integration/E2E tests using the project's E2E framework (Playwright, Cypress, Capybara, etc.)
+- For paths marked [→EVAL]: generate eval tests using the project's eval framework, or flag for manual eval if none exists
+- Write tests that exercise the specific uncovered path with real assertions
+- Run each test. Passes → commit as `test: coverage for {feature}`
+- Fails → fix once. Still fails → revert, note gap in diagram.
+
+Caps: 30 code paths max, 20 tests generated max (code + user flow combined), 2-min per-test exploration cap.
+
+If no test framework AND user declined bootstrap → diagram only, no generation. Note: "Test generation skipped — no test framework configured."
+
+**Diff is test-only changes:** Skip Step 3.5 entirely: "No new application code paths to audit."
+
+**6. After-count and coverage summary:**
+
+```bash
+# Count test files after generation
+find . -name '*.test.*' -o -name '*.spec.*' -o -name '*_test.*' -o -name '*_spec.*' | grep -v node_modules | wc -l
+```
+
+For PR body: `Tests: {before} → {after} (+{delta} new)`
+Coverage line: `Test Coverage Audit: N new code paths. M covered (X%). K tests generated, J committed.`
+
+### Test Plan Artifact
+
+After producing the coverage diagram, write a test plan artifact so `/avad-qa` can consume it:
+
+```bash
+SLUG=$(git remote get-url origin 2>/dev/null | sed 's|.*[:/]\([^/]*/[^/]*\)\.git$|\1|;s|.*[:/]\([^/]*/[^/]*\)$|\1|' | tr '/' '-')
+mkdir -p ~/.avadbot/projects/$SLUG
+USER=$(whoami)
+DATETIME=$(date +%Y%m%d-%H%M%S)
+```
+
+Write to `~/.avadbot/projects/{slug}/{user}-{branch}-ship-test-plan-{datetime}.md`:
+
+```markdown
+# Test Plan
+Generated by /avad-ship on {date}
+Branch: {branch}
+Repo: {owner/repo}
+
+## Affected Pages/Routes
+- {URL path} — {what to test and why}
+
+## Key Interactions to Verify
+- {interaction description} on {page}
+
+## Edge Cases
+- {edge case} on {page}
+
+## Critical Paths
+- {end-to-end flow that must work}
+```
+
+---
+
+## Step 4: Determine Targeted Validation (Conditional)
+
+If the repository defines a validation matrix (in governing docs or CLAUDE.md),
+check which areas are affected:
+
+```bash
+git diff --name-only origin/<target>...HEAD
+```
+
+Run any additional area-specific checks beyond the general test suite.
+Examples: migration validation, contract tests, idempotency checks.
+
+Skip this step if no validation matrix is defined.
+
+---
+
+## Step 5: Pre-Landing Review
+
+Review the diff for structural issues that tests don't catch.
+
+```bash
+git diff origin/<target>...HEAD
+```
+
+Always use three-dot diff (`...`) — this shows only your branch's changes since
+divergence, not changes on the target branch.
+
+### Step 5.0: Load or Generate Checklist
+
+**If a project-specific checklist exists** (`~/.avadbot/projects/<repo>/review-checklist.md`):
+read it and use it.
+
+**If no checklist exists**, generate one before proceeding:
+
+1. Read the project's governing docs, `CLAUDE.md`, `AGENTS.md`, and scan the codebase
+   structure to understand:
+   - Language and framework (Python/Django, Rails, Node/React, Go, etc.)
+   - Database type and access patterns (raw SQL, ORM, migrations)
+   - External APIs used and their constraints
+   - Domain-specific rules (canonical values, idempotency requirements, etc.)
+   - Security boundaries (auth, tokens, user input handling)
+
+2. Read `../avad-review/checklist-seed.md` and use it as the bootstrap taxonomy.
+   Adapt it before writing anything:
+   - keep only categories that matter to this repo
+   - rename categories to match the project's actual architecture and vocabulary
+   - add project-specific categories and suppressions from docs and code
+   - never copy the seed verbatim as the final checklist
+   - no code transforms the seed; the agent reads it as context and synthesizes
+     the final project-specific checklist
+
+3. Generate `~/.avadbot/projects/<repo>/review-checklist.md` following this structure:
+
+   ```markdown
+   # Pre-Landing Review Checklist
+
+   ## Instructions
+
+   Review the diff for the issues listed below. Be specific — cite `file:line`
+   and suggest fixes. Skip anything that's fine. Only flag real problems.
+
+   **Two-pass review:**
+   - **Pass 1 (CRITICAL):** Run critical categories first. These block `/ship`.
+   - **Pass 2 (INFORMATIONAL):** Run remaining categories. Included in PR body
+     but do not block.
+
+   **Output format:**
+
+   Pre-Landing Review: N issues (X critical, Y informational)
+
+   **CRITICAL** (blocking):
+   - [file:line] Problem description
+     Fix: suggested fix
+
+   **Issues** (non-blocking):
+   - [file:line] Problem description
+     Fix: suggested fix
+
+   If no issues found: `Pre-Landing Review: No issues found.`
+
+   Be terse. One line problem, one line fix. No preamble.
+
+   ---
+
+   ## Pass 1 — CRITICAL
+
+   <generate 2-4 critical categories based on the project's actual risks>
+
+   ## Pass 2 — INFORMATIONAL
+
+   <generate 3-6 informational categories based on the project's patterns>
+
+   ---
+
+   ## Suppressions — DO NOT flag these
+
+   <generate 3-5 suppression rules to reduce false positives>
+   ```
+
+4. Start from the seed file, but the final categories must be **derived from the project**, not generic boilerplate.
+   Examples of how project signals map to checklist items:
+
+   | Project signal | → Critical category |
+   |---|---|
+   | Raw SQL / migrations dir | SQL injection, parameterized queries |
+   | `AGENTS.md` lists canonical values | Vocabulary drift |
+   | Insert-only / upsert patterns | Idempotency regressions |
+   | API key / OAuth in auth module | Secrets in tracked files |
+   | Rate limit handling in code | Rate limit safety |
+
+   | Project signal | → Informational category |
+   |---|---|
+   | Architecture doc with contracts | Schema drift from contracts |
+   | Endpoint whitelist | Unauthorized endpoint usage |
+   | Migration files present | Editing applied migrations |
+   | Test directory exists | Test gaps for new code paths |
+
+5. Write the file to `~/.avadbot/projects/<repo>/review-checklist.md` and continue.
+   This file persists — future `/ship` runs will use it directly.
+
+### Step 5.1: Apply the Checklist (Fix-First)
+
+1. Apply it in two passes:
+   - **Pass 1 (CRITICAL):** blocking categories
+   - **Pass 2 (INFORMATIONAL):** non-blocking — include in PR body
+
+2. **Classify each finding as AUTO-FIX or ASK** using the Fix-First Heuristic:
+
+   **AUTO-FIX** (fix without asking — mechanical, low-risk):
+   - Dead code, unused imports, unused variables
+   - Stale comments that reference removed code
+   - N+1 query patterns with obvious eager-load fix
+   - Missing null checks where the fix is clear
+   - Obvious typos in strings or identifiers
+   - Style violations (formatting, naming conventions)
+   - Missing error logging where pattern is established
+
+   **ASK** (needs user judgment — ambiguous or high-risk):
+   - Security concerns (auth, input validation, secrets)
+   - Race conditions or concurrency issues
+   - Design decisions (API shape, data model, architecture)
+   - Performance tradeoffs with no obvious winner
+   - Changes that affect public API or contracts
+   - Anything where two reasonable engineers would disagree
+
+   Critical findings lean toward ASK; informational lean toward AUTO-FIX.
+
+3. **Auto-fix all AUTO-FIX items.** Apply each fix. Output one line per fix:
+   `[AUTO-FIXED] [file:line] Problem → what you did`
+
+4. **If ASK items remain,** present them in ONE AskUserQuestion:
+   - List each with number, severity, problem, recommended fix
+   - Per-item options: A) Fix  B) Skip
+   - Overall RECOMMENDATION
+   - If 3 or fewer ASK items, you may use individual AskUserQuestion calls instead
+
+5. **After all fixes (auto + user-approved):**
+   - If ANY fixes were applied: commit fixed files (`git add <fixed-files> && git commit -m "fix: pre-landing review fixes"`), then **re-run validation (Step 3)** to confirm fixes don't break anything. If validation passes, continue. If it fails, stop.
+   - If no fixes applied (all ASK items skipped, or no issues found): continue.
+
+6. Output summary: `Pre-Landing Review: N issues — M auto-fixed, K asked (J fixed, L skipped)`
+
+   If no issues found: `Pre-Landing Review: No issues found.`
+
+---
+
+## Step 5.5: TODOS.md Auto-Update
+
+Read `TODOS.md` in the repo root. If it doesn't exist, skip this step silently.
+
+If it exists:
+
+1. **Detect completed items:** Scan the diff and commit history for work that closes open TODOs.
+   Match conservatively — only mark items done when the diff clearly resolves the TODO's **What** description.
+
+2. **Move completed items** to the `## Completed` section, preserving original content and appending:
+   ```markdown
+   **Completed:** vX.Y.Z (YYYY-MM-DD)
+   ```
+
+3. **Check structure:** Verify items follow the format in `avad-review/TODOS-format.md`
+   (What/Why/Context/Effort/Priority). Do not rewrite existing items — only flag malformed ones
+   as informational.
+
+4. If any items were moved to Completed, stage `TODOS.md` for the version bump commit in Step 8.
+
+---
+
+## Step 6: Version Bump (auto-decide)
+
+1. **Find the version source** (check in order, use the first match):
+   - `VERSION` file
+   - `package.json` → `"version"` field
+   - `pyproject.toml` → `version` field
+   - `Cargo.toml` → `version` field
+   - **None found** → create a `VERSION` file starting at `0.1.0`
+
+2. **Auto-decide the bump level based on the diff:**
+   - Count lines changed: `git diff origin/<target>...HEAD --stat | tail -1`
+   - **PATCH** (3rd digit): < 50 lines changed, bug fixes, trivial tweaks, config
+   - **MINOR** (2nd digit): 50+ lines changed, new features, significant changes
+   - **MAJOR** (1st digit): **ASK the user** — only for breaking changes or milestones
+
+3. **Compute the new version:**
+   - Bumping a digit resets all digits to its right to 0
+   - Example: `1.2.3` + MINOR → `1.3.0`
+
+4. **Write the new version** to the same source where it was found.
+
+---
+
+## Step 7: CHANGELOG (auto-generate)
+
+1. **If `CHANGELOG.md` does not exist**, create it with a standard header:
+   ```markdown
+   # Changelog
+
+   All notable changes to this project will be documented in this file.
+   ```
+
+2. **Auto-generate the entry** from ALL commits on the branch:
+   - Use `git log <target>..HEAD --oneline` for commit history
+   - Use `git diff <target>...HEAD` for the full diff
+   - Categorize changes into applicable sections:
+     - `### Added` — new features
+     - `### Changed` — changes to existing functionality
+     - `### Fixed` — bug fixes
+     - `### Removed` — removed features
+   - Only include sections that have entries
+   - Write concise, descriptive bullet points
+   - Insert after the file header, dated today
+   - Format: `## [X.Y.Z] - YYYY-MM-DD`
+
+3. **Do NOT ask the user to describe changes.** Infer from the diff and commit history.
+
+---
+
+## Step 8: Commit (bisectable chunks)
+
+**Goal:** Create small, logical commits that work well with `git bisect`.
+
+This step handles **uncommitted changes only** — do not rewrite, reorder, or amend
+existing branch commits. The branch history is the developer's responsibility.
+
+If there are no uncommitted changes, skip to Step 9.
+
+1. **Commit ordering** (earlier commits first):
+   - **Infrastructure:** migrations, config changes, route additions
+   - **Models & services:** new models, services, concerns (with their tests)
+   - **Controllers & views:** controllers, views, components (with their tests)
+   - **VERSION + CHANGELOG:** always in the final commit
+
+2. **Rules for splitting:**
+   - A module/service and its test file go in the same commit
+   - A controller, its views, and its test go in the same commit
+   - Migrations are their own commit (or grouped with the model they support)
+   - Config/route changes can group with the feature they enable
+   - If the total diff is small (< 50 lines across < 4 files), a single commit is fine
+
+3. **Each commit must be independently valid** — no broken imports, no references
+   to code that doesn't exist yet. Order commits so dependencies come first.
+
+4. **Commit message format:**
+   - First line: `<type>: <summary>` (type = feat/fix/chore/refactor/docs)
+   - Use the format defined in `docs/GIT_WORKFLOW.md` if available
+   - Only the **final commit** gets the co-author trailer:
+
+   ```bash
+   git commit -m "$(cat <<'EOF'
+   chore: bump version and changelog (vX.Y.Z)
+
+   Co-Authored-By: Claude <noreply@anthropic.com>
+   EOF
+   )"
+   ```
+
+---
+
+## Step 9: Push
+
+```bash
+git push -u origin <branch-name>
+```
+
+Never force push.
+
+---
+
+## Step 10: Create PR
+
+Target branch: `<target>` (from `docs/GIT_WORKFLOW.md`).
+
+```bash
+git fetch origin
+```
+
+Verify the branch is still based on the latest `origin/<target>`.
+
+Create a PR:
+
+```bash
+gh pr create --base <target> --title "<type>: <summary>" --body "$(cat <<'EOF'
+## Summary
+<bullet points from CHANGELOG>
+
+## Validation
+<commands run, pass/fail results>
+
+## Test Coverage
+<coverage diagram from Step 3.5, or "All new code paths have test coverage.">
+<If Step 3.5 ran: "Tests: {before} → {after} (+{delta} new)">
+
+## Pre-Landing Review
+<findings from Step 5, or "No issues found.">
+
+## Risks / Follow-ups
+<assumptions, residual risk, follow-up work — or "None.">
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+)"
+```
+
+**Output the PR URL** — this is the final output the user sees.
+
+---
+
+## Important Rules
+
+- Never skip validation. If tests fail, stop.
+- Never skip the pre-landing review.
+- Never force push.
+- Never merge without explicit user instruction.
+- Never include unrelated dirty changes in a shipped diff.
+- Never create a PR from a branch containing mixed-purpose work.
+- Never proceed on stale branch state — always `git fetch` first.
+- Never push without fresh verification evidence. If code changed after Step 3 tests, re-run before pushing.
+- Stop when governance documents require stopping.
+- If unsure, choose the minimum safe action and report the blocker.
+- Respect each project's conventions — do not impose external conventions.
+- Split commits for bisectability — each commit = one logical change.
+- Step 3.5 generates coverage tests. They must pass before committing. Never commit failing tests.
+- The goal is: user says `/ship`, next thing they see is the review + PR URL.
+
+---
+
+## Expected Outcome
+
+When `/ship` completes successfully:
+
+1. Branch verified as a single logical change
+2. Synced with latest `origin/<target>`
+3. All validation passed
+4. Pre-landing review completed
+5. Version bumped
+6. CHANGELOG updated
+7. Changes committed in bisectable chunks
+8. Branch pushed
+9. PR created targeting `<target>`
+10. User sees the PR URL

@@ -1,0 +1,257 @@
+---
+name: r-stats
+description: Guide advanced R statistical work with estimand-first method selection, diagnostics, effect sizes, Bayesian, causal, SEM, bootstrap, survival, mixed-effects, count, and missing-data workflows.
+---
+
+# R Stats
+
+Start from the estimand and outcome structure, keep statistical helpers tight and testable, and preserve the methods doctrine that keeps recurring analysis work consistent.
+
+## Quick start
+
+1. Read `references/statistical-analysis-framework.md` for method-selection doctrine and core R surfaces.
+2. When missingness is non-trivial or multiple imputation is on the table, also read `references/missing-data-and-multiple-imputation.md`.
+3. When the question is really about adjusted predictions, response-scale contrasts, average marginal effects, elasticities, or the choice between `marginaleffects` and `emmeans`, also read `references/marginal-effects-and-adjusted-predictions.md` and `references/marginaleffects-versus-emmeans.md`.
+4. When the task is about tidymodels resampling design, tuning, model-selection rules, or metric choice, also read `references/tidymodels-resampling-and-metrics.md`.
+5. When the task includes choosing a figure family for estimates, intervals, survival curves, cumulative incidence, post-estimation plots, or interactive statistical figures, also read `references/estimand-driven-figures.md`.
+6. When the topic is pediatric oncology survival, relapse, non-relapse mortality, transplant outcomes, or competing risks, also read `references/pediatric-oncology-time-to-event-and-competing-risks.md`.
+7. When the topic is pediatric asthma exacerbation burden, recurrent-event timing, spirometry trajectories, or repeated-measure symptom/biomarker outcomes, also read `references/pediatric-asthma-recurrent-events-and-longitudinal-models.md`.
+8. When the task involves complex survey design, weighted descriptives, `svydesign()`, `svyglm()`, `svrepdesign()`, or `srvyr` survey summaries, also read `references/survey-weighted-analysis.md`.
+9. When the task involves Bayesian models, `brms`, posterior draws, posterior predictive checks, `loo()`, `tidybayes`, `ggdist`, or `bayesplot`, also read `references/bayesian-brms-tidybayes-workflows.md`.
+10. When the task involves observational causal inference, `MatchIt`, `WeightIt`, `cobalt`, propensity-score weighting, overlap weighting, matching, trimming, balance diagnostics, or target-population estimands such as ATT or ATE, also read `references/causal-design-with-matchit-weightit-cobalt.md`.
+11. When the task involves meta-analysis, effect-size construction, `metafor`, forest plots, funnel plots, multilevel meta-analysis, or influence diagnostics across studies, also read `references/meta-analysis-with-metafor.md`.
+12. When the task involves model diagnostics, parameter extraction, effect sizes, standardized coefficients, narrative statistical summaries, or `performance` / `parameters` / `effectsize` / `report` / `see`, also read `references/easystats-diagnostics-and-effect-sizes.md`.
+13. When the task involves correlated longitudinal or repeated-measures outcomes, population-averaged models, `geepack`, `geeglm()`, `geese()`, working-correlation selection, or `QIC()`, also read `references/gee-with-geepack.md`.
+14. When the task involves structural equation modeling, CFA, growth curves, latent-variable regression, `lavaan`, `cfa()`, `sem()`, `growth()`, fit indices, modification indices, or latent scores, also read `references/sem-with-lavaan.md`.
+15. When the task involves ROC/AUC, precision-recall curves, Brier score, calibration, threshold metrics, net benefit, decision curves, `pROC`, `probably`, or `rmda`, also read `references/predictive-performance-and-decision-curves.md`.
+16. When the task involves bootstrap confidence intervals, permutation tests, `boot::boot()`, `boot.ci()`, `rsample::bootstraps()`, `int_pctl()`, `int_t()`, `int_bca()`, or `infer` resampling workflows, also read `references/bootstrap-and-permutation-inference.md`.
+17. When the task involves nonlinear functional form, splines, `mgcv`, `gam()`, `bam()`, `s()`, `te()`, `ti()`, `ns()`, or concurvity diagnostics, also read `references/gams-and-splines.md`.
+18. When the main bottleneck is local high-volume tabular prep before fitting, also read `references/high-volume-tabular-prep.md`.
+19. Keep narrow code requests tight: one helper file plus one matching test file whenever feasible.
+20. Reuse `references/tte-summary-template.R` and `references/test-tte-summary-template.R` for reverse Kaplan-Meier or median follow-up work.
+21. Make assumptions explicit: outcome type, censoring, clustering, over-dispersion, missingness posture, posterior quantity, causal estimand, meta-analytic effect measure, diagnostic family, working-correlation posture, latent-variable identification posture, performance surface, threshold policy, resampling target, interval or p-value method, replicate count, smooth basis posture, and any survey-design posture.
+22. Pair method choice with diagnostics and a reporting plan.
+23. When the task is to improve the reusable R/statistics stack itself, read `references/statistical-improvement-playbook.md` and update this skill rather than creating a separate retreat surface.
+
+## Workflow
+
+### 1. Define the estimand first
+
+- Clarify the scientific or analytic question.
+- Confirm the outcome scale and dependency structure.
+- Decide whether the job is inference, prediction, description, or data reduction.
+
+### 2. Choose the simplest defensible family
+
+- Match the model family to the outcome and design.
+- Keep survival, mixed-effects, ordinal, multinomial, count, and missing-data paths explicit when the design calls for them.
+- Make the key assumptions visible before fitting.
+
+### 3. Make missing-data posture explicit
+
+- Review the missing-data pattern before committing to complete-case analysis or imputation.
+- When multiple imputation is warranted, keep the imputation model specification explicit through `method`, `predictorMatrix`, `formulas`, and any passive imputation rules for derived variables.
+- Pool model estimates, not completed datasets.
+- Keep mixed-model and custom-model pooling requirements visible so tidiers or scalar pooling are available before the modeling stage.
+
+### 4. Match post-estimation tools to the estimand
+
+- Use adjusted predictions when the target is an expected outcome level.
+- Use comparisons when the target is a discrete or counterfactual contrast such as a risk difference, risk ratio, lift, or change between named covariate values.
+- Use slopes when the target is a derivative-style marginal effect or elasticity.
+- Use the `avg_*` variants or the `by` argument when the reported quantity should be a marginal average rather than one estimate per observation.
+- When a collaborator asks for marginal means or reference-grid contrasts in emmeans language, translate that request into an explicit grid and decide whether a balanced-grid `marginaleffects` workflow is enough or whether a specialist `emmeans` surface is the better fit.
+- Keep the response scale explicit through `type=` when interpretation depends on probabilities, risks, or expected counts instead of link-scale values.
+
+### 4a. Match resampling, tuning, and metric choices to the analysis goal
+
+- Current `rsample::vfold_cv()` documentation says v-fold cross-validation splits the data into assessment and analysis folds and supports `strata` for stratified sampling, with numeric strata binned into quartiles. Keep the resampling design visible because it changes the validation story.
+- Current `tune_grid()` documentation says model or recipe tuning parameters are evaluated across one or more resamples. Keep tuning on the resampling surface, not on the final test split.
+- Current `show_best()` documentation says `select_best()` finds the numerically best tuning combination, while `select_by_one_std_err()` can choose a simpler model within one standard error of the best result. Keep the selection rule explicit because it changes the tradeoff between raw performance and simplicity.
+- Current `finalize_*()` documentation says tuned values can be spliced into models, recipes, and workflows. Keep that finalize step visible so downstream code can tell whether the statistical object is still tunable.
+- Current `last_fit()` documentation says the final chosen model is fit on the full training set and then evaluated on the test set. Treat that held-out evaluation as a separate stage from tuning.
+- Current `yardstick::metric_set()` documentation says one metric set can combine only compatible metric families: numeric metrics together, class metrics with class-probability metrics, or compatible survival metrics. Choose the metric family deliberately.
+- Current `yardstick` documentation also keeps `event_level` explicit for binary classification metrics such as `roc_auc()`. Team doctrine: in clinical or operational binary outcomes, make the event level explicit instead of relying on the default first factor level.
+- Current `collect_metrics()` documentation supports summarized and unsummarized collection. Fold-level or split-level metrics are often worth inspecting when instability matters more than the mean alone.
+
+### 4c. Keep survey design posture explicit when inference is design-based
+
+- Current `svydesign()` documentation keeps `ids`, `strata`, `weights`, `fpc`, and `nest` explicit. When the data come from a complex sample, keep the survey design declaration visible before fitting or summarizing.
+- Current `subset.survey.design()` documentation says subpopulation restriction keeps the original design information. Treat domain analysis as `subset(design, ...)` instead of quietly dropping rows from the raw data after design construction.
+- Current `svyglm()` documentation says the fit uses inverse-probability weighting with design-based standard errors. Keep design-based survey inference separate from ordinary model-fitting language about generic weights.
+- Current `svyglm()` documentation also says `quasibinomial()` and `quasipoisson()` avoid warnings while preserving estimates and standard errors for binary and count outcomes. Keep that family choice explicit when those outcome types appear.
+- Current `svyciprop()` documentation supports multiple interval methods, including `logit`, `likelihood`, `asin`, `beta`, and `mean`. When weighted proportions are near 0 or 1, keep the interval method visible.
+- Current `srvyr::survey_mean()` documentation keeps `vartype`, `level`, `proportion`, `prop_method`, and `deff` explicit. Even in dplyr-style workflows, preserve those uncertainty and design-effect choices as part of the method contract.
+- Team doctrine: the design object is part of the statistical model, not just preprocessing.
+
+### 4b. Match the figure family to the estimand
+
+- For adjusted predictions across a continuous x-variable, a line plus uncertainty ribbon is usually the clearest statistical surface because the estimate changes smoothly across an ordered predictor while uncertainty varies along the curve.
+- For adjusted predictions, contrasts, or slopes at discrete groups or named scenarios, point-interval displays are usually the strongest default because the estimand is an estimate with uncertainty at each level, not an amount that benefits from bar area.
+- For time-to-event and cumulative-incidence quantities, keep the event-time structure visible with step-like curves instead of smoothing away jumps that occur at observed event times.
+- For repeated-measure or trajectory quantities, use `geom_line()` when the x-axis ordering defines the trajectory; use `geom_path()` only when row order itself is the intended path; and use `geom_step()` when the scientific story is about changes occurring at observed transition times.
+- Use ribbons for uncertainty that extends continuously over x; use lineranges, error bars, or pointranges when uncertainty belongs to discrete x-values or named contrasts.
+- If the figure becomes interactive in Shiny, preserve the same estimand and figure family. Interactivity should expose detail, selection, or drill-down without silently changing the analysis definition.
+- Team inference: bars are often a weak default for contrasts, slopes, and adjusted predictions because the inferential object is a point estimate with an interval, not a filled quantity. Prefer them mainly when the quantity of interest is a count, rate, or composition where the bar form is part of the meaning.
+
+### 4d. Keep Bayesian posterior quantities and diagnostics explicit
+
+- Current `brm()` documentation says the returned `brmsfit` object contains the posterior draws along with model metadata. Treat the fitted object as the central posterior contract and keep priors, family, and backend choices visible in the analysis record.
+- Current `posterior_epred()` documentation says expected-response draws differ from full posterior predictive draws and are typically smaller in variance because residual error is not included. Keep parameter-draw, expected-response, and predictive-draw questions distinct in code, tables, and figures.
+- Current `conditional_effects()` documentation supports fitted values, posterior predictive quantities, spaghetti overlays, and explicit resolution choices. Keep the requested posterior quantity visible whenever model-derived curves are shown to collaborators.
+- Current `pp_check()` documentation says posterior predictive checks are built on `bayesplot` PPC functions. Pair substantive Bayesian conclusions with posterior predictive checks rather than relying only on coefficient summaries.
+- Current `posterior` documentation keeps `draws_df`, `rvar`, `summarise_draws()`, `rhat()`, `ess_bulk()`, and `ess_tail()` explicit. Keep convergence and Monte Carlo diagnostics near the model summary so interval tables are not interpreted without chain quality context.
+- Current `loo` documentation keeps `loo()`, `loo_compare()`, and Pareto-k diagnostics explicit. When model comparison is part of the job, keep predictive-comparison diagnostics visible instead of flattening them into a single winner label.
+- Team doctrine: every Bayesian result should say which posterior quantity it represents, which interval type and width it uses, and which predictive checks or diagnostics support trust in that result.
+
+### 4e. Keep causal design posture explicit in observational treatment studies
+
+- Current `matchit()` documentation says matching is a preprocessing step aimed at creating treated and control groups balanced on the included covariates. Keep design construction separate from the downstream effect model so collaborators can inspect the causal design on its own terms.
+- Current MatchIt effect-estimation guidance says the target estimand can shift when units are discarded through common-support restrictions, calipers, cardinality matching, or exact-matching style restrictions. Keep the target population explicit and revisit the estimand label after design decisions that drop units.
+- Current `weightit()` documentation keeps `estimand`, `focal`, `s.weights`, and `keep.mparts` explicit. Keep the target estimand, focal group, sampling-weight posture, and uncertainty posture visible whenever balancing weights are estimated.
+- Current `weightit()` documentation also supports overlap-style estimands such as `ATO`, `ATM`, and `ATOS` for methods that allow them. State the requested estimand explicitly instead of treating all propensity-score weighting as if it targets the same population.
+- Current `summary.matchit()` and `cobalt` documentation keep balance diagnostics explicit before and after adjustment. Assess balance before interpreting an effect estimate; balance diagnostics are part of the analysis design, not a cosmetic appendix.
+- Current `trim()` documentation says trimming or dropping extreme weights changes the resulting `weightit` object and can improve effective sample size. Keep trimming decisions and their effect on the weighted sample visible in the analysis record.
+- Current `glm_weightit()` documentation says the fitted covariance matrix can account for estimation of the weights through M-estimation when supported. When weighted outcome modeling is central to the analysis, keep the uncertainty method explicit alongside the outcome model.
+- Team doctrine: freeze the causal design, examine balance and support, then estimate and report the effect on the resulting target population.
+
+### 4f. Keep meta-analytic effect construction and dependency posture explicit
+
+- Current `escalc()` documentation says the effect-size measure should follow the study design, outcome type, and information available. Keep the effect-size construction stage explicit so `yi`, `vi`, study labels, and any transformations can be reviewed before fitting a meta-analytic model.
+- Current `rma.uni()` documentation says the same interface can fit equal-effects, fixed-effects, random-effects, and mixed-effects meta-regression models. Keep the heterogeneity posture explicit rather than treating all meta-analyses as one generic pooled estimate.
+- Current `rma.mv()` documentation says dependent effect sizes can be handled by providing a variance-covariance matrix `V` and a multilevel or multivariate random-effects structure. When multiple outcomes or correlated effects appear, keep the dependency structure explicit instead of pretending the study-level effects are independent.
+- Current `forest.rma()` documentation supports fitted values, pooled estimates, and prediction intervals through `addfit` and `addpred`. Keep the pooled estimate and predictive spread aligned with the chosen model rather than defaulting to one display for every synthesis.
+- Current `funnel()` and `regtest()` documentation provide publication-bias or small-study-effect diagnostics. Treat these as diagnostic layers attached to the synthesis, not as standalone evidence about truth or bias.
+- Current `leave1out()` and `influence()` documentation keep sensitivity and influential-study diagnostics explicit. When a synthesis may be driven by a small number of studies, keep those diagnostics near the substantive conclusion.
+- Team doctrine: meta-analysis work should state the effect measure, heterogeneity model, dependency posture, moderator plan, and sensitivity diagnostics as part of the methods contract.
+
+### 4g. Keep diagnostics, parameter extraction, and effect-size posture explicit with easystats
+
+- Current `check_model()` documentation says it prepares data for a panel of model checks and that dedicated check functions can be called when you need informative warnings and a narrower diagnostic contract. Keep the diagnostic family explicit rather than treating a composite diagnostic panel as the only model-checking surface.
+- Current `performance` documentation exposes targeted checks such as `check_collinearity()`, `check_overdispersion()`, `check_predictions()`, and model-fit summaries such as `model_performance()`. Match the diagnostic to the model family and the assumption being questioned.
+- Current `parameters::model_parameters()` documentation supports broad model-class coverage, standardized coefficients, grouped output, exponentiation, Bayesian extras such as probability of direction, and markdown-aware printing. Keep parameter extraction as a distinct summary stage instead of burying it inside a custom table function.
+- The same `model_parameters()` documentation says `standardize = "refit"` refits the model on standardized data and that `standardize = "basic"` follows a more software-style post-hoc path. Keep the standardization method explicit because it changes interpretation and computational cost.
+- Current `effectsize` documentation says `effectsize()` chooses an appropriate effect-size index when possible, while dedicated functions such as `cohens_d()` and `eta_squared()` expose the metric more directly. Keep the effect-size family aligned with the design and model rather than attaching one generic standardized number to every result.
+- Current `cohens_d()` documentation says `pooled_sd = FALSE` is appropriate when pairing the estimate with Welch-style comparisons. Keep the variance assumption aligned between the inferential test and the reported effect size.
+- Current `eta_squared()` documentation says ANOVA effect sizes depend on the sums of squares returned by `anova(model)` and that this may differ across model classes. Keep the sums-of-squares posture explicit when reporting variance-explained measures.
+- Current `report` documentation provides narrative summaries such as `report_statistics()`, `report_model()`, and `report_performance()`. Treat these as communication surfaces built from the underlying model summaries, not as replacements for checking the underlying quantities.
+- Current `see` documentation provides plot methods for objects returned by easystats packages. Use these plotting surfaces to keep diagnostic and parameter visualizations consistent, while still preserving the underlying data object for verification.
+- Team doctrine: separate model fitting, diagnostic checking, parameter extraction, effect-size estimation, and narrative communication into explicit stages, even when easystats makes the workflow feel very unified.
+
+### 4h. Keep GEE working-correlation and cluster posture explicit
+
+- Current `geeglm()` documentation says the function has syntax similar to `glm`, returns a similar object, and requires a cluster `id`. Data are assumed to be sorted so that observations from each cluster appear as contiguous rows. Keep cluster identity and row ordering explicit before fitting.
+- The same `geeglm()` documentation says `na.action` takes no action and that the function only works on complete data. Keep missing-data handling explicit before the GEE fit instead of assuming row omission happens automatically.
+- Current `geeglm()` documentation keeps `waves`, `corstr`, `zcor`, `scale.fix`, `scale.value`, and `std.err` explicit. Treat repeated-measure ordering, working-correlation choice, scale posture, and robust versus jackknife-style standard errors as part of the methods contract.
+- The same documentation warns that `corstr = "unstructured"` should be used with great care. Keep high-parameter working-correlation choices deliberate and justified.
+- Current `QIC()` documentation says:
+  - `QIC` helps choose a working correlation structure;
+  - `QICu` compares models that keep the same working correlation and quasi-likelihood form but differ in mean specification;
+  - `CIC` can be a more robust alternative when mean-model fit is uncertain and correlation structures are compared.
+- Current `geese()` documentation supports separate mean, scale, and correlation-model components. Keep that surface available when a simple `geeglm()` wrapper no longer captures the needed covariance or scale structure.
+- Team doctrine: when the question is about population-averaged repeated-measure effects, keep cluster ordering, complete-case handling, working correlation, standard-error type, and any `QIC` or `CIC` comparison visible in the analysis design.
+
+### 4i. Keep SEM measurement, fit, and modification posture explicit
+
+- Current `lavaan` tutorial guidance centers the workflow on model syntax, fitting functions such as `cfa()`, `sem()`, and `growth()`, and extractor functions such as `summary()`, `coef()`, `fitted()`, and `inspect()`. Keep measurement specification, structural regressions, and extraction steps explicit rather than collapsing them into one opaque call.
+- Current `sem()` documentation says it is a wrapper around the more general `lavaan()` function with defaults that automatically add common SEM conveniences. Keep the fitting surface explicit enough that collaborators can tell when the user-friendly wrappers are sufficient and when the lower-level function is needed.
+- Current `fitMeasures()` documentation says global fit indices can be requested selectively and can depend on user-specified baseline or `h1` models. Treat fit-index choice as part of the reporting design rather than as an unexamined bundle of every available metric.
+- Current `parameterEstimates()` documentation says `standardized = TRUE` adds standardized columns, but tests and standard errors still refer to the unstandardized estimates; `standardizedSolution()` is needed when tests or intervals for standardized parameters are required. Keep the standardized-solution posture explicit.
+- Current `lavInspect()` documentation includes a `post.check` surface that warns about inadmissible solutions such as negative variances or non-positive-definite latent or residual covariance matrices. Keep admissibility checks near the model summary instead of treating them as an afterthought.
+- Current `modificationIndices()` documentation provides score-test style guidance for fixed or constrained parameters. Treat modification indices as local diagnostics that may suggest model-development paths, not as an automatic rewrite rule.
+- Current `lavPredict()` documentation provides model-based predictions of latent variables and related quantities. When latent scores are used downstream, label them as model-based outputs tied to the fitted SEM.
+- Current `lavTestLRT()` documentation says nested-model comparisons can require scaled difference testing under robust estimators. Keep model-comparison method explicit when comparing constrained or nested SEMs.
+- Team doctrine: SEM work should state the measurement model, structural model, identification posture, fit-index set, standardized-solution choice, and model-modification discipline as part of the methods contract.
+
+### 4j. Keep discrimination, calibration, thresholds, and net-benefit posture explicit
+
+- Current `yardstick` documentation keeps `roc_auc()`, `pr_auc()`, and `brier_class()` as distinct probability-metric surfaces. Treat rank discrimination, precision-recall behavior, and probability error as different evaluation questions rather than collapsing them into one headline number.
+- Current `yardstick::roc_auc()` documentation keeps `event_level` explicit, and current `pROC::roc()` documentation keeps `levels` and `direction` explicit. Preserve event orientation deliberately because binary prediction metrics can change meaning when class levels or score direction are ambiguous.
+- Current `pROC::roc()` documentation says `direction = "auto"` should be set explicitly when resampling or randomizing data because otherwise the curves can be biased toward higher AUC values. Keep score direction visible whenever ROC work is part of validation or model comparison.
+- Current `pROC::coords()` and `probably::threshold_perf()` documentation expose threshold-specific operating characteristics on dedicated surfaces. Treat threshold choice as a utility-sensitive design step instead of presenting a single cutpoint as if it were implied by the AUC.
+- Current `probably::cal_plot_breaks()` documentation provides a bin-based calibration surface, and current `yardstick::brier_class()` documentation provides a probability-error summary. Keep calibration plots and Brier-style summaries alongside discrimination summaries when predicted probabilities will be interpreted or acted on.
+- Current `rmda::decision_curve()` documentation defines net benefit over probability thresholds and keeps `policy`, `study.design`, and prevalence inputs explicit. Keep clinical utility and decision policy visible instead of treating decision curves as generic accuracy figures.
+- Team doctrine: prediction-model evaluation should state the event definition, discrimination surface, calibration surface, threshold policy, and decision-curve posture as separate parts of the methods contract.
+
+### 4k. Keep bootstrap and permutation posture explicit
+
+- Current `boot::boot()` documentation keeps the statistic function, number of replicates `R`, simulation type `sim`, statistic type `stype`, and any `strata` explicit. Treat the resampling engine as part of the methods contract rather than as hidden implementation detail.
+- The same documentation says `sim` can be `"ordinary"`, `"balanced"`, `"permutation"`, `"parametric"`, or `"antithetic"`, and that permutations return random permutations of cases. Keep bootstrap-style uncertainty work distinct from permutation-based null-distribution testing.
+- Current `boot.ci()` documentation says interval type is explicit through `type = c("norm", "basic", "stud", "perc", "bca")`, and that studentized intervals require variance information. Keep the interval method visible because different bootstrap intervals answer the same uncertainty question with different approximations.
+- Current `rsample::bootstraps()` documentation keeps the bootstrap analysis sample, out-of-bag assessment set, optional stratification, and optional `apparent = TRUE` sample explicit. Keep that design visible when bootstrap resamples feed model validation or interval estimation.
+- Current `rsample::int_pctl()` documentation says percentile intervals usually need thousands of resamples, student-t intervals need a variance estimate, and BCa intervals are computationally taxing. Keep replicate count and interval family explicit whenever bootstrap intervals are reported.
+- Current `infer::generate()` documentation distinguishes `type = "bootstrap"` from `type = "permute"` and explicitly recommends setting the random seed when exact reproducibility matters. Current `get_p_value()` documentation also says a reported p-value of 0 is an approximation driven by finite `reps`. Keep seed choice and finite-resample approximation visible.
+- Team doctrine: bootstrap work should name the statistic, resampling unit, replicate count, and interval method. Permutation work should name the null hypothesis, exchangeability or rearrangement rule, replicate count, and the fact that the p-value is simulation-based.
+
+### 4l. Keep nonlinear functional form and smooth-term posture explicit
+
+- Current `mgcv::gam()` documentation says smoothness is estimated as part of fitting and that smooth terms such as `s()`, `te()`, `ti()`, and `t2()` extend the GLM formula surface. Keep basis choice, smoothing-selection method, and dimensionality explicit when modeling nonlinear effects.
+- The same documentation says `method` choices such as `GCV.Cp`, `REML`, `ML`, and `NCV` change the smoothing-parameter selection criterion. Keep smoothing-selection posture visible because it changes how nonlinear complexity is controlled.
+- Current `mgcv::bam()` documentation positions `bam()` as the large-data GAM path and keeps `discrete`, `nthreads`, and chunked model-matrix construction explicit. Treat `bam()` as a deliberate large-data modeling path rather than as a silent drop-in replacement for `gam()`.
+- Current `splines::ns()` documentation provides a natural cubic spline basis with explicit `df`, `knots`, and `Boundary.knots`. Keep low-ceremony spline bases available when the scientific job is flexible functional form inside a broader model family rather than a full GAM workflow.
+- Current `summary.gam()` documentation says smooth-term p-values are approximate and neglect smoothing-parameter uncertainty, while current `gam.check()` and `concurvity()` documentation expose core diagnostics for basis dimension and nonlinear collinearity. Keep inference and diagnostics for smooth terms near the fit summary instead of treating them as afterthoughts.
+- Current `predict.gam()` and `plot.gam()` documentation keep prediction scale and plotting scale explicit. Be clear about whether a nonlinear effect is being shown on the linear predictor scale, response scale, or a term-specific surface.
+- Team doctrine: when nonlinearity matters, state the spline or smooth family, the smoothing-selection method, the diagnostic plan, and the reporting scale as part of the methods contract.
+
+### 5. Implement focused helpers cleanly
+
+- Prefer tidy, deterministic helper functions.
+- Validate inputs early.
+- Use the base pipe `|>` in generated R code.
+- Pair substantive helper changes with focused `testthat` coverage. In package repos, let `usethis::use_r()` and `use_test()` create or maintain the file pair.
+
+### 6. Preserve recurring statistical patterns
+
+- Keep reverse Kaplan-Meier and time-to-event summaries reusable.
+- Keep large-data posture aligned with Arrow, Parquet working sets, delayed `collect()`, `data.table`, or similar tools when the dataset size demands it.
+- Keep effect estimates and intervals ahead of decorative output.
+- Keep missing-data decisions and pooled-analysis diagnostics visible in the analysis note or result object.
+- Keep post-estimation estimands on the scale the audience actually needs.
+- Keep the figure family matched to the estimand so ribbons, intervals, lines, and step curves reinforce the analysis instead of obscuring it.
+
+### 6b. Keep high-volume tabular prep explicit before fitting
+
+- Current `fread()` documentation says ingest can keep `select`, `drop`, `nThread`, and detected classes such as `integer64`, `IDate`, and `POSIXct` explicit. Inspect those classes before fitting models that expect standard numeric, factor, or date surfaces.
+- Current `data.table` reference-semantics and `:=` documentation says mutations happen by reference and `copy()` avoids side effects. Keep one explicit boundary between the reusable source table and any model-ready frame used for sensitivity, subgroup, or alternate-endpoint work.
+- Current `tidytable` documentation keeps grouped prep explicit through `.by`, while current `dtplyr` documentation says `lazy_dt()` stays lazy until collection or conversion. Either route can be a strong prep layer as long as the workflow materializes one deliberate modeling frame before it reaches a fitting function.
+- Team doctrine: heavy grouped prep can live in `data.table`, `tidytable`, or `dtplyr`, but the modeling boundary should still be one inspectable, already-materialized object.
+
+### 7. Improve doctrine when repeated friction appears
+
+- Save recurring method-selection lessons into this skill and its references.
+- Prefer primary or official sources when expanding the methods guidance.
+- Treat diagnostics, multiplicity, missing-data posture, and post-estimation interpretation as part of the analysis design.
+
+## Coordination notes
+
+- Reach for `/r-eda` when the statistical workflow depends on Arrow/Parquet optimization, larger-than-memory intake, or building a Parquet working layer before modeling.
+- Reach for `/r-package-dev` when the statistical helper work lives inside an R package and package structure, `usethis`, or release surfaces matter.
+- Reach for `/r-model-builder` when the main task is a reusable model helper layer, pooled-fit helper workflow, or post-estimation wrapper.
+- Reach for `/r-tables-reporting` when the main task is Table 1, regression-table, adjusted-prediction table, figure export formatting, or journal-facing display choices.
+- Reach for `/r-shiny` when the chosen estimand figure must become an interactive app surface.
+- Reach for `/r-advanced` when repo history should be converted into reusable R guidance.
+
+## Resources
+
+- `references/statistical-analysis-framework.md`
+- `references/missing-data-and-multiple-imputation.md`
+- `references/marginal-effects-and-adjusted-predictions.md`
+- `references/marginaleffects-versus-emmeans.md`
+- `references/tidymodels-resampling-and-metrics.md`
+- `references/estimand-driven-figures.md`
+- `references/statistical-improvement-playbook.md`
+- `references/pediatric-oncology-time-to-event-and-competing-risks.md`
+- `references/pediatric-asthma-recurrent-events-and-longitudinal-models.md`
+- `references/survey-weighted-analysis.md`
+- `references/bayesian-brms-tidybayes-workflows.md`
+- `references/causal-design-with-matchit-weightit-cobalt.md`
+- `references/meta-analysis-with-metafor.md`
+- `references/easystats-diagnostics-and-effect-sizes.md`
+- `references/gee-with-geepack.md`
+- `references/sem-with-lavaan.md`
+- `references/predictive-performance-and-decision-curves.md`
+- `references/bootstrap-and-permutation-inference.md`
+- `references/gams-and-splines.md`
+- `references/high-volume-tabular-prep.md`
+- `references/tte-summary-template.R`
+- `references/test-tte-summary-template.R`

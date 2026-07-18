@@ -1,0 +1,571 @@
+---
+name: gaia-create-story
+description: Create a detailed story file from epics-and-stories.md with full frontmatter, acceptance criteria, and sprint-state registration. Architecture skill.
+argument-hint: [story-key]
+allowed-tools: [Read, Write, Edit, Bash]
+orchestration_class: heavy-procedural
+yolo_steps: [3]
+---
+
+## Orchestration Mode
+
+```bash
+SESSION_MODE=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/detect-orchestration-mode.sh")
+WARNING_OUTPUT=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-warning.sh" --skill-class heavy-procedural --mode "$SESSION_MODE")
+if printf '%s' "$WARNING_OUTPUT" | grep -q '^SURFACE-WARNING: '; then
+  SENTINEL_PATH=$(printf '%s' "$WARNING_OUTPUT" | sed -n 's/^SURFACE-WARNING: //p' | head -n1)
+  cat "$SENTINEL_PATH"
+fi
+```
+
+**Surface contract.** When the prelude `cat`s a sentinel file — which happens once per session under Mode A (subagent dispatch) — you MUST mirror that cat'd warning text VERBATIM as the FIRST user-visible text of your response, before any skill-phase output. Claude Code auto-collapses Bash tool-call output, so the warning is invisible to users unless re-emitted as LLM turn text. Skip this step only when the prelude produced no sentinel output (Mode B, repeat invocation in same session, or out-of-scope skill class).
+
+## Setup
+
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/setup.sh
+
+## Brain Context
+
+!${CLAUDE_PLUGIN_ROOT}/scripts/brain/brain-reliance-loader.sh gaia-create-story:load-context
+
+## Mission
+
+Create a detailed story file for the supplied story key. The story is extracted from `{planning_artifacts}/epics-and-stories.md`, elaborated with architecture context, ACs in Given/When/Then format, tasks/subtasks, test scenarios, and dependencies. Output (canonical): `{implementation_artifacts}/{EPIC_DIR}/{story_key}-{slug}/story.md` — the per-story directory carries the key and the basename is the literal `story.md`, with a sibling `reviews/` subdir for review reports. `{EPIC_DIR}` is the full output of `resolve-epic-slug.sh` (e.g. `epic-E1-core`). The layout is enforced by `validate-canonical-filename.sh`, which also accepts the legacy flat `{story_key}-{slug}.md` and legacy nested `{EPIC_DIR}/stories/{story_key}-{slug}.md` forms read-only (three-tier fallback).
+
+The four artifact placeholders resolve at skill-load via `!scripts/resolve-config.sh <key>` — for `planning_artifacts`, `implementation_artifacts`, `test_artifacts`, `creative_artifacts`. The resolver merges `config/project-config.yaml` over framework defaults (project-over-global). HALT on resolver non-zero exit (no-silent-fallback contract).
+
+Native Claude Code conversion of the legacy create-story workflow.
+
+### `--for-sprint <id>` batch mode
+
+`/gaia-create-story --for-sprint <id> [--refresh]` materializes ONLY the stories a sprint selected (backlog selection), in one invocation — so an operator does not run `/gaia-create-story` per story (consolidates the prior `--bulk` + `--materialize` proposals). It is **create-if-missing and idempotent**: a key that already has a file is skipped; `--refresh` re-elaborates a rolled-over story BUT never clobbers an in-progress/review/done one (status-guarded).
+
+The deterministic half runs `${CLAUDE_PLUGIN_ROOT}/scripts/materialize-sprint-stories.sh --keys "K1,K2,K3" --epics <epics-and-stories.md> --impl-root <implementation-artifacts> [--refresh] [--manifest <path>]` (`--keys` is COMMA-separated; the obsolete project-config flag from the prior prose was removed — the script resolves the config itself via `generate-frontmatter.sh`). It scaffolds each missing story as a skeleton (priority_flag: null — never auto-set) into the per-story layout (`epic-{slug}/{key}-{slug}/story.md` via `resolve-epic-slug.sh`), and writes an **elaboration manifest** of the newly-scaffolded keys.
+
+Story ELABORATION — filling the `{CONTENT_PLACEHOLDER}` bodies (real ACs/tasks/test-scenarios) — is NOT scriptable: it is the LLM-driven Step 3/Step 4 work below. So `--for-sprint` is a **main-turn loop**: for each key in the manifest, run the per-story elaboration (Steps 3–6), then transition the story to `ready-for-dev` via `transition-story-status.sh` (NOT a direct `status:` edit). The sprint that selected these stories commits as `status: planned`; the readiness gate activates it after materialization + ATDD.
+
+## Critical Rules
+
+- An epics-and-stories document MUST exist at `{planning_artifacts}/epics-and-stories.md` before starting (path resolved via `!scripts/resolve-config.sh planning_artifacts`). If missing, fail fast with "epics-and-stories.md not found at {planning_artifacts}/epics-and-stories.md -- run /gaia-create-epics first."
+- Story files MUST include complete YAML frontmatter with ALL 15 required fields: key, title, epic, status, priority, size, points, risk, sprint_id, depends_on, blocks, traces_to, date, author, priority_flag. Optional fields: origin, origin_ref, figma.
+- All acceptance criteria MUST use Given/When/Then format: "Given {context}, when {action}, then {expected result}".
+- **AC checkbox format.** Each AC line MUST begin with a `- [ ]` markdown checkbox. The full line shape is `- [ ] **AC{N}:** Given {context}, when {action}, then {expected result}.` — checkbox first, then bold AC tag, then the Given/When/Then sentence. `validate-ac-format.sh` enforces this strictly: bold `**Given:** / **When:** / **Then:**` bullet lists (without the leading `- [ ]` checkbox) fail with CRITICAL and block story creation, even though the prose reads as valid Given/When/Then. The checkbox enables operators to tick ACs as they ship and feeds the `/gaia-check-dod` evidence signal.
+- The story file MUST be written to the canonical per-story path `{implementation_artifacts}/{EPIC_DIR}/{story_key}-{slug}/story.md`, where `{EPIC_DIR}` is the full `resolve-epic-slug.sh` output and the basename is the literal `story.md` (enforced by `validate-canonical-filename.sh`; `{implementation_artifacts}` is resolved via `!scripts/resolve-config.sh implementation_artifacts`). The legacy flat `{story_key}-{slug}.md` and legacy nested `{EPIC_DIR}/stories/{story_key}-{slug}.md` forms are read-only fallbacks; NEW writes always use the per-story form.
+- Slugs are generated by `slugify.sh` — do not re-implement the algorithm in prose; pass the title via `--title` and consume stdout.
+- The story template is bundled at `${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/story-template.md`. Do NOT take a runtime dependency on the `_gaia/` framework tree.
+- After writing the story file, call `${CLAUDE_PLUGIN_ROOT}/scripts/transition-story-status.sh {story_key} --reconcile-only` to register the story atomically across the four canonical surfaces (story-file frontmatter, `sprint-status.yaml`, `epics-and-stories.md`, `story-index.yaml`). The `--reconcile-only` flag (NOT `--to backlog`) is required because Step 4 already wrote `status: backlog` to the story file — `--to backlog` would be a self-transition no-op that SKIPS the registration write. See Step 5 below for the full rationale.
+- The `sprint-status.yaml` MUST be re-read immediately before writing (Sprint-Status Write Safety rule).
+- If a story file already exists for this key with status other than `backlog`, HALT with guidance to use /gaia-fix-story.
+- The priority_flag field accepts only `null` (default), `"next-sprint"`, or `"hotfix"` as valid values. The `"hotfix"` value is human-set only — `/gaia-add-feature` and triage MUST NOT auto-set it. When set, `/gaia-sprint-plan` auto-injects the story into the ACTIVE sprint via `sprint-state.sh inject` (bypassing sprint-plan selection ceremony). Hotfix stories MUST still pass the FULL `/gaia-run-all-reviews` including the wire-verification gate — a hotfix is faster to PLAN, NOT faster to TEST.
+- Step 6 (Validation) implements the Val + SM Fix-Loop dispatch pattern. SM fix is INLINE via this skill's own `Edit`/`Write` tools; nested subagent spawning for the fix is forbidden (single-spawn-level).
+- Step 6 3-attempt cap is hard. YOLO MUST NOT bypass the cap or the terminal FAILED verdict.
+- Step 6 terminal verdicts are recorded via `review-gate.sh` against the ledger-keyed `story-validation` gate (`--plan-id <id>`); does NOT touch the six canonical Review Gate table rows.
+- Story status MUST only be changed via `transition-story-status.sh`. Direct edits to `status:` fields in story frontmatter, sprint-status.yaml, epics-and-stories.md, story-index.yaml, or per-epic shards under `.gaia/artifacts/planning-artifacts/epics/` are FORBIDDEN.
+- **Per-epic directory naming** — The canonical per-epic directory name is the FULL output of `resolve-epic-slug.sh` (e.g., `epic-E1-core-brain-vault`). Do NOT write story files to `epic-{N}/stories/...` (numeric-only, no slug) — `transition-story-status.sh` writes the `story-index.yaml` to the resolver-output directory, so any other naming produces SPLIT STATE across two directories per epic (story files in one, `story-index.yaml` in the other). Even when bulk-authoring stories WITHOUT this skill (e.g., writing 36 stories in one pass), every story MUST land at the per-story path `{implementation_artifacts}/{resolve_epic_slug output}/{story_key}-{slug}/story.md` (the per-story directory carries the key and the basename is `story.md`). Under the new layout `transition-story-status.sh` co-locates `story-index.yaml` at the epic root `{resolve_epic_slug output}/story-index.yaml`. Bypassing the resolver and using `epic-{N}/` is the recurring bug class — the resolver exists precisely to keep create-story and transition-story-status in sync.
+
+## Steps
+
+### Step 1 -- Select Story
+
+- If a story key was provided as an argument (e.g., `/gaia-create-story <story-key>`), use it directly.
+- Read `{planning_artifacts}/epics-and-stories.md` and locate the story by key.
+- Scan `{implementation_artifacts}/` for existing story files matching `{story_key}-*.md`.
+- If a story file already exists:
+  - Read its YAML frontmatter status field.
+  - If status is `backlog`: warn "Story file exists with status backlog. Proceeding will regenerate it." Allow continue.
+  - If status is anything else: HALT -- "Story {key} is in '{status}' status. Use /gaia-fix-story {key} to edit."
+- If no story key was provided: display a prioritized list of stories without files and ask the user to select.
+
+> **YOLO hard guard:** The existing-story-status HALT above runs unconditionally — including in YOLO mode. YOLO MUST NOT bypass the HALT gate. Order of evaluation: existing-story-status HALT first, YOLO branch (Step 3) second. A `status: in-progress` story HALTs before any subagent spawn even with `yolo`/`--yolo` set.
+
+### Step 2 -- Load Context
+
+- Read story summary from `{planning_artifacts}/epics-and-stories.md`.
+- Read `{planning_artifacts}/architecture.md` for technical context (ADRs live inline in the Decision Log table).
+- Read `{planning_artifacts}/ux-design.md` if available for UI context.
+
+### Step 3 -- Elaborate Story
+
+> [!yolo]
+> Step 3 honors the declarative `yolo_steps: [3]` frontmatter convention. Under YOLO, the routing prompt is auto-answered `[a]` (Auto-delegate to PM + Architect, plus UX Designer when the four-rule UX detection matches) and the post-subagent `[c]`/`[e]`/`[a]` confirmation is auto-continued. Hard gates remain enforced: Step 1's non-backlog status HALT and Step 6's 3-attempt Val cap are unconditional in BOTH modes. A `severity: CRITICAL` finding in the consolidated subagent response HALTs YOLO with the surfaced finding.
+
+#### YOLO branch
+
+Consult the canonical YOLO mode helper rather than re-implementing detection inline:
+
+```bash
+if ${CLAUDE_PLUGIN_ROOT}/scripts/yolo-mode.sh is_yolo; then
+  YOLO_MODE=true
+else
+  YOLO_MODE=false
+fi
+```
+
+The helper applies the precedence (memory-save exempt, explicit opt-out, `GAIA_YOLO_FLAG=1`, inherited `GAIA_YOLO_MODE=1`, default interactive). Do NOT consume the `gaia-create-story/setup.sh: yolo_mode={true|false}` log line as the activation signal — that line is documentary only; the helper is the single source of truth.
+
+When `YOLO_MODE=true`:
+
+- **Skip the routing prompt entirely.** Do NOT display the `[u]/[a]` menu; do NOT wait for user input. Auto-select the `[a]` Auto-delegate path and proceed directly to subagent spawn.
+- **Propagate inheritance to subagents.** Export `GAIA_YOLO_MODE=1` on the PM (Derek), Architect (Theo), and (when matched) UX Designer (Christy) subagent invocations. Do NOT set `GAIA_CONTEXT=memory-save` here — that exemption is reserved for the memory-save step at workflow completion.
+- **Auto-continue any post-subagent or template-output review prompts.** YOLO mode replaces every `[c]/[e]/[a]` or `[c]/[e]/[v]` interactive review prompt with an automatic continue — there must be zero user prompts between Step 4 (file write) and Step 6 (Val dispatch).
+- **CRITICAL-finding HALT.** After the consolidated PM + Architect (+ UX Designer) response returns, inspect the merged findings for any entry with `severity: CRITICAL`. On any match, HALT and surface the finding to the user instead of auto-continuing. WARNING and INFO findings continue to auto-merge into the elaboration. This is the YOLO-branch hard gate — the contract preserves CRITICAL findings as user-blocking signals even when YOLO is active.
+- **YOLO MUST NOT bypass the Step 1 existing-story-status HALT gate nor the Step 6 3-attempt cap or terminal FAILED verdict.** The HALT gate in Step 1 fires before the YOLO branch ever evaluates; the cap and verdict in Step 6 are unconditional. The wire-up contract is: `/gaia-create-story | Step 3 Elaborate Story | yolo_steps:[3] | Auto-select [a]; auto-continue after PM+Architect return`.
+
+When `YOLO_MODE=false` (interactive default), proceed to the prompt below.
+
+#### Non-YOLO routing prompt
+
+Present a brief summary of what was loaded, then offer the user how to elaborate. The canonical prompt is (text below is part of the contract — do not paraphrase):
+
+```
+How would you like to elaborate this story?
+[u] I'll answer the elaboration questions myself
+[a] Auto-delegate to PM (Derek), Architect (Theo){UX_CLAUSE}    -- recommended
+```
+
+The `{UX_CLAUSE}` token is replaced based on the **four-rule UX detection** below:
+
+- When any rule matches: `, and UX Designer (Christy)`
+- When no rule matches: `` (empty string — the `[a]` line **omits** the "and UX Designer" clause)
+
+Concrete examples:
+
+- UX match → `[a] Auto-delegate to PM (Derek), Architect (Theo), and UX Designer (Christy)`
+- No UX match → `[a] Auto-delegate to PM (Derek) and Architect (Theo)`
+
+#### Four-rule UX detection
+
+Run all four rules. Any rule matching → spawn UX Designer. No rule matching → omit UX Designer (backend-only path).
+
+**Rule #1** — `figma:` frontmatter block present (definitive signal).
+**Rule #2** — UI_TERMS substring match (case-insensitive) in description or AC text: `screen | page | modal | form | button | navigation | wizard | flow | interaction | accessibility | responsive | mobile view | design`. Word-boundary `flow` excludes `data flow` / `control flow`.
+**Rule #3** — Epic has a UX-tagged `tags:` or `classification:` line in `epics-and-stories.md`.
+**Rule #4** — `{planning_artifacts}/ux-design.md` exists AND the story's epic key appears inside. Missing file → skip cleanly (rules 1-3 still evaluate); use `[ -f ]` guard.
+
+**Deterministic invocation.** Detection is delegated to the `detect-ux-scope.sh` helper script — the SKILL.md no longer re-implements the four-rule pseudocode in prose. The helper applies word-boundary regex semantics on UI_TERMS (so "platform" does not trip `\bform\b`, "interaction" does not trip `\baction\b`) and an explicit exclusion phrase list (`data flow`, `control flow`, `request flow`, `workflow`, `git flow`) that suppresses the bare `flow` UI term in backend stories.
+
+```
+DETECT=$(${CLAUDE_PLUGIN_ROOT}/scripts/detect-ux-scope.sh "${STORY_FILE}")
+UX_MATCH=$(echo "$DETECT" | jq -r '.ux_match')
+RULES_FIRED=$(echo "$DETECT" | jq -rc '.rules_fired')
+EXCLUDED_BY=$(echo "$DETECT" | jq -rc '.excluded_by')
+log "ux_detection: ux_match=${UX_MATCH} rules_fired=${RULES_FIRED} excluded_by=${EXCLUDED_BY}"
+```
+
+`detect-ux-scope.sh` returns JSON `{ux_match: bool, rules_fired: [...], excluded_by: [...]}`. The `rules_fired` array carries any subset of the four canonical rule IDs `rule1`, `rule2`, `rule3`, `rule4` in priority order. The script exits 0 on success, 1 if the story file is unreadable, 2 if the frontmatter is malformed. Missing `ux-design.md` degrades cleanly — `rule4` is simply omitted from `rules_fired`.
+
+A story matching multiple rules still results in **a single UX Designer spawn** — priority order matters for telemetry only. Always log which rule(s) fired and which exclusion phrases (if any) suppressed candidate matches.
+
+#### Subagent contracts
+
+When the user picks `[a]`, dispatch the selected subagents with the contracts below.
+
+**PM (Derek) — `gaia:pm`.** Always spawned on `[a]`.
+- Loads: `{planning_artifacts}/epics-and-stories.md`, `{planning_artifacts}/prd.md`, `{planning_artifacts}/ux-design.md` (when present).
+- Answers 3 questions: (Q1) edge cases from a product/stakeholder lens; (Q2) AC prioritization (must-have vs nice-to-have); (Q3) stakeholder notes / cross-team callouts.
+
+**Architect (Theo) — `gaia:architect`.** Always spawned on `[a]`.
+- Loads: `{planning_artifacts}/architecture.md`, `{planning_artifacts}/test-plan.md`, `{planning_artifacts}/epics-and-stories.md`.
+- Answers 2 questions: (Q1) implementation constraints (ADRs, patterns, tech choices); (Q2) technical dependencies (other modules, services, libraries).
+
+**UX Designer (Christy) — `gaia:ux-designer`.** Spawned on `[a]` ONLY when the four-rule UX detection matches. NOT spawned for backend-only stories.
+- Loads: `{planning_artifacts}/ux-design.md` (when present), `{planning_artifacts}/epics-and-stories.md`, the story frontmatter (including any `figma:` block).
+- Answers exactly 3 questions: (Q1) UX edge cases — empty, loading, error, no-data, offline states; (Q2) accessibility — keyboard navigation, screen-reader support, color contrast, ARIA semantics; (Q3) interaction patterns — which design-system components/patterns to reuse vs build custom.
+
+PM still loads `ux-design.md` even when UX Designer is also spawned — this is intentional. PM brings stakeholder context; UX Designer brings design-system expertise. The question scopes do not overlap.
+
+#### Parallel spawn protocol — single message, multiple Agent calls
+
+HARD CONSTRAINT: all selected subagents are spawned in ONE assistant message containing multiple Agent tool calls — true parallel, never sequential (AC6). Backend-only story → 2 calls (PM + Architect); UX-scoped story → 3 calls (PM + Architect + UX Designer).
+
+#### `[u]` Manual elaboration path (4-question flow, AC5)
+
+When the user selects `[u]`, ask exactly 4 questions in this canonical order. No additional questions, no reordering, no merging:
+
+1. **Edge cases.** "What edge cases should this story handle? (empty/loading/error states, boundary inputs, failure modes)"
+2. **Implementation preferences.** "Any implementation preferences or constraints? (libraries, patterns, ADRs to honor, anti-patterns to avoid)"
+3. **AC splits.** "Should any acceptance criterion be split into smaller ACs for clarity or test isolation?"
+4. **Additional context.** "Any additional context — stakeholders, integrations, or cross-team callouts — to include?"
+
+The 4 questions are exactly 4 — sized to mirror V1's `[u]` UX. Do NOT inflate the count by walking the PM/Architect/UX scopes from the `[a]` path.
+
+Gather edge cases, implementation preferences, AC splits, and additional context returned by the `[u]` flow (or by the subagents on the `[a]` path) and pass them forward to Step 4.
+
+### Step 3b -- Edge Case Analysis
+
+This step JIT-invokes the `edge-cases` skill to enumerate boundary, error, timing, concurrency, integration, security, data, and environment scenarios for the story's acceptance criteria. It restores the V1 parity pipeline that was dropped in V2. Steps 3b/3c/3d run **non-interactively** — they MUST NOT introduce any new user prompts and behave identically in YOLO mode.
+
+**Size gate.** If the story `size` is `S`, skip Step 3b entirely:
+
+```
+if [ "${SIZE}" = "S" ]; then
+  log "edge_case_skip: size=S"
+  edge_case_results=[]
+  # proceed to Step 3c with empty results — Step 3c becomes a no-op
+fi
+```
+
+For sizes M, L, or XL, proceed with the JIT skill invocation below.
+
+**JIT skill invocation.** Invoke the `edge-cases` skill (canonical name; namespaced form `gaia:edge-cases` resolves equivalently) via the Skill tool. Pass the input context:
+
+```yaml
+story_key:           "{STORY_KEY}"
+story_title:         "{TITLE}"
+story_description:   "{DESCRIPTION}"
+acceptance_criteria: ["{AC1}", "{AC2}", ...]   # primary ACs from Step 3 elaboration
+size:                "{SIZE}"                  # M | L | XL
+architecture_excerpt: "{relevant ADR/architecture section, optional}"
+```
+
+The skill returns a structured `edge_case_results` list with the canonical schema:
+
+```yaml
+edge_case_results:
+  - id:       "EC-1"          # sequential EC-{N}
+    scenario: "..."            # one-line description
+    input:    "..."            # triggering input/precondition
+    expected: "..."            # expected behavior
+    category: "boundary"       # one of: boundary | error | timing | concurrency | integration | security | data | environment
+    severity: "high"           # optional: critical | high | medium | low (used by Step 3d row format)
+```
+
+**Token budget cap.** Combined input + skill output MUST stay under 8K tokens. Truncation order when post-processing over-budget results: keep `boundary`/`error`/`security` first, then `concurrency`/`timing`, then drop `data`/`integration`/`environment` from the tail. Log `edge_case_token_usage=${tokens}` per invocation; over 80% of budget also log a Dev Notes entry.
+
+**Failure handling.** Non-blocking on any error (skill missing, >30s timeout, malformed output, exception): set `edge_case_results=[]`, log a warning, proceed to Step 3c. Edge-case skill failure MUST NOT block story creation.
+
+YOLO compatibility: non-interactive — same outputs regardless of `YOLO_MODE`.
+
+### Step 3c -- Append Edge Cases to Acceptance Criteria
+
+Append edge-case-derived AC rows to the story file. The append is delegated to `append-edge-case-acs.sh`, which enforces a SHA-256-based primary-AC immutability check and atomically reverts on drift.
+
+```
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/append-edge-case-acs.sh \
+  --file <story-file> \
+  --edge-cases '<json-array-of-edge-case-results>'
+```
+
+`<json-array-of-edge-case-results>` is `edge_case_results` from Step 3b serialized as JSON. The script is idempotent (dedup by `scenario`), best-effort (missing target file emits stderr WARNING and exits 0), and emits the integer count of new entries on stdout. On non-zero exit the file is already reverted — proceed to Step 3d with unchanged primary ACs; story creation MUST NOT halt.
+
+YOLO compatibility: non-interactive.
+
+### Step 3d -- Append Edge Cases to Test Plan
+
+Append edge-case rows to `{planning_artifacts}/test-plan.md`. The append, dedup, TC-ID allocation, and row format are delegated to `append-edge-case-tests.sh` — do not re-implement in prose.
+
+```
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/append-edge-case-tests.sh \
+  --test-plan "$(!scripts/resolve-config.sh planning_artifacts)/test-plan.md" \
+  --story-key "<story_key>" \
+  --edge-cases '<json-array-of-edge-case-results>'
+```
+
+The script is idempotent (dedup by `(story_key, scenario)` pair), best-effort (missing test-plan file emits stderr WARNING and exits 0 — non-blocking), and uses the canonical `| TC-{N} | {scenario} | edge-case | {severity} | {story_key} |` row format.
+
+YOLO compatibility: non-interactive.
+
+### Step 3e -- Intake-time dispatch-verb enforcement
+
+After ACs are drafted (Steps 3 / 3b / 3c) and BEFORE Step 4 generates the story file on disk, enforce the drift-prevention contract: every AC mentioning a dispatch verb (per the closed-list taxonomy SSOT at `knowledge/taxonomy/dispatch-verbs.txt`) MUST be paired with a companion integration-test AC OR explicitly annotated with `<!-- gaia:contract-only: <reason> -->`.
+
+The deterministic enforcement runs in `scripts/lib/intake-dispatch-verb-check.sh` — the LLM never inlines the taxonomy or re-implements the matcher (SSOT contract).
+
+```bash
+!scripts/lib/intake-dispatch-verb-check.sh --story-file "${TMP_STORY_DRAFT}"
+```
+
+The helper:
+- Sources `scripts/lib/dispatch-verb-match.sh` (matcher library).
+- Walks each AC; on a dispatch-verb match with no integration-test AC and no contract-only override, exits 1 with the canonical stderr `HALT: dispatch-verb AC #<n> ("<excerpt>") lacks a companion integration-test AC. Add an integration-test AC, OR annotate this AC with <!-- gaia:contract-only: <reason> --> if the dispatch is contract-only.`
+- For each `<!-- gaia:contract-only: <reason> -->` override observed, appends a `**Contract-only ACs:**` subsection to the story Dev Notes capturing the reason.
+
+YOLO compatibility: non-interactive. A HALT here aborts the YOLO branch — there is no auto-fix; the author must add an integration-test AC or annotate the override.
+
+### Step 4 -- Generate Story File
+
+The deterministic operations of Step 4 — slug, frontmatter YAML, scaffold render, and post-write validation — are delegated to the script tier. The agent's only Step 4 responsibility is (a) feeding inputs to the scripts in dependency order, (b) filling `{CONTENT_PLACEHOLDER}` lines with judgment-bearing content, and (c) honoring the `origin` / `origin_ref` provenance contract.
+
+```
+# 1. Resolve the output directory (HALT on resolver non-zero exit).
+IMPLEMENTATION_ARTIFACTS=$(!scripts/resolve-config.sh implementation_artifacts)
+
+# 2. Slug — delegated to slugify.sh.
+SLUG=$(!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/slugify.sh --title "<story-title>")
+
+# 2a. Canonical basename preview.
+#     Display the filename that scaffold-story.sh will write BEFORE the
+#     write happens. validate-canonical-filename.sh strictly
+#     enforces this exact basename — surfacing it here lets the author
+#     confirm the slug matches their intent before the file lands on disk.
+#     The basename rule is `${STORY_KEY}-${SLUG}.md`; the strictness
+#     contract itself is preserved verbatim (no auto-correct, no
+#     monotonic-prefix acceptance).
+echo "[gaia-create-story] Canonical basename preview: ${STORY_KEY}-${SLUG}.md"
+
+# 3. Frontmatter YAML — delegated to generate-frontmatter.sh,
+#    which derives points from size via the resolved sizing_map
+#    and HALTs on resolver failure (no silent fallback).
+FRONTMATTER_YAML=$(!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/generate-frontmatter.sh \
+  --story-key "<story_key>" \
+  --epics-file "$(!scripts/resolve-config.sh planning_artifacts)/epics-and-stories.md" \
+  --project-config "${PROJECT_ROOT:-$(pwd)}/.gaia/config/project-config.yaml" \
+  [--origin <s>] [--origin-ref <s>])
+# Pass `--project-config` as an absolute path. The relative
+# form (`.gaia/config/project-config.yaml`) fails when the caller's
+# CWD is not the project root (e.g., orchestrator dispatched from inside a
+# git work tree subdir).
+
+# 3b. Resolve the canonical per-epic directory name.
+#     Delegated to resolve-epic-slug.sh — single source of truth for the
+#     per-epic directory name. The resolver's stdout is the COMPLETE basename
+#     (e.g., `epic-E1-core-brain-vault`) — it ALREADY includes the `epic-`
+#     prefix. Do NOT prepend another `epic-` segment when constructing paths.
+#     HALT on resolver non-zero exit per the deterministic-script-lift
+#     principle (no silent fallback to a hardcoded slug).
+#
+# Canonical-naming contract:
+#   - Use the resolver output VERBATIM as the per-epic directory name.
+#   - Do NOT write to `epic-{N}/stories/...` (numeric-only, no slug) — that
+#     bypasses resolve-epic-slug.sh and produces split state with
+#     transition-story-status.sh which uses the resolver path directly.
+#     Mixing the two produces split state across TWO directories per epic:
+#     story .md files in one, story-index.yaml in the other.
+#
+# NEW per-story nested write target (drops the `stories/`
+# middle level so a story's location encodes its key as a single moveable unit):
+#   - Path: ${IMPLEMENTATION_ARTIFACTS}/${EPIC_DIR}/{story_key}-{slug}/story.md
+#   - A sibling `reviews/` subdir under {story_key}-{slug}/ holds the
+#     type-FIRST review reports (code-review-{key}.md, qa-tests-{key}.md, …) —
+#     never the reversed {key}-<type>.md form (check-deps.sh glob collision).
+#   - NEW writes always use this nested per-story form. Legacy
+#     `${EPIC_DIR}/stories/{story_key}-{slug}.md` and flat layouts remain
+#     READ-ONLY fallback via resolve-story-file.sh's three-tier resolver —
+#     existing files are NOT migrated (read-compat only).
+#   - validate-canonical-filename.sh validates the key from the directory name
+#     `{story_key}-{slug}/` (location encodes key) when the basename is story.md.
+EPIC_DIR=$(!scripts/lib/resolve-epic-slug.sh \
+  --epic-key "<epic_key>" \
+  --epics-file "$(!scripts/resolve-config.sh planning_artifacts)/epics-and-stories.md")
+
+# 3c. Legacy-flat refusal guard. If a legacy flat-path file
+#     `${IMPLEMENTATION_ARTIFACTS}/<story_key>-*.md` already exists for the
+#     same key, REFUSE to write the canonical nested sibling — emit a single
+#     stderr WARNING line that names BOTH the existing flat path and the
+#     would-be nested path, and HALT non-zero (exit 1). The refusal is a
+#     workflow-level halt, not a finding the SM-fix loop can repair. Run the
+#     layout migration first to unify flat/nested layouts.
+# POSIX-portable glob test (`compgen` is a bash builtin that breaks
+# under zsh / dash). Use a command-list with `set --` so the test works in any
+# POSIX shell: `set --` re-binds positional params to the glob match; an unmatched
+# glob leaves the literal pattern in $1, which we detect with `-e`.
+set -- "${IMPLEMENTATION_ARTIFACTS}/${STORY_KEY}-"*.md
+if [ -e "$1" ]; then
+  flat_path="$1"
+  nested_path="${IMPLEMENTATION_ARTIFACTS}/${EPIC_DIR}/stories/${STORY_KEY}-${SLUG}.md"
+  printf '[gaia-create-story] REFUSED: legacy flat file %s exists; will NOT write nested sibling %s. Run the layout migration first.\n' \
+    "$flat_path" "$nested_path" >&2
+  exit 1
+fi
+
+# 4. Scaffold the deterministic skeleton — delegated to scaffold-story.sh.
+#    Forces status: backlog; emits seven content section names
+#    on stdout in declaration order. Output lands at the NEW per-story nested
+#    path: ${EPIC_DIR}/<story_key>-${SLUG}/story.md — the
+#    `stories/` middle level is dropped so the story's directory carries its key
+#    and a sibling `reviews/` subdir holds the type-first review reports.
+#    Never the legacy flat or epic-*/stories/ path. The mkdir -p of the per-story
+#    directory (and its reviews/ subdir) is idempotent under POSIX semantics so
+#    concurrent /gaia-create-story invocations do not race (AC1 / AC2 / AC5).
+STORY_DIR="${IMPLEMENTATION_ARTIFACTS}/${EPIC_DIR}/<story_key>-${SLUG}"
+mkdir -p "${STORY_DIR}/reviews"
+SECTIONS=$(!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/scaffold-story.sh \
+  --template ${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/story-template.md \
+  --output "${STORY_DIR}/story.md" \
+  --frontmatter "${FRONTMATTER_YAML}")
+
+# 5. Post-write validation — delegated to validate-canonical-filename.sh
+#    and validate-frontmatter.sh. Both HALT on non-zero with stderr passthrough.
+#    For the new per-story layout validate-canonical-filename.sh validates
+#    the key from the DIRECTORY name (basename is story.md); the legacy basename
+#    contract still applies to legacy-layout files (read-compat).
+#
+# Validator CLI form — the three story validators
+# (validate-frontmatter.sh, validate-ac-format.sh, validate-canonical-filename.sh)
+# accept TWO call forms:
+#   --file <path>     canonical, recommended for all scripted callers (used below)
+#   <path>            deprecated positional form; emits a NOTICE line and proceeds.
+# Always prefer the `--file` form in new code; the positional form exists for
+# hand-driven invocations and one-off scripts during the retrofit window.
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/validate-canonical-filename.sh --file "${STORY_DIR}/story.md"
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/validate-frontmatter.sh         --file "${STORY_DIR}/story.md"
+```
+
+After the scaffold returns the seven content section names (`User Story`, `Acceptance Criteria`, `Tasks / Subtasks`, `Dev Notes`, `Technical Notes`, `Dependencies`, `Test Scenarios`), fill each `{CONTENT_PLACEHOLDER}` with judgment-bearing content via Edit calls. ACs use Given/When/Then format (validated post-fill by `validate-ac-format.sh`).
+
+The `origin` / `origin_ref` provenance contract: when the invoking command is `/gaia-correct-course` or `/gaia-triage-findings` (via Skill-to-Skill Delegation), pass through `--origin` and `--origin-ref` to `generate-frontmatter.sh`. Otherwise omit the flags and the frontmatter records `origin: null` / `origin_ref: null`.
+
+#### Step 4b -- Manual-test authoring offer (surface-aware, opt-in)
+
+A story with a user-facing surface needs a manual / functional verification pass, not just automated tests. Offer manual verification at authoring time — symmetric with how acceptance tests are offered by risk: **offered when relevant, opt-in, never silently mandatory.** This is the trigger that makes the per-story-review manual-test gate fire; without it the gate stays dormant because nothing upstream sets the flag.
+
+**Surface detection (when to offer).** Offer the manual-test prompt when the story touches a user-facing surface — any of:
+- The project declares a user-facing platform (`web`, `server` / API, `ios` / `android` mobile, or a desktop surface) in `project-config.yaml` AND the story changes behavior on that platform, OR
+- The story is UI/UX-bearing (the four-rule UX detection in Step 3 matched, or the story body describes a screen, endpoint, or user-visible flow).
+
+A pure-internal / script-only / refactor story with no user-facing surface does NOT trigger the prompt — its `manual_verification` defaults to `false` (absent prompt). Forcing the flag onto every story would make the fail-closed review gate block work that has nothing to verify manually.
+
+**The offer.** When the surface test matches, ask the author (auto-continue under YOLO with the surface-derived default = offer accepted for a clearly user-facing story, declined otherwise):
+
+> This story has a user-facing surface. Add a manual-test scenario and require a manual-verification verdict at review? `[y]` opt in / `[n]` skip.
+
+**On opt-in:** pass `--manual-verification` to `generate-frontmatter.sh` (Step 4 step 3) so the frontmatter records `manual_verification: true`, and fill the `## Manual Test` section with the scenario (what an operator / the agent-driven manual tester exercises, the expected observable behavior, and the surface(s) involved). **On skip / no-surface:** omit the flag (`manual_verification: false`) and leave the `## Manual Test` section as the `N/A` default. The generator emits the key in both cases, so the flag is always explicit in frontmatter.
+
+The sizing_map override contract is enforced by `generate-frontmatter.sh`; the canonical filename rule is enforced by `validate-canonical-filename.sh`; the 15-field schema is enforced by `validate-frontmatter.sh`. SKILL.md no longer describes any of these algorithms in prose.
+
+`points` are derived from `size` via the resolved `sizing_map` (project-over-global; the `sizing_map:` block is part of the project-config.yaml schema). The resolver is `!scripts/resolve-config.sh sizing_map` — same key consumed by `gaia-sprint-plan/SKILL.md` Step 2 for parity. HALT on resolver non-zero exit or malformed sizing_map (no silent fallback to a hardcoded constant).
+
+> After artifact write: run open-question detection snippet
+> `!${CLAUDE_PLUGIN_ROOT}/scripts/detect-open-questions.sh "${IMPLEMENTATION_ARTIFACTS}/epic-${EPIC_SLUG}/stories/${STORY_KEY}-${SLUG}.md"`
+
+### Step 5 -- Register in Sprint Status
+
+```
+!${CLAUDE_PLUGIN_ROOT}/scripts/transition-story-status.sh <story_key> --reconcile-only
+```
+
+Atomic four-surface writer (story-file frontmatter, sprint-status.yaml, epics-and-stories.md, story-index.yaml) under flock — see `transition-story-status.sh`. MUST run AFTER the Step 4 file write succeeds (story file is source of truth). Do not call the legacy deprecation wrapper.
+
+The invocation MUST use `--reconcile-only` (NOT `--to backlog`). Step 4's `generate-frontmatter.sh` already writes `status: backlog` into the story file. Calling `--to backlog` is a self-transition (current == target), and `transition-story-status.sh` short-circuits with a "no-op (story already at backlog)" log and SKIPS the four-surface registration write. The result is that the newly-created story file exists on disk but is never registered into `sprint-status.yaml`, `epics-and-stories.md`, or `story-index.yaml` — `/gaia-sprint-plan` then cannot see it in the backlog index. `--reconcile-only` bypasses the self-transition short-circuit and forces the four-surface write to run, registering the story even when current == target.
+
+### Step 6 -- Validation (Shared Val + SM Fix-Loop Dispatch Pattern)
+
+Six-component dispatch: 8-part Val validation, inline SM fix loop (3-attempt cap), status-sync per attempt, terminal verdict via `review-gate.sh`. Reused by `/gaia-validate-story`.
+
+Single-spawn-level: the SM fix is INLINE via this skill's `Edit` / `Write` tools — never a nested subagent spawn. Inline SM is the canonical pattern.
+
+**Component 1 — Val dispatch.** Invoke Val with: `context: fork`, `model: claude-opus-4-7`, `effort: high` (opus pin), tool allowlist `[Read, Grep, Glob, Bash]`, `artifact_path` = the Step 4 story file, `source_workflow: gaia-create-story`. See `plugins/gaia/agents/validator.md §Val Operations`.
+
+Non-opus mismatch guard: if a downstream override forces a non-opus model, emit the canonical WARNING `Val dispatch on non-opus model — forcing opus per opus-pin contract` and force opus. Silent degradation is forbidden.
+
+Val returns an 8-part response: `frontmatter`, `completeness`, `clarity`, `semantics`, `dependencies`, `factual`, `origin`, `review_gate_vocabulary`. Each part carries a `findings[]` with severity (`CRITICAL` / `WARNING` / `INFO`).
+
+Malformed response (AC-EC1): single missing part → WARNING + UNVERIFIED for that part; multiple missing parts → HALT, re-invoke once; second malformed response → terminal UNVERIFIED via `review-gate.sh`. Never silently pass.
+
+**Component 2 — Finding classification.** Partition findings by severity.
+- Zero CRITICAL and zero WARNING: verdict PASSED, skip the fix loop entirely. Proceed to Component 6 terminal write.
+- Any CRITICAL or WARNING: enter the fix loop.
+- INFO findings (AC-EC7) are always logged to the story's Dev Agent Record but NEVER trigger the loop. The severity classifier MUST filter INFO out of the loop trigger condition — INFO does not extend the loop lifespan.
+
+**Component 3 — Inline SM fix (attempt N of 3).** Apply fixes using this skill's own `Edit` and `Write` tools. The SM auto-fix vocabulary covers:
+- frontmatter field additions (missing required fields from the 15-field schema)
+- AC format corrections (converting free-form ACs to Given/When/Then)
+- dependency / trace / origin field updates
+- canonical filename renames
+
+Scope is restricted to the single story file path and (for Component 6) the `review-gate.sh` ledger output. No other files may be edited during the fix apply.
+
+**Component 4 — Re-validation.** After each fix attempt, re-invoke Val as a FRESH `context: fork` subagent. Each attempt is a new dispatch — not a continuation of the prior Val session. Use the same parameters as Component 1.
+
+**Component 5 — Status-sync after every attempt.** After the fix applies (Component 3), invoke `transition-story-status.sh {story_key} --to {new_status}` (see Step 5 invocation pattern above). Self-transitions are benign no-ops — proceed to re-validation, do not HALT (AC-EC3).
+
+**Component 6 — Attempt cap and terminal verdict.** The hard cap is 3 attempts. Track the attempt counter; new findings introduced by an SM fix (AC-EC5) do NOT reset the counter. Identical finding IDs across two consecutive attempts (oscillation / non-convergence, AC-EC4) must be logged to Dev Agent Record as a stall signal, but the loop MUST NOT short-circuit — the cap still runs to 3.
+
+Terminal verdict write (ledger-keyed, does NOT overwrite the six-row Review Gate table). Canonical vocabulary is strict — exactly `PASSED`, `FAILED`, or `UNVERIFIED` (enforced by `review-gate.sh`):
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/review-gate.sh update \
+  --story "{story_key}" --gate "story-validation" \
+  --verdict <PASSED|FAILED|UNVERIFIED> \
+  --plan-id "create-story-val-{timestamp}"
+```
+
+Query: `review-gate.sh status --story {story_key} --gate story-validation --plan-id <id>` returns the canonical string.
+
+**Component 6b — Status transition on terminal verdict.** Canonical Step 6 ordering — load-bearing; reversing any pair leaves a queryable-state mismatch:
+
+1. `review-gate.sh update --verdict <PASSED|FAILED|UNVERIFIED>` (terminal ledger write)
+2. `transition-story-status.sh {story_key} --to <target_status>` (four-file atomic status update)
+3. (Step 7) `val-sidecar-write.sh` (memory persistence)
+
+Target status per verdict — PASSED → `ready-for-dev`; FAILED or UNVERIFIED → `validating` (parked pending `/gaia-fix-story`):
+
+```bash
+# PASSED
+${CLAUDE_PLUGIN_ROOT}/scripts/transition-story-status.sh {story_key} --to ready-for-dev
+# FAILED or UNVERIFIED
+${CLAUDE_PLUGIN_ROOT}/scripts/transition-story-status.sh {story_key} --to validating
+```
+
+Self-transitions are no-ops.
+
+**AC-EC2 — missing review-gate.sh.** If `review-gate.sh` is not present or not executable at Component 6, HALT with an actionable error that references the expected path. Do NOT silently skip the terminal verdict write.
+
+**AC-EC6 — Val timeout / model unavailable.** If Val's `context: fork` invocation times out, crashes, or returns no response, HALT with the canonical message "Val validation could not complete: {reason}" and record the terminal verdict as UNVERIFIED via `review-gate.sh`. Never silently PASSED.
+
+**AC-EC8 — YOLO does not bypass the cap.** YOLO-mode invocations run the same 3-attempt loop with the same terminal verdict rules. YOLO MUST NOT override the cap and MUST NOT override a terminal FAILED verdict. On a YOLO-mode FAILED, HALT with guidance pointing to `/gaia-fix-story {story_key}`.
+
+**AC6 — YOLO auto-triggers Val dispatch.** With `YOLO_MODE=true`, Component 1 fires immediately after Step 4 file write — no user prompt. The cap, severity classification, terminal verdict, and HALT-on-FAILED rules are unchanged.
+
+**Token budget.** Log per-attempt Val token usage to Dev Agent Record; total loop overhead ≤ 3× single-pass Val budget.
+
+### Step 6b — Re-shard touched documents
+
+Step 5 (`transition-story-status.sh`) writes to the epics-and-stories monolith as part of the four-surface atomic update. Once Step 6 validation finishes, MUST follow with a re-shard so the per-epic shards under `.gaia/artifacts/planning-artifacts/epics/` stay aligned with the monolith. This step honours the monolith-vs-shard sync contract — it is not optional unless the user passes `--monolith-only` for an explicit atomic same-PR edit. This step sits BEFORE Step 7 (Val sidecar persistence) so the sidecar payload reflects the post-shard state on disk; Step 7 still runs last per AC3 atomicity.
+
+- If `$ARGUMENTS` contains `--monolith-only`: skip this step entirely. The user takes responsibility for re-running `/gaia-shard-doc` (or merging shards back to the monolith) before commit. Record `reshard: skipped (--monolith-only)` in the workflow checkpoint.
+- Otherwise, invoke `/gaia-shard-doc .gaia/artifacts/planning-artifacts/epics-and-stories.md` (or the canonical monolith path resolved at runtime). The skill writes to `.gaia/artifacts/planning-artifacts/epics/` — `01-change-log.md` and per-epic `NN-eNN-...md` shards.
+- After the re-shard returns, run `${CLAUDE_PLUGIN_ROOT}/scripts/check-monolith-shard-sync.sh` against the project root. The check is advisory (always exits 0). If it emits any `WARNING` lines naming `epics-and-stories.md`, surface those WARNINGs to the user — they indicate the re-shard did not converge and the user must investigate before commit.
+- Record `reshard: invoked (gaia-shard-doc)` in the workflow checkpoint so the audit trail captures the invocation.
+
+This step runs in YOLO mode automatically — re-sharding is deterministic and needs no user prompt. It is purely additive: skills that did not previously include this step continue to function for backwards compatibility.
+
+### Step 7 — Persist to Val Sidecar
+
+Final action — delegates persistence to `val-sidecar-write.sh`. MUST run last (AC3 atomicity).
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/val-sidecar-write.sh \
+  --command-name "/gaia-create-story" \
+  --input-id "${story_key}" --sprint-id "${sprint_id:-N/A}" \
+  --decision-payload "$(jq -cn --arg v "${verdict}" --arg p "${story_file_path}" \
+    --argjson f "${findings_json:-[]}" \
+    '{verdict:$v, findings:$f, artifact_path:$p}')"
+```
+
+If Step 6 was skipped, use `verdict: "skipped"` and empty findings. Helper enforces the allowlist and idempotency (`status=skipped_duplicate` is success). Best-effort: log warnings on rejection but never fail the skill.
+
+## Changelog
+
+- **2026-05-14 — Intake-time dispatch-verb enforcement.** Added Step 3e between Step 3d (Append Edge Cases to Test Plan) and Step 4 (Generate Story File). The step invokes `scripts/lib/intake-dispatch-verb-check.sh --story-file <draft>` which sources the matcher library and HALTs with the canonical message when a dispatch-verb AC lacks a companion integration-test AC and has no `<!-- gaia:contract-only: <reason> -->` override. Story-template.md and validate-frontmatter.sh gain a new 16th required `delivered:` boolean field (default `true`). The new field is the bookkeeping primitive a later story will consume for retroactive stub-only landings.
+
+## Finalize
+
+!${CLAUDE_PLUGIN_ROOT}/skills/gaia-create-story/scripts/finalize.sh
+
+## Mode B Readiness
+
+> **Driving teammate turns (MANDATORY under team orchestration).** Declaring
+> readiness above sets up the spawn / relay / shutdown bookkeeping seams — it does
+> NOT by itself drive a teammate. When `SESSION_MODE == team`, the orchestrator
+> MUST drive each teammate turn per the canonical **Mode B teammate round-trip
+> contract** at `knowledge/mode-b-round-trip-contract.md`: emit a real
+> `SendMessage(to: <handle>)` whose message ends with the reply-routing reminder,
+> let the teammate reply via `SendMessage(to: team-lead)` (one-shot re-prompt on
+> idle-without-reply; never fabricate the reply), then relay the received body to
+> the transcript / artifact. The bridge functions named above are bookkeeping
+> only; the round-trip itself is an orchestrator-driven, main-turn loop.
+>
+> **No discretionary Mode A fall-through.** The team-mode round-trip is mandatory
+> when the session resolves to team orchestration — "it is a small / focused /
+> quick step" is NOT a license to fall back to one-shot Mode A, and a slow reply
+> is the cross-turn-boundary case (wait or re-prompt once), not a fallback
+> trigger. The ONLY legitimate fall-through is a real `MODE_B_FALLBACK` token
+> emitted by the bridge at spawn time (substrate genuinely unavailable).
+
+This skill is Mode B-ready. Under the team-orchestration mode, the authoring work that the prose above describes as inline subagent dispatch is instead routed through the shared planning bridge library at `${CLAUDE_PLUGIN_ROOT}/scripts/lib/planning-mode-b-bridge.sh`, which itself layers on the shared dispatch library `${CLAUDE_PLUGIN_ROOT}/scripts/lib/dispatch-teammate.sh`.
+
+- **Spawn seam.** The architect subagent (Theo), the pm subagent (Derek), and — when the UX-detection rules match — the ux-designer subagent (Christy) collaborate on the story. The single-spawn-level and frontmatter-writing contracts above are unchanged: the SM fix loop stays inline, and the routing/HALT gates remain in force. The orchestration calls `planning_spawn_subagent gaia:architect "gaia-create-story"` to obtain a persistent teammate handle. The clean-room gate in the shared library refuses any reviewer persona before a teammate is created.
+- **Relay seam.** Each authoring turn is relayed verbatim to the team lead via `planning_relay_turn <handle> <payload>`, so the produced artifact structure is identical to the Mode A subagent-dispatch path — only the dispatch seam differs, never the authored output.
+- **Shutdown seam.** At skill exit the orchestration calls `planning_shutdown`, which delegates to `shutdown_all` so no teammate pane is left orphaned.
+- **Honest fallback.** Live Mode B is not exercisable in every Claude Code context. When the substrate is absent the bridge degrades to the existing Mode A foreground dispatch and emits a single `MODE_B_FALLBACK` token to stderr; the Mode A behaviour documented above remains the source of truth.

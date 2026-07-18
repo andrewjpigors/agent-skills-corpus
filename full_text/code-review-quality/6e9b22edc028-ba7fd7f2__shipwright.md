@@ -1,0 +1,814 @@
+---
+name: shipwright
+description: >
+  The ARMADA builder. Works a single GitHub issue end-to-end: research, plan, implement in an
+  isolated git worktree, validate with the project's own build/test/lint commands, and open a PR.
+  Trigger when the user says "work on issue", "pick up #123", "build this issue", "implement
+  #123", "start on the backlog item", references a GitHub issue number to implement, or invokes
+  /shipwright. Also the default target that crows-nest dispatches to. Has an address-review mode:
+  given a PR and its review comments, it triages each (agree/discuss/disagree), implements the
+  agreed changes, re-validates, pushes, and replies per thread — triggered by "address review
+  comments", "respond to the review", "fix the PR feedback". Accepts a GitHub issue number, a
+  free-text description, or a PR number plus review findings. Stack-agnostic — it runs whatever
+  build/test commands the repo configures.
+argument-hint: "<issue-number | description | PR# + findings>"
+allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Skill, Agent, EnterWorktree, ExitWorktree
+---
+
+# shipwright — build one issue into a PR
+
+End-to-end workflow for picking up an issue, planning it, building it in an isolated worktree, and
+opening a pull request. `shipwright` is stack-agnostic: it discovers the project's commands from
+`.armada/config.json` (or infers them) rather than assuming any language or framework.
+
+**shipwright runs in one of three modes:**
+
+- **Build mode** (default, §0–§10) — take an issue and produce a PR. For **bug-type** issues this
+  mode carries a **reproduce → fix → verify** loop: reproduce the reported symptom on the unpatched
+  code first (§2a), then confirm the repro is gone after the fix using the same method (§6a). A green
+  build/test/lint is **not** sufficient evidence a bug is fixed.
+- **Address-review mode** (§11) — take an **existing PR plus its review comments** and respond to
+  them: triage each, implement the agreed changes, re-validate, push, and reply per thread. This is
+  the stage [`crows-nest`](../crows-nest/SKILL.md) dispatches inside its ready-PR pipeline, after
+  [`muster`](../muster/SKILL.md) has reviewed. If you're invoked with a PR number and review
+  findings rather than an issue, jump to §11.
+- **Rebase mode** (§12) — take an **existing PR that GitHub reports `BEHIND` or `CONFLICTING`** and
+  make it mergeable: rebase its branch onto the configured base, resolve conflicts integrating both
+  sides, re-validate, and force-push (with `--force-with-lease`) to the PR's own branch. This is the
+  make-mergeable stage [`crows-nest`](../crows-nest/references/review-merge-pipeline.md) dispatches in its ready-PR pipeline
+  (§4.4b) **only when `autoMerge: true`**. If you're invoked to rebase/make-mergeable a PR rather
+  than to build or to address review, jump to §12.
+
+## 0a. Emit a liveness beat as you advance (so a slow build isn't misread as stalled)
+
+When crows-nest dispatches you as a **background** subagent (§2d of its SKILL), the harness surfaces
+**nothing** to the lookout until you return — no mid-build stream. A slow-but-healthy build then looks
+identical to a wedged one, and #134 was chartered because that ambiguity got a healthy agent **killed
+one step from opening its PR**. Fix it at the source: **emit a coarse liveness beat as you cross each
+phase**, so the lookout can tell *working* from *wedged* without guessing on output-file mtime.
+
+As you **enter** each stage below, drop a beat via the bundled producer (resolve it by the standard
+scripts-dir rule — **prefer `${CLAUDE_PLUGIN_ROOT}`, else the `pluginRoot` from `.armada/config.json`**;
+key `--run` by your **branch**, else the issue number):
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT:-<config.pluginRoot>}/scripts/liveness-beat.mjs" \
+  beat --run <branch|issue> --phase <phase> [--note "<what you're doing>"]
+```
+
+Emit one beat **when you begin** each phase (and, inside a long phase, an extra beat at any natural
+checkpoint — e.g. between test files — is welcome but not required; the phase-aware grace already
+covers a single long tool call):
+
+| Stage | `--phase` |
+|-------|-----------|
+| §2 research & gather context | `research` |
+| §3 plan | `planning` |
+| §4 create the worktree | `worktree` |
+| §5 implement | `implementing` |
+| §6 validate (build/test/lint) | `validating` |
+| §7 open the PR | `opening-pr` |
+| §11 address-review round | `addressing` |
+| §12 rebase | `rebasing` |
+
+Then, **when you finish** — right after you've reported your structured result (§8), whether the outcome
+is `opened` or `blocked` — write the **terminal marker** so a finished agent going quiet is never
+mistaken for a wedged one:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT:-<config.pluginRoot>}/scripts/liveness-beat.mjs" \
+  done --run <branch|issue> --status <opened|blocked> --reason "<one line>"
+```
+
+The terminal marker is **per-dispatch**, not a permanent latch on the branch: a branch flows through
+several back-to-back dispatches (build → review → address-review → rebase), so when you are dispatched
+again on a branch an earlier dispatch already marked `done` (e.g. an **address-review** round → phase
+`addressing`, or a **rebase** → `rebasing`), your **first beat automatically re-arms** the run — it
+clears the previous terminal marker and bumps the lifecycle so wedged-detection is live for your round.
+You do nothing special; just beat your phase as normal.
+
+The reader (crows-nest) classifies your run into `working` / `done` / `wedged` from these beats +
+the phase-aware grace — see crows-nest §2d *"Is an in-flight build actually stalled?"*. Beats are
+**best-effort and side-channel** (they write only under `out/liveness/`, gitignored): if the script is
+missing or a beat fails, **swallow it and carry on** — a liveness write must **never** block, fail, or
+delay the build. It is a courtesy to the lookout, not a step the build depends on.
+
+**Your beat survives worktree reaping automatically — you do nothing special.** You build in an
+**isolated worktree** that crows-nest **reaps** on merge, but the dashboard reads the **main** repo's
+`out/liveness/`. The producer resolves the main repo root itself (`git rev-parse --git-common-dir`, which
+from a linked worktree points at the main repo's shared `.git`), so your beat lands in the main repo's
+`out/liveness/<run>.json` even though your cwd is inside the worktree — it's visible to the board and
+outlives the reap. This also means the beat works **without** `${CLAUDE_PLUGIN_ROOT}` resolving to
+anything inside the worktree (use the `pluginRoot` fallback for the script path, as above; the *output*
+path is resolved by the producer). And crows-nest independently emits a `building` beat at dispatch and a
+terminal beat at reconcile on your behalf (its §8g), so the progress bar populates and reaches 100% even
+if one of your own beats is skipped — your beats simply *refine* the phase in between (#170).
+
+The same phase you beat also drives a **coarse progress % estimate** (#156): the producer maps each
+phase → a percentage (`research` 10 → `planning` 20 → `worktree` 25 → `implementing` 40 → `validating`
+75; `addressing` 60, `rebasing` 80; `opening-pr` 95; the terminal marker = 100), which spyglass reads
+and shows as a slim progress bar + % on your in-flight run card. You do **nothing extra** — just beat
+your phase as above; the % is a pure, read-only derivation. It is deliberately an **estimate** (labels
+don't expose true sub-step progress) and degrades to **no bar** on an unknown phase or a missing beat.
+
+## 0. Discover the project's commands
+
+Read `.armada/config.json` → `commands` for `build` / `test` / `lint` / `format` / `run` and
+`baseBranch`. If the file is absent the repo isn't commissioned — run
+[`commission`](../commission/SKILL.md) first (it detects and writes these). If you're mid-flight
+without it, infer from the repo and **state your inference before relying on it**:
+
+- `package.json` → `scripts` (`build`, `test`, `lint`)
+- `Makefile` → targets (`make build`, `make test`)
+- `*.csproj` / `*.sln` → `dotnet build` / `dotnet test` / `dotnet format`
+- `Cargo.toml` → `cargo build` / `cargo test` / `cargo clippy` / `cargo fmt`
+- `pyproject.toml` / `tox.ini` → `pytest`, `ruff`, etc.
+
+If you can't determine a command and it matters, ask once rather than guessing.
+
+## 1. Identify the issue
+
+Accept **either**:
+- A GitHub issue number (e.g. `#42` or `42`) — fetch with `gh issue view <number>`.
+- A free-text description — search with `gh issue list --search "<query>"`.
+
+If free text matches no issue, confirm with the user before proceeding without one.
+
+### 1a. Determine the right base branch
+
+Don't assume `main`. Some issues target code that lives on a long-lived feature branch and hasn't
+merged yet — branching off main would leave you with nothing to fix. For each file path or symbol
+the issue mentions:
+
+```bash
+# Does the file exist on the default base?
+git ls-tree origin/<baseBranch> -- <path/from/issue>
+
+# If not, find which branch has it:
+git branch -a --contains $(git log --all --oneline -- <path/from/issue> | head -1 | awk '{print $1}')
+
+# If the issue references a recent PR, check what it targeted:
+gh pr view <pr-number> --json baseRefName,headRefName,state,mergeCommit
+```
+
+If the target code only exists on a non-default branch, surface it with options: (a) branch off
+the feature branch, (b) merge feature→base first then branch off base, (c) cherry-pick onto a
+fresh branch (rare). Wait for the user's call.
+
+Present a scope summary and get confirmation before building:
+
+```
+## Issue: <title>
+- **Issue:** #<number> (or "no linked issue")
+- **Summary:** <1-3 sentences>
+- **Acceptance criteria:** <bullet list>
+- **Base branch:** <base — and why, if not the default>
+
+Proceed?
+```
+
+## 2. Research and gather context
+
+Run these in parallel where possible:
+
+- **Read the issue fully** — description, comments, labels, linked issues/PRs.
+- **Read project docs** — `README`, `CLAUDE.md`/`AGENTS.md`, `docs/`, architecture/decision records
+  (`docs/adr/` or similar). Note any documented decision that constrains the approach.
+- **Read the repo's cartography** — `.armada/cartography/` (`architecture.md`, `conventions.md`,
+  `pitfalls.md`, `workflows.md`, `testing.md`, `glossary.md`, or a single `cartography.md`), the
+  per-repo heuristics [`cartographer`](../cartographer/SKILL.md) accumulates from past runs. These are
+  **actionable `heuristic / evidence / confidence` entries** the fleet learned about *this* repo, and
+  applying them is the payoff for keeping the map: a **workflow** heuristic ("run `npm run generate`
+  before the build") becomes a planned step, a **pitfall** ("don't edit `*.gen.ts`") fences the
+  change, and a **convention** ("use `FooService`, not the raw client") shapes the implementation to
+  match the grain of the repo. Apply High-confidence heuristics by default; treat Low-confidence ones
+  as considerations, not hard constraints. If the directory is absent, the repo just hasn't been
+  mapped yet — carry on.
+- **Read the existing code** in the affected area. Understand the patterns, related modules, tests,
+  and the files that will need changes. Find where tests live and how they're run.
+- **Run any audit the issue calls out *first*.** If the issue says "this is only safe if X holds"
+  or "audit Y before merging", treat that as research — its findings often reshape the plan (the
+  change may be inert in real data, or the gaps may dwarf the headline change).
+
+## 2a. Reproduce first — for bug-type issues (reproduce → fix → verify)
+
+**This step is mandatory when the issue is a bug** — anything labelled `bug`/`defect`/`fleet-defect`,
+or whose body reports a *symptom that should not happen* (a console warning, a crash, a hydration
+mismatch, a wrong value rendered, a failing interaction). It is the antidote to the failure this
+guard exists for: a plausible fix that **passes lint/build/test but doesn't remove the actual bug**,
+because local green gates only prove the code compiles and the existing tests pass — not that the
+reported symptom is gone. Reproducing first turns "the symptom" into concrete, re-runnable evidence,
+and gives you a ground-truth oracle to verify the fix against in §6a.
+
+Do this **before** planning the fix (§3), on the **unpatched** base-branch code, so the evidence is
+of the bug as reported:
+
+1. **Pin the symptom.** From the issue, identify the precise observable: the exact console
+   warning/error text, the failing assertion, the wrong on-screen value, the broken interaction — the
+   thing that must be *gone* for the bug to be fixed. If the issue is vague, narrow it to a concrete,
+   checkable observable before proceeding.
+2. **Reproduce it with the same method muster would use** — match the bug's nature:
+   - **Runtime / UI bug** (hydration mismatch, console warning, broken interaction, wrong render):
+     **run the app** (`commands.run`) and drive it with a **headless browser** (e.g. Playwright),
+     reproducing the exact steps and capturing the symptom — console logs, a screenshot, the failing
+     DOM state. This is the same browser ground-truth muster applies; doing it here shifts that check
+     **left** so a wrong fix is caught in the build, not at review.
+   - **Logic / data / API bug:** write or run a **failing test** (or a scripted call) that exercises
+     the reported path and fails on the unpatched code in the way the issue describes. A new
+     regression test that fails-before/passes-after is the strongest evidence and should be added to
+     the suite where it fits.
+   - **Build / tooling bug:** capture the failing command output.
+3. **Capture the evidence.** Save the before-state — the warning text, the failing test output, the
+   screenshot/log — so it can go in the PR body (§7). This is the "before" half of the before/after.
+4. **If you cannot reproduce the symptom, stop and say so explicitly.** Do **not** invent a fix and
+   assert it works. State plainly in the PR body (and your handoff) that the symptom could not be
+   reproduced with the steps given, what you tried, and what additional information or environment
+   would be needed. A non-reproducing bug issue is a legitimate outcome to surface — it is **not** an
+   excuse to ship an unverified change as if it were a fix. If, despite not reproducing, you still
+   make a speculative change, label it as speculative and `Relates to #<n>` (not `Closes`), since you
+   have no evidence it removes the symptom.
+
+**Scope any browser teardown to the instance you launched — never a process-wide kill.** When you
+spawn a browser to reproduce or verify a UI (here and in §6a), close **only that instance** on the way
+out: hold the child process/PID or the Playwright `browser`/`context` handle and close *that*, or
+launch it against a dedicated `--user-data-dir` / isolated automation profile / headless instance and
+close that session. **Never** issue a process-wide browser kill — `taskkill /IM msedge.exe`,
+`pkill chrome`, `killall chrome`, `Stop-Process -Name msedge` — it closes **every** browser window the
+operator has open on a live desktop (their own work, a live stream, other agents' browsers), not just
+the one you spawned. If you **can't** scope teardown to your instance, prefer a fire-and-forget
+`file://` open with **no** teardown (the [`spyglass`](../spyglass/SKILL.md) driver's model — nothing to
+kill) over a blanket kill.
+
+Carry the reproduction method forward — you will re-run **the exact same method** in §6a to prove the
+fix removed the symptom. (For non-bug / feature issues, skip this step and proceed to §3.)
+
+## 3. Plan implementation
+
+Present a structured plan for approval:
+
+```
+## Implementation Plan: <title>
+
+### Context
+<What you learned from docs, decisions, and the code>
+
+### Approach
+<High-level approach and rationale>
+
+### Files to create/modify
+- `path/to/file` — <what changes>
+
+### Acceptance criteria mapping
+- [ ] Criterion 1 → <how it will be met>
+
+### Testing strategy
+- <tests to add/update and how they run>
+
+### Risks / open questions
+- <unknowns or risks>
+```
+
+Wait for approval. Adjust on feedback.
+
+### 3b. Decompose large issues into a stacked PR series
+
+Most issues ship as one PR. **Large ones should ship as a stack** — sliced into stacked branches,
+each a focused, independently reviewable PR. Trigger decomposition when the change touches multiple
+distinct surfaces, the diff would plausibly exceed ~2,000 lines, or the PR body would need "slices"
+to be readable. When it fires, slice the work, present the slice tree, and **get sign-off before
+writing code** — see [references/stacked-prs.md](references/stacked-prs.md) for the full slicing
+procedure (slice = branch = PR, slices stack, foundation first, rollup branch for 4+ slices).
+
+## 4. Create a worktree
+
+Build in an isolated worktree so multiple issues can be worked in parallel.
+
+There are **two ways to get an isolated worktree**, in order of preference. Whichever you use, the
+guarantee is the same: code changes land in a tree that is *yours*, not the shared checkout.
+
+**(a) Agent-tool isolation (preferred).** If the harness exposes the `EnterWorktree` tool, use it
+(creates the worktree and switches the session into it in one step):
+
+```
+EnterWorktree(name: "<number>-<short-description>")
+```
+
+When a background subagent is spawned with `isolation: "worktree"` (the path
+[`crows-nest`](../crows-nest/SKILL.md) §2d uses), the harness has already placed you in your own
+worktree — you don't create one, you just confirm `git rev-parse --show-toplevel` points at a
+per-build tree and carry on.
+
+**(b) Manual git-worktree fallback.** Agent-tool isolation can be **unavailable** — the harness may
+not expose `EnterWorktree`, or `isolation: "worktree"` can fail (e.g. *"not in a git repository …
+configure WorktreeCreate hooks"* when the repo was created mid-session). **Do not lose isolation and
+fall back to building in the shared checkout** — create the worktree yourself with git, branching
+straight off the **remote** base so it doesn't inherit a stale local `HEAD`:
+
+```bash
+git fetch origin <baseBranch>
+git worktree add -b <number>-<short-description> <worktree-path> origin/<baseBranch>
+cd <worktree-path>
+```
+
+**Path hygiene on Windows — use forward slashes and a sibling path.** A backslash path
+(`C:\…\wt-2`) gets mangled by the shell and can create the worktree **nested inside the repo**
+instead of as a sibling. Always pass a **forward-slash, shell-safe** path that resolves to a
+**sibling** of the repo, e.g. `../<number>-<short-description>` or an absolute
+`C:/DataCalumSimpson/<number>-<short-description>` — never a backslash path and never one that
+lands inside the repo's own working tree.
+
+Rename the branch to follow the repo's convention if needed (check `git branch -a` for patterns
+like `feature/<number>-...`, `fix/<number>-...`). If you created the worktree from a local `HEAD`
+rather than `origin/<baseBranch>` above, sync it — worktrees inherit from `HEAD` at creation, which
+may be stale:
+
+```bash
+git pull origin <baseBranch>
+```
+
+**Clean up the manual worktree on completion.** A worktree you created by hand is yours to remove
+once the PR is open (or the build is abandoned) — leaving it leaks disk and clutters
+`git worktree list`. Remove it **best-effort** and tolerate Windows file-lock leftovers (a held
+file handle can keep `git worktree remove` from deleting the directory):
+
+```bash
+git worktree remove <worktree-path> || git worktree remove --force <worktree-path> || true
+git worktree prune                                   # drop the registry entry if the dir lingers
+```
+
+If the directory still can't be deleted because a process holds a lock, leave it — `git worktree
+prune` has already cleared the registry, so it won't be mistaken for an active worktree; a later
+sweep can reclaim the bytes. **Don't fail the build over a leftover directory.** (Worktrees the
+Agent tool created are the harness's to reap — only clean up the ones *you* added.)
+
+**All code changes happen in the worktree, never the main checkout.** If the project needs a
+dependency install in a fresh tree (e.g. `npm ci`, `bundle install`, restoring packages), do it
+in the worktree.
+
+### 4a. Record the run→branch map (so progress/cost climb without a live `/loop`)
+
+The moment you know your **branch** and **worktree path** — right after creating the worktree above —
+record the run→(branch, worktree) map so the read-only dashboard can resolve *this* run to *this* branch
+and start climbing its phase→% beats and cost **immediately**, regardless of how you were dispatched
+(issue #191). Key it by the issue number, exactly as the map producer expects:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT:-<config.pluginRoot>}/scripts/spyglass-cost-postmortem.mjs" \
+  map --issue <n> --branch <branch> [--worktree <worktree-path>]
+```
+
+**Why you, and not only crows-nest.** crows-nest emits this same map at dispatch **when it dispatches
+under `/loop`** (its §8g.i). But under **manual dispatch** — a human runs `/shipwright <n>` directly, or
+crows-nest picks up an armed issue **outside a loop** (its supervised single pick) — that foreground
+step never fires, so `out/costs/_runs.json` stayed empty, `scripts/liveness-beat.mjs` couldn't resolve
+the run to a branch, and the card sat at a flat % with no cost for the whole build. Writing it here, from
+the one component present in **every** dispatch mode, closes that gap. The write is **idempotent** — the
+producer keys by issue and updates the entry **in place** (never a duplicate) and **preserves the
+original `startedAt` burn-clock** — so when crows-nest *also* writes it under `/loop` there is **no
+regression**, just the same entry refreshed.
+
+Same discipline as your liveness beat (§0a): **best-effort and side-channel** (it writes only under
+`out/costs/`, gitignored) and **reap-safe** — the producer resolves the **main** repo root itself
+(`git rev-parse --git-common-dir`), so the entry lands in the main repo's `out/costs/_runs.json` even
+though your cwd is inside the worktree, and it survives the worktree being reaped on merge. If the script
+is missing or the write fails, **swallow it and carry on** — it must never block or delay the build.
+
+### 4b. Record an up-front estimate (a genuine prediction, not a backfill)
+
+Now that you've **planned** the work (§3) but **before you write a line of code** (§5), record a
+best-effort **PREDICTION** for this run: your estimated **cost (USD)** and estimated **time to ship
+(seconds)**. This is the fleet learning to *forecast* — the dashboard later grades **estimate →
+actual** per shipped run and shows how calibrated the fleet is over time (#212). Make the call from
+your plan (the surfaces touched, the test burden, how novel the work is), keyed by your **branch**,
+else the issue number:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT:-<config.pluginRoot>}/scripts/estimate.mjs" \
+  record --run <branch|issue> --cost <usd> --duration <sec> [--note "<basis>"]
+```
+
+**It must be a genuine up-front prediction — NEVER backfilled from the result.** Record it *here*,
+from planning, while the actual cost/time are still unknown; the file is stamped with `at` (when you
+predicted), so the calibration is only honest if it predates the build. Never revise it after the
+fact to look accurate — an over- or under-estimate is *signal*, and quietly correcting it destroys
+the very calibration this exists to build. Either number may be omitted if you genuinely can't call
+it (→ that dimension is simply ungraded, shown as `—`).
+
+Same discipline as your liveness beat (§0a) and run-map (§4a): **best-effort, side-channel,
+reap-safe.** It writes only under `out/estimates/<run>.json` (gitignored) and the producer resolves
+the **main** repo root itself (`git rev-parse --git-common-dir`), so the estimate lands where the
+read-only dashboard reads and survives the worktree being reaped. If the script is missing or the
+write fails, **swallow it and carry on** — an estimate write must **never** block, fail, or delay the
+build. It is a forecast, not a step the build depends on.
+
+## 5. Implement
+
+Follow the approved plan. **Match the surrounding code** — its naming, structure, error handling,
+and idioms are the convention; read neighbouring files before inventing a new pattern. Specifics:
+
+- Keep changes scoped to the issue. Don't fix unrelated debt unless asked (note it instead).
+- Update docs alongside code when the change affects documented behaviour (API reference,
+  architecture notes, README usage).
+- **Commit frequently** — small, logical commits, not one giant batch.
+
+### Data migrations / schema changes
+
+If the change alters persisted data or schema, review any generated migration **before
+committing**. Auto-generated "drop old → create new" ordering is data-destructive when you're
+restructuring. For data-preserving changes: create the new shape first, copy data across, then drop
+the old — and mirror the round-trip in the down/rollback path so it's reversible.
+
+## 6. Validate
+
+Before opening a PR, run the project's checks and **print the outputs**:
+
+```bash
+<commands.build>      # must exit 0
+<commands.test>       # must exit 0 — no new failures vs the base-branch baseline
+<commands.lint>       # clean
+<commands.format>     # then: git diff --exit-code   (no diff)
+```
+
+### Establish a baseline before chasing "new" failures
+
+If tests fail with surprising results, check whether they already fail on the base branch **before
+assuming you caused it**. The worktree shares git history, so run the same filter from the main
+checkout on the base branch. Pre-existing failures are not yours — note them as pre-existing in the
+PR body and move on. Assuming inherited failures are yours can burn 30+ minutes on the wrong root
+cause.
+
+### Pre-commit hooks and inherited lint debt
+
+If a pre-commit hook lints whole files (not just your lines) and blocks on pre-existing debt you
+didn't introduce: verify it's pre-existing (`git show origin/<base>:<path>` / `git blame`), then
+suppress narrowly with a justified inline disable comment to keep the diff focused. Don't expand the
+PR to fix unrelated debt, and don't bypass the hook with `--no-verify`.
+
+## 6a. Verify the repro is gone — for bug-type issues
+
+**A green §6 is necessary but not sufficient for a bug fix.** If you reproduced a symptom in §2a, you
+must now prove the fix **removes that symptom** — re-run the **exact same reproduction method** from
+§2a against the **patched** code:
+
+- **Runtime / UI bug:** run the app and drive it with the headless browser through the **same steps**;
+  confirm the warning/error/broken behaviour is **gone** (clean console, correct render, working
+  interaction). Capture the after-state (screenshot / clean log) as the "after" half of the
+  before/after evidence. Scope the browser teardown to the instance you launched (per §2a) — **never**
+  a process-wide kill.
+- **Logic / data / API bug:** the regression test (or scripted call) that **failed before** must now
+  **pass**. Keep that test in the suite so the bug stays fixed.
+- **Build / tooling bug:** the command that failed before now succeeds.
+
+Hold the bar:
+
+- The fix is **not done** until the §2a repro no longer reproduces. If the symptom still appears, the
+  fix is wrong or incomplete — **do not open a `Closes` PR**. Go back to §3/§5: a fix that compiles
+  and passes the old tests but leaves the symptom is exactly the failure this loop exists to catch
+  (the real root cause is often not the first plausible one — e.g. a secondary concern fixed while
+  the true cause is untouched).
+- **Verify against the symptom, not a proxy.** Confirm the *same* observable you pinned in §2a is
+  gone, with the *same* method — not a different test that merely passes, and not "tests are green"
+  standing in for "the warning is gone".
+- Keep **both** the before (§2a) and after evidence for the PR body (§7) so muster and a human can see
+  the bug was actually removed, not merely that the suite is green. muster remains the backstop, but
+  it should be **confirming** a verified fix, not discovering an unverified one.
+
+## 6b. Runtime shakedown — optionally drive the app via `sea-trial`
+
+A green §6 proves the code compiles and the old assertions hold; it does **not** prove the change
+*works when a user drives the running app*. When the change has a **runtime surface** (a UI flow, a
+route, an interaction — anything harder to prove with a test than by sailing it) and the repo exposes
+`commands.run`, invoke [`sea-trial`](../sea-trial/SKILL.md) via the `Skill` tool against the just-built
+change **before opening the PR**: it launches the app via `commands.run`, drives the real flow with
+Playwright, and returns a **PASS / FAIL / SKIPPED / DEGRADED** verdict with evidence (screenshots,
+console/network errors). This is the drive-the-running-app layer **on top of** the §6a
+reproduce→fix→verify loop.
+
+Treat it exactly like the logbook hand-off (§9) and muster's runtime lens (§1c): **best-effort and
+side-channel** — invoke it, absorb the outcome, and **never let its verdict block, fail, or delay the
+build**. A **SKIPPED** (no `commands.run`) or **DEGRADED** (no Playwright/browser) result changes
+nothing — the static gates from §6 still stand; carry on and note it. A **FAIL** is **advisory, not a
+build gate**: it's a real runtime regression a green build missed, so surface it **strongly** — fold
+the evidence (screenshots, console/network errors) into the PR body and recommend the fix so muster and
+a human see it plainly — but it does **not** hard-block opening the PR. Fix it if you can before
+opening; if you don't, open the PR with the FAIL noted as a recommended follow-up rather than holding
+the build. This keeps sea-trial consistent with its contract that a **failure or skip must never block
+or fail a build or review** — same as muster §1c, where a FAIL is a surfaced finding but never wedges
+the gate. (This is distinct from the §6a bug-repro bar, which **is** a hard gate — that's the reported
+symptom of a bug-type issue, not this optional, off-by-default runtime lens.) sea-trial is gated by
+`sea-trial.enabled` for this auto-invocation (a human's `/sea-trial` always runs).
+
+## 7. Open the pull request
+
+```bash
+git push -u origin <branch>
+```
+
+Write the PR body from [references/pr-template.md](references/pr-template.md): what changed and why,
+key decisions with rationale, how each acceptance criterion is met, testing performed, and
+screenshots for UI changes. **For a bug-type issue, the body must record the before/after repro
+evidence** from §2a/§6a — the symptom reproduced on the unpatched code and that same method showing
+it gone after the fix (the pr-template has a *Bug repro evidence* section for this). This is the
+proof muster (and a human) needs to see the bug was actually removed, not merely that tests pass. If
+the symptom **could not be reproduced** (§2a step 4), say so explicitly in the body instead of
+claiming a verified fix. Link the issue **in the body**:
+
+- `Closes #<number>` if fully addressed; `Relates to #<number>` if partial.
+
+**The closing keyword must live in the PR _body_, not just the title.** GitHub only auto-closes an
+issue on merge when a closing keyword (`Closes #N` / `Fixes #N` / `Resolves #N`) appears in the PR
+**body** — a `(#N)` reference in the *title* does **not** auto-close. A PR that links the issue only
+in its title merges without closing the issue, leaving shipped work showing open and forcing the
+lookout to close it by hand. So every PR shipwright opens for a fully-addressed issue **must** carry
+`Closes #<number>` in the body (the [pr-template](references/pr-template.md) already places it under
+the summary). For a partial PR, use `Relates to #<number>` instead — deliberately *not* a closing
+keyword, because a partial PR must not auto-close the issue.
+
+**Notify the original requester, when the issue names one.** If the issue body records who asked — a
+`Requested by @<user>` line — **copy that same line into the PR body**. The @-mention notifies the
+requester their suggestion is being built (an @-mention sends a GitHub notification), and it leaves the
+handle where the §9 walkthrough follow-up can read it too. Copy **only** that line / the bare
+`@<handle>` — never any other text from the issue.
+
+```bash
+gh pr create --title "<concise title>" --body "$(cat <<'EOF'
+<PR body>
+EOF
+)"
+```
+
+**Don't comment on the host issue — return the PR link in your result and let the foreground lookout
+post it.** When shipwright runs as a dispatched **subagent** (the autonomous `crows-nest` path), it
+must **not** `gh issue comment` on the issue it was handed. That comment is an external write to an
+issue the subagent didn't open, so the harness's auto-mode classifier consistently **denies** it —
+the call is dead weight that fails on essentially every dispatched build and litters the run summary
+with "issue-comment blocked by classifier" noise. It's also redundant: [`crows-nest`](../crows-nest/SKILL.md)
+already posts the issue comment from your structured result during reconciliation (the same place it
+reconciles labels) — `🔭 crows-nest: PR opened — <pr>`. So the subagent's job ends at **opening the
+PR and returning `{ pr, branch, status, reason }`** (the return contract crows-nest maps); the
+foreground lookout owns the host-issue comment. (This applies to the **host issue** only — PR
+comments the pipeline posts on its *own* PR are unaffected, since those aren't classifier-blocked.)
+
+### Verify the closing keyword is in the body before reporting `opened`
+
+Don't trust that the keyword made it in — **read the created PR's body back and confirm it before
+reporting the PR opened.** For a fully-addressed issue the body must contain a closing keyword that
+references this issue (`Closes #<n>` / `Fixes #<n>` / `Resolves #<n>`); if it's missing, **self-correct
+by editing the body** rather than reporting `opened` with a PR that won't auto-close:
+
+```bash
+pr=<pr-number>; n=<issue-number>
+body=$(gh pr view "$pr" --json body --jq '.body')
+if ! printf '%s' "$body" | grep -Eiq "(close[sd]?|fix(e[sd])?|resolve[sd]?) +#$n\b"; then
+  # Keyword absent — append it to the body so the merge auto-closes the issue.
+  gh pr edit "$pr" --body "$(printf '%s\n\nCloses #%s\n' "$body" "$n")"
+fi
+```
+
+(A **partial** PR is the deliberate exception — it carries `Relates to #<n>`, no closing keyword, and
+this check is skipped for it.) Only after the body is confirmed to carry the closing keyword (or has
+been self-corrected) is the PR genuinely `opened`. This closes the loop that
+[`crows-nest`](../crows-nest/SKILL.md) otherwise had to special-case — an ARMADA-opened `Closes #<n>`
+PR auto-closes its issue on merge, so the lookout's close-the-loop pass (§5) just reconciles labels
+rather than compensating for a missing keyword.
+
+### Auto-arm the PR for the ready-PR watch
+
+A PR ARMADA opens is part of the fleet's work, so **arm it for review on creation** — add the
+configured `triggerLabel` (`triggerLabel` from `.armada/config.json`, default `armada`) to the PR
+so [`crows-nest`](../crows-nest/SKILL.md)'s ready-PR watch (§3) picks it up with no manual labelling
+step:
+
+```bash
+gh pr edit <pr-number> --add-label "<triggerLabel>"   # default "armada"
+```
+
+This is deliberate and safe: the ready-PR pipeline's only *consequential* action is the final
+merge, and that is **already gated by `autoMerge` (default `false`)** — review and address never
+merge. So one gate is enough; auto-arming doesn't add risk, it just removes a redundant second gate.
+Specifically:
+
+- **Only arm PRs ARMADA itself opens** (build mode). Don't reach out and label arbitrary human PRs.
+- With `autoMerge: false` the pipeline reviews → addresses → re-validates and **stops before
+  merging** anyway; with `autoMerge: true` the user has already opted into autonomous merge. The
+  sole gate on the final merge is `autoMerge`.
+- A human can still **disarm** the PR by removing the `<triggerLabel>` label — the arming switch
+  works both ways, per object.
+
+If an automated reviewer (e.g. Copilot) is configured and can be requested via CLI, request it;
+if not, note it in the handoff so the user can add it manually — don't block on it.
+
+## 8. Handoff
+
+Share the PR URL, summarise what was done and any follow-ups, and note if a new architecture
+decision should be recorded. The worktree stays available for review iteration.
+
+## 9. Walkthrough video — interactive offer or auto-record depending on `logbook` config
+
+Read `logbook` from `.armada/config.json` (default `"off"` when absent; treat any unrecognised or
+malformed value as `"off"` too — fail closed) and branch:
+
+**`"off"` (default)** — unchanged behaviour: on an interactive session, offer once as a single
+question and don't auto-record:
+
+> "Want me to record a short walkthrough video for the stakeholders?"
+
+On the non-interactive (autonomous background) path, **skip silently** — no prompt can be issued,
+so the offer is a no-op. Default to skipping if unsure — over-offering trains the user to mute the
+suggestion.
+
+**`"user-visible"`** — **auto-record** when the change is user-visible: new workflows, multi-step
+UX, role-based behaviour, anything harder to read than to watch. **Skip** for refactors, dependency
+bumps, infra-only changes, or one-line fixes (the same heuristic used for the interactive offer
+above — if you would skip the offer, skip auto-recording). When the heuristic says record, invoke
+logbook non-interactively against the just-opened PR.
+
+**`"all"`** — **auto-record on every PR** shipwright opens, regardless of the change type.
+
+**When auto-recording** (either `"user-visible"` or `"all"`): invoke logbook as a **best-effort,
+side-channel** step — non-interactively against the just-opened PR, **after** the handoff (§8) so it
+never blocks or delays it. A logbook failure, missing toolchain, or degraded render **must never
+block, fail, or delay** the build or handoff: swallow any error, report what was attempted (and what,
+if anything, went wrong) as a **follow-up note** after the handoff, and carry on. Logbook already
+degrades gracefully to captions-over-stills when the full toolchain is absent — shipwright's
+contract is only to invoke it and absorb the outcome.
+
+**The requester is notified on the walkthrough, too.** When a walkthrough is recorded and the issue
+named a requester (§7), logbook (§6) reads the `Requested by @<user>` line from the PR body and
+@-mentions them in the walkthrough comment — so shipwright's only part is to have copied that line into
+the PR body (§7).
+
+## 10. Suggest skill improvements — and file ARMADA defects (self-improvement loop)
+
+After each issue, reflect: steps that were missing or mis-ordered, conventions worth documenting,
+friction worth automating. Present suggestions and, if approved, open a PR against this skill.
+
+When a reflection is about a genuine **ARMADA defect** — a step in this skill was wrong or missing, a
+guard didn't fire, or you had to **guess** because guidance was absent — don't just suggest it,
+**file it through the fleet's self-improvement loop**: route it via [`charter`](../charter/SKILL.md)
+§9, which triages ARMADA-defect vs task-problem, files against the configured `armadaRepo` (never the
+host project), de-dupes against open `fleet-defect` issues, and labels it `fleet-defect` **unarmed by
+default** (armed only if `autoArmSelfFixes` is true). Keep it to **genuine ARMADA defects** — a
+broken test or wrong requirement in the *target project* is task work, handled in the build, **not** a
+fleet-defect. Filing is **best-effort and side-channel**: it must never block or derail the build —
+surface what was filed in the handoff (§8) and carry on.
+
+## 11. Address-review mode — respond to review comments on a PR
+
+When shipwright is dispatched against an **existing PR with review comments** — by
+[`crows-nest`](../crows-nest/SKILL.md)'s pipeline after a [`muster`](../muster/SKILL.md) review, or
+by a human pointing it at a PR — it switches from building to **addressing review**: a considered
+response to every comment, not blind compliance. The full procedure lives in
+**[references/address-review-mode.md](references/address-review-mode.md)**:
+
+> **Fetch every comment** (§11b) → **triage each — agree / discuss / disagree + one-line
+> rationale** (§11c) → **implement the agreed changes** (§11d) → **re-validate** (§11e) → **push**
+> and **reply per thread** (§11f) → **return the structured result** (§11g). Work on the PR's own
+> branch (§11a); leave threads unresolved (the reviewer's call); a `blockingDisagreement` hands back
+> to a human rather than merging.
+
+## 12. Rebase mode — make a stale or conflicting PR mergeable
+
+When shipwright is dispatched to **make an existing PR mergeable** — by
+[`crows-nest`](../crows-nest/references/review-merge-pipeline.md)'s make-mergeable stage (§4.4b) when a reviewed PR is `BEHIND`
+or `CONFLICTING` and `autoMerge: true`, or by a human pointing it at a stale PR — it rebases the PR
+branch onto the current base, resolves any conflicts, re-validates, and force-pushes. This is the
+hands-off version of the conflict resolution that otherwise has to be done by hand on a stale-branch
+PR. The work happens on the **PR's own branch** so the force-push updates the PR in place.
+
+> **Confirm the branch is fleet-owned** → **rebase onto the configured base** → **resolve conflicts
+> integrating both sides** → **re-validate** → **force-push with `--force-with-lease`** — or, if it
+> isn't mechanically resolvable, **fall back to `blocked`**.
+
+### 12a. Confirm the branch is safe to force-push
+
+Force-push is acceptable **only on a fleet-owned branch** — one whose commits are all ARMADA's. If a
+human has pushed commits to the PR branch, do **not** rewrite it: return `blocked` and let a human
+rebase, rather than risk clobbering their work.
+
+```bash
+gh pr view <n> --json headRefName,baseRefName,mergeable,author,commits
+# Inspect authorship of the branch's own commits (those not on the base):
+git log --format='%an <%ae>' origin/<baseBranch>..origin/<headRef>
+```
+
+If the branch carries non-ARMADA commits, stop here → `blocked` ("branch has human commits; rebase
+by hand"). Otherwise continue.
+
+### 12b. Check out the PR branch on its own worktree
+
+Work on the PR's branch — never a fresh one — so the force-push lands on the PR:
+
+```bash
+gh pr checkout <n>        # or: git worktree add ../<n>-rebase <prHeadRef>
+git fetch origin <baseBranch>
+```
+
+### 12c. Rebase onto the configured base and resolve conflicts
+
+Rebase the PR branch onto the **configured `baseBranch`** (from `.armada/config.json`, §0) — not an
+assumed `main`:
+
+```bash
+git rebase origin/<baseBranch>
+```
+
+When a conflict halts the rebase, resolve it by **integrating both sides** — keep the base's changes
+*and* the PR's intent. **Never resolve by dropping the base's work** (e.g. `-X ours` blindly, or
+taking the PR side wholesale) — that silently reverts whatever landed on the base since the branch
+forked, which is exactly the bug a rebase is meant to avoid. Read both sides, understand what each
+changed, and produce a resolution that preserves both. Then `git add` the resolved files and
+`git rebase --continue`.
+
+**Dependency lockfiles get the lockfile-merge convention, not a textual merge.** When the conflicting
+file is a JS/package-managed **dependency lockfile** (`package-lock.json`, `yarn.lock`,
+`pnpm-lock.yaml`, `npm-shrinkwrap.json`), do **not** hand-merge its hunks — a generated lockfile
+three-way-merged by text is inconsistent and often corrupt. Instead apply the standard convention:
+**(1) union the dependency edits in `package.json`** (keep both sides' added/bumped deps, higher
+version on a clash), **(2) regenerate the lockfile via the repo's package manager** (`npm install` /
+`yarn install` / `pnpm install`, matched to whichever lockfile exists — never resolve a `yarn.lock`
+with `npm`), then `git add` the regenerated lockfile, and **(3) re-validate** (§12d) so a broken
+dependency union blocks rather than merging. This is the same convention crows-nest's make-mergeable
+stage documents ([crows-nest §4.4b](../crows-nest/references/review-merge-pipeline.md)); it applies
+whether the lockfile conflict is hit here or there. (JS lockfiles only for now — other package
+managers generalise later.)
+
+If a conflict **isn't mechanically resolvable with confidence** — the two sides made genuinely
+contradictory changes to the same logic and picking either loses correctness — **abort and fall
+back to `blocked`** rather than guessing:
+
+```bash
+git rebase --abort
+```
+
+Return `unresolved` with which file/hunk couldn't be reconciled. **Bound the attempts** — the lookout
+caps rebase rounds (`maxRebaseRounds`, default 1); don't loop on a branch that keeps re-conflicting.
+
+### 12d. Re-validate the rebased tree
+
+A clean rebase is **not** proof of a sound resolution — a mechanically-clean merge can still be
+semantically wrong. Re-run the project's checks against the rebased head and **print the outputs** —
+same gate as §6:
+
+```bash
+<commands.build> && <commands.test> && <commands.lint>   # must be green
+```
+
+If validation **fails** post-rebase, do **not** force-push a broken tree — return `blocked` with the
+failing check. A clean-conflict resolution that breaks tests must block, never merge.
+
+### 12e. Force-push with lease
+
+Push the rebased branch to the PR's own branch. Use `--force-with-lease` (not bare `--force`) so the
+push is refused if the remote moved under you — a guard against clobbering an unexpected concurrent
+push:
+
+```bash
+git push --force-with-lease origin <headRef>
+```
+
+Then comment the PR with what happened (`gh pr comment <n>`): rebased onto `<baseBranch>`, conflicts
+resolved (which files), re-validated green, new head sha.
+
+### 12f. Return the structured result
+
+Return a machine-readable result so the lookout can re-review and gate (§4.4b → §4.1 → §4.5):
+
+```json
+{
+  "pr": 11,
+  "mode": "rebase",
+  "result": "resolved",          // "resolved" | "unresolved"
+  "headSha": "<new head sha>",
+  "rebasedOnto": "<baseBranch>",
+  "validation": "pass",          // "pass" | "fail"
+  "reason": "rebased onto master; resolved conflicts in skills/foo/SKILL.md; re-validated green"
+}
+```
+
+`result: "unresolved"` (or `validation: "fail"`) tells the lookout to fall back to `armada:blocked`
+with the reason — shipwright **never** force-merges an unresolved or test-breaking rebase, and the
+final merge stays the lookout's gated decision (§4.5), never shipwright's.
+
+## Inputs
+
+- A GitHub issue number **or** a free-text description (build mode), **or** a PR number plus its
+  review comments/findings (address-review mode, §11), **or** a PR number to rebase/make-mergeable
+  (rebase mode, §12).
+- Optional: a base branch override.
+
+## Output
+
+- **Build mode:** an isolated worktree with the implementation committed; an open, non-draft PR
+  linking the issue with a structured summary body, **armed with the `triggerLabel` so the ready-PR
+  watch picks it up automatically**; and the structured result (`{ pr, branch, status, reason }`)
+  returned to the caller. When dispatched as a subagent, shipwright does **not** comment on the host
+  issue itself — it returns the PR link and the **foreground lookout posts the issue comment** during
+  reconciliation (§7), so the comment never trips the auto-mode classifier.
+- **Address-review mode:** the agreed changes pushed to the PR branch; a per-thread reply on every
+  review comment (triaged agree/discuss/disagree, threads left unresolved); a structured result for
+  the lookout to re-review and gate on.
+- **Rebase mode:** the PR branch rebased onto the configured base with conflicts resolved
+  (integrating both sides), re-validated, and force-pushed with `--force-with-lease` to the PR's own
+  branch — or, when the conflict isn't confidently resolvable or validation fails post-rebase, an
+  `unresolved` structured result so the lookout falls back to `armada:blocked` rather than force-merge.

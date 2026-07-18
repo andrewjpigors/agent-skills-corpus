@@ -1,0 +1,571 @@
+---
+name: miniqmt-cli
+description: Operate miniQMT/xtquant via the miniqmt-cli tool -- market data queries, real-time streaming, account management, order placement with safety guards, daemon health checks, SSH tunnel management, and deployment to Windows. Use this skill whenever the user mentions miniqmt, miniQMT, xtquant, QMT trading, placing stock orders via CLI, checking positions or assets on a QMT account, streaming ticks or klines from QMT, deploying the trading daemon, or troubleshooting the miniqmt-cli daemon. Also use when the user asks about A-share programmatic trading via a CLI daemon architecture.
+---
+
+# miniqmt-cli: Drive miniQMT / xtquant from the Command Line
+
+## Access Policy — read first
+
+**All programmatic access to the trading daemon MUST go through `miniqmt-cli`.** Direct HTTP calls to `http://127.0.0.1:8765/...` are no longer a supported integration surface — the URL space, payload shapes, and error semantics are internal implementation details and may change without notice.
+
+Reasons:
+
+- **One source of truth.** The CLI's command set is the only documented API. The HTTP routes underneath exist solely to let the CLI talk to the daemon over an SSH tunnel; their paths are unstable.
+- **Drift kills callers.** When a parallel HTTP reference existed, a polling agent followed a stale `/positions` / `/orders` / `/trades` (unprefixed) path and silently 404'd for hours. The CLI shields callers from this class of bug.
+- **Safety pipeline.** The CLI carries the masking, idempotency client_req_id generation, and `--confirm-live` handshake conventions. Bypassing it weakens those guarantees even though the daemon enforces most of them.
+
+Callers from non-Python runtimes should wrap the CLI as a subprocess (`subprocess.run(["miniqmt-cli", "account", "asset", "--account", "main", "--format", "json"], capture_output=True)`) rather than constructing HTTP requests by hand. SSE consumers should use `miniqmt-cli stream tick|kline|order ...` and parse its stdout, not subscribe to `/stream/*` directly.
+
+If you're an agent on a different host than the daemon, configure remote mode in `~/.miniqmt_cli/client.toml`:
+
+```toml
+[client]
+mode = "remote"
+server_url = "http://127.0.0.1:8765"   # the daemon, via SSH tunnel
+```
+
+Then bring up the tunnel (see [SSH Tunnel](#ssh-tunnel) below). The CLI then works transparently — no proxy config needed.
+
+## Architecture
+
+Mac CLI (Click) --> SSH tunnel --> Windows FastAPI daemon (port 8765) --> xtquant/miniQMT
+
+- **Client** (Mac): `~/.miniqmt_cli/client.toml` -- sends HTTP requests through an SSH tunnel
+- **Server** (Windows): `~/.miniqmt_cli/server.toml` -- FastAPI daemon wrapping xtquant, runs as a Scheduled Task
+- Communication: all commands hit `http://127.0.0.1:8765` via `ssh -N -L 8765:127.0.0.1:8765 <host>`
+
+## Prerequisites
+
+Before running any command, verify:
+
+1. **SSH tunnel is up** -- without it, all commands fail with "cannot reach daemon"
+2. **Daemon is running** on Windows -- check with `miniqmt-cli health`
+3. **miniQMT client is open** on Windows -- required for xtquant to connect to the broker
+
+### `/health` response shape
+
+Two independent top-level blocks. There is **no** flat `state` enum — callers
+compose decisions from the structured fields. (The old composite strings like
+`daemon_up_no_trader` mixed two unrelated concerns into one name and have
+been removed.)
+
+```json
+{
+  "daemon": {
+    "state": "up",              // up | degraded
+    "xtquant_loaded": true,
+    "xtquant_error": "..."      // present only when state == degraded
+  },
+  "accounts": {
+    "main": {
+      "trader": {
+        "state": "alive",       // never_connected | alive | lost
+        "last_connect_at": "2026-05-13T09:30:01Z",
+        "last_disconnect_at": null
+      },
+      "risk_breaker": "ok",     // ok | tripped
+      "baseline": "captured"    // captured | pending
+    }
+  }
+}
+```
+
+**Scope of each field:**
+
+- `daemon.state` is purely process-local: this Python process is up + xtquant
+  module loaded. It says nothing about miniQMT or the broker.
+- `accounts.<name>.trader.state` reflects what the daemon **last heard** on
+  the xtquant SDK channel — `alive` after a successful login, `lost` after
+  xtquant fires `on_disconnected`. The daemon cannot independently probe
+  miniQMT's GUI or broker connectivity, so a `lost` flag is a positive
+  signal (SDK told us the channel dropped), but a stale `alive` flag is
+  not a guarantee the channel is currently up. The only definitive
+  liveness probe is to run an account command — a real broker failure
+  surfaces as `trader.connect failed rc=...` or
+  `trader.subscribe failed rc=...`.
+- `risk_breaker` and `baseline` are computed from the daemon's risk manager.
+- When the daemon was started with `serve --dry-run`, the `daemon` block adds `"dry_run": true` and `xtquant_loaded` is forced to `false` (xtquant is never touched in that mode). All account commands raise; this mode is for offline development only.
+
+**Reading rules of thumb:**
+
+| You want to know… | Read… |
+|---|---|
+| Daemon process alive? | `daemon.state == "up"` |
+| xtquant loadable? | `daemon.xtquant_loaded == true` |
+| Trader session for an account dropped? | `accounts.<name>.trader.state == "lost"` |
+| When did it drop / when did it last connect? | `accounts.<name>.trader.last_disconnect_at` / `last_connect_at` |
+| Account safe to send orders? | `daemon.state == "up"` AND `accounts.<name>.trader.state == "alive"` AND `accounts.<name>.risk_breaker == "ok"` AND `accounts.<name>.baseline == "captured"` |
+| Account has never tried to log in (fresh daemon)? | `accounts.<name>.trader.state == "never_connected"` — run any `account` command to trigger lazy login |
+
+`miniqmt-cli health` prints a human summary of this body. Exit code rules:
+
+- **Exit 1** when any of these are true: daemon unreachable (`cannot reach daemon …`); `daemon.state != "up"` (e.g. xtquant failed to load); any `accounts.<name>.trader.state == "lost"`; any `accounts.<name>.risk_breaker == "tripped"`; any `accounts.<name>.baseline == "pending"` while that account's trader is `alive`.
+- **Exit 0** otherwise. In particular, a fresh daemon where every account is `never_connected` exits 0 — that's the normal lazy-load state, not an error.
+
+## Global Options
+
+```bash
+miniqmt-cli [--format table|json|csv] [--config <path>] <command>
+```
+
+Default format comes from `client.toml`; override per-call with `--format`.
+
+## Commands Reference
+
+### Market Data
+
+```bash
+# List sectors (e.g. 沪深A股, 上证50)
+miniqmt-cli sector list
+
+# List instruments in a sector
+miniqmt-cli instrument list --sector "沪深A股"
+miniqmt-cli instrument list --limit 10
+
+# Instrument detail
+miniqmt-cli instrument info --code 000001.SZ
+
+# Latest tick snapshot (supports multiple codes)
+miniqmt-cli tick --code 000001.SZ --code 600519.SH
+
+# Historical K-line (periods: 1d, 1m, 5m)
+miniqmt-cli kline --code 000001.SZ --period 1d --start 20260101 --end 20260415
+
+# Historical ticks (raw tick-by-tick data)
+miniqmt-cli ticks --code 000001.SZ --start 20260415093000 --end 20260415100000
+```
+
+### Real-time Streaming (SSE)
+
+Streams run until Ctrl+C. Output is one event per line; use `--format json` for programmatic consumption (the table format is for ad-hoc inspection).
+
+**Known failure mode: xtquant snapshot cache wedge.** The `timetag` field of `xtdata.get_full_tick()` can lock at a past value while `lastPrice` / `bidVol` / `askVol` continue updating normally. Observed 2026-05-18: four codes (`600760.SH` / `600011.SH` / `000333.SZ` / `002179.SZ`) all locked at `timetag=20260518 09:32:06` for 13 minutes, daemon process otherwise healthy, watchdog silent, all HTTP requests returning 200, `trader=alive`. The daemon is a pure pass-through to xtquant — grep `timetag` across the daemon source returns zero hits — so the wedge lives inside xtquant's process-internal snapshot cache, not in daemon code.
+
+**Empirically supported trigger: daemon uptime crossing a market-close boundary.** Access-log analysis of the 5/18 incident window (09:20–09:59) showed zero `stream tick` activity from any client, stable ~150 req/min on `/trade/*` polling, zero non-200 responses, zero WARN/ERROR lines. The only standing variable was a 64-hour daemon uptime that had spanned the weekend close. Best fit: xtquant's internal `timetag` write path has weak day-rollover handling. An earlier hypothesis that short-lived `stream tick` subscribe/unsubscribe cycles trigger the wedge is **not** supported by the logs and should not be relied on.
+
+**Primary mitigation: nightly daemon restart on trading days.** `scripts/windows/bootstrap.ps1` registers a `MiniqmtDaemonNightlyRestart` Scheduled Task that runs `scripts/windows/nightly-restart.ps1` at 08:50 Mon-Fri — one known-clean xtquant process per day eliminates the cross-close failure mode. Polling via `/data/tick` reads the same xtquant cache that `stream tick` populates, so polling does **not** recover a wedged cache — only a daemon restart does.
+
+**When to use `stream tick` vs `tick` polling.** Persistent `stream tick` is the recommended consumer pattern (lower latency than respawning `miniqmt-cli tick` per evaluation, no subprocess startup cost). One subscription per consumer process for the whole trading day; do not subscribe/unsubscribe per evaluation. This is a performance/ergonomics recommendation — it does **not** by itself prevent the wedge above; pair it with the nightly restart.
+
+#### Tick stream
+
+```bash
+# Interactive (Ctrl+C to stop)
+miniqmt-cli stream tick --code 000001.SZ --code 600519.SH
+
+# Programmatic consumption
+miniqmt-cli --format json stream tick --code 000001.SZ --code 600519.SH
+```
+
+**Event payload (JSON mode).** First line is the subscription envelope; subsequent lines each wrap one tick event. Codes that do not tick in an interval emit nothing for that interval.
+
+```json
+{"event": "subscribed", "codes": ["000001.SZ"], "seqs": [42]}
+{"tick": {"code": "000001.SZ", "timetag": "20260518 09:32:06", "lastPrice": 10.48,
+          "high": 10.52, "low": 10.41, "open": 10.45, "lastClose": 10.40,
+          "volume": 12345, "amount": 128943.50,
+          "bidPrice": [10.47, 10.46, 10.45, 10.44, 10.43],
+          "askPrice": [10.48, 10.49, 10.50, 10.51, 10.52],
+          "bidVol":   [100, 200, 300, 400, 500],
+          "askVol":   [150, 250, 350, 450, 550]}}
+{"tick": {...}, "dropped": 3}
+```
+
+- `event: subscribed` arrives exactly once at stream start — **consumers must skip it before processing ticks**.
+- `dropped: N` appears alongside a `tick` when the daemon's per-stream queue overflowed since the last emit (cap = 256). The dropped events are the oldest; the emitted `tick` is the freshest. Log it as a backpressure warning, not an error — it means your consumer is slower than the broker pushes.
+- Field set varies by xtquant SDK version. `code`, `timetag`, `lastPrice`, `high`, `low`, `bidVol`, `askVol` are present on standard A-share L1 feeds; anything else is best-effort.
+- `timetag` is a `"YYYYMMDD HH:MM:SS"` string; parse before using as a sort key. **If you see `timetag` static while other fields advance, you've hit the cache wedge — restart the daemon.**
+
+**Consuming `stream tick` from a long-running subprocess.** The boring details that bite:
+
+1. **`bufsize=1` + `env={..., "PYTHONUNBUFFERED": "1"}` on `Popen`.** Without both, Python's stdio block-buffers the daemon's per-line output into ~4 KB chunks; consumers see silent stretches where ticks have been emitted but are stuck in the pipe.
+2. **Drain `stderr` in a separate thread.** `miniqmt-cli` rarely writes to stderr, but if the pipe buffer fills (tens of KB) the subprocess blocks on `write(stderr)` and the tick stream goes silent without any visible error.
+3. **No SSE keepalive from the daemon.** During a quiet stretch the daemon emits no bytes — a wedged daemon and a quiet market look identical on the wire. Consumers MUST run their own stale watcher: if no tick has arrived for N seconds in trading hours (~30s for liquid watchlists), kill the subprocess and reconnect. Trigger on "no event from ANY watched code" rather than per-code so a single illiquid name doesn't false-positive.
+4. **Reconnect with exponential backoff** (1s → 30s cap). SSH-tunnel blips and daemon restarts will close the SSE stream; resetting backoff after one successful tick keeps reconnects fast in steady state.
+5. **SIGTERM bypasses the CLI's `finally` block.** `miniqmt-cli stream tick` only reaches its unsubscribe path on `KeyboardInterrupt` (SIGINT). For long-running consumers this is intentional — not unsubscribing avoids the cache wedge above. Use SIGINT only when you actually want a clean unsubscribe (testing/debug); for normal restart, SIGTERM is fine.
+6. **The tick callback must be near-instant.** Block the read loop and the daemon's per-stream queue (cap 256) fills, you start seeing `dropped: N`, and the freshest tick is all you get. Push ticks to a worker queue immediately; evaluate strategies elsewhere.
+
+#### Kline stream
+
+```bash
+miniqmt-cli stream kline --code 000001.SZ --period 1m
+```
+
+Each event wraps one bar: `{"bar": {"code": ..., "time": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...}}`. The daemon coalesces by `(code, bar_start_ts)` and yields only the latest bar per key, so a slow consumer never sees duplicate stale bars.
+
+#### Order stream
+
+```bash
+# Stream order lifecycle events (submitted / partially filled / filled / cancelled / rejected)
+# Essential for agents: subscribe before placing an order, then consume fill/reject events.
+miniqmt-cli stream order --account sim
+
+# JSON format for programmatic parsing
+miniqmt-cli --format json stream order --account sim
+```
+
+Event payload shape (JSON mode). The **first** line after subscription is an envelope, then each order state change emits an `order_status` dict:
+
+```json
+{"event": "subscribed", "filter_account": "sim"}
+{"type": "order_status", "account": "sim", "order_id": 12345, "code": "000001.SZ",
+ "side": "buy", "status": "filled", "volume": 100, "filled_volume": 100,
+ "avg_price": 10.48, "frozen": 0.0}
+```
+
+Also emitted on the same stream: `{"type": "order_response", ...}` (async submit ack) and `{"type": "trade", ..., "trade_id": ..., "price": ..., "amount": ...}` (per-fill detail).
+
+Possible `status` values (from xtquant `order_status`): `submitted`, `confirmed`, `partially_filled`, `filled`, `cancelled`, `rejected`, `expired`, `pending_cancel`, `unknown`. Unknown codes are returned as `unknown_<n>` — agents should have a default branch.
+
+### Account & Portfolio
+
+```bash
+# List configured accounts (names + masked IDs)
+miniqmt-cli account list
+
+# Query account asset (cash, total, frozen)
+miniqmt-cli account asset --account sim
+
+# Query positions
+miniqmt-cli account position --account sim
+
+# Today's orders
+miniqmt-cli account orders --account sim
+
+# Today's trades (fills)
+miniqmt-cli account trades --account sim
+```
+
+### Trading (Three-Layer Safety)
+
+> **Terminology — "live account" (实盘账户)**: Any account with `requires_confirm_live = true` in `server.toml`. This is a **property**, not an account name. Set to `false` for sim/paper accounts. In the examples below, `sim` is a paper account and `real` is a live account.
+>
+> Where `--confirm-live <last-4-digits-of-account_id>` is required on live accounts (current behavior):
+>
+> | Command | `--confirm-live` required on live? | Enforced by |
+> |---------|---|---|
+> | `order buy` / `order sell` (incl. `--dry-run`) | Yes | CLI (`order.py`) + daemon (`/trade/order`) |
+> | `risk reset` | Yes | CLI (`risk.py`) + daemon (`/risk/reset`) |
+> | `order cancel` | **No** — the CLI command has no `--confirm-live` flag and `/trade/cancel` does not re-check the live gate. Cancels are still gated by the daemon account whitelist. | — |
+
+Orders go through three independent safety checks:
+
+1. **CLI layer**: `--dry-run` preview, interactive "yes" confirmation, `--confirm-live` digit match
+2. **Daemon layer**: account whitelist, live-gate re-verification, idempotency dedup
+3. **Audit layer**: every order logged to `~/.miniqmt_cli/orders.jsonl` with pre/post phases
+
+```bash
+# Buy -- preview only (no order sent)
+miniqmt-cli order buy --account sim --code 000001.SZ --volume 100 --price 10.50 --dry-run
+
+# Buy -- with interactive confirmation
+miniqmt-cli order buy --account sim --code 000001.SZ --volume 100 --price 10.50
+
+# Buy -- skip confirmation (scripting)
+miniqmt-cli order buy --account sim --code 000001.SZ --volume 100 --price 10.50 --yes
+
+# Sell
+miniqmt-cli order sell --account sim --code 000001.SZ --volume 100 --price 11.00 --yes
+
+# Live (real-money) account requires last-4-digit verification
+miniqmt-cli order buy --account real --code 000001.SZ --volume 100 --price 10.50 --confirm-live 1234
+
+# Cancel an order
+miniqmt-cli order cancel --account sim --order-id 12345 --yes
+```
+
+Order types: `--type limit` (default) or `--type market`.
+
+#### Complete Trading Workflow (agent-facing)
+
+Follow these steps in order. Each step has a purpose — skipping is how agents end up with "order placed, no idea what happened".
+
+**1. Pre-flight health — probe real connectivity, not just `/health`.**
+
+`/health` showing `accounts.<name>.trader.state == "never_connected"` is normal on a fresh daemon and is NOT a login failure (see the Prerequisites section). To confirm the account is actually usable, hit a trader-touching endpoint:
+
+```bash
+miniqmt-cli --format json account asset --account sim
+```
+
+Success (`cash` / `total_asset` numeric) proves: daemon up → xtquant loaded → trader connected → account subscribed. After this, `accounts.<name>.trader.state` flips to `alive` and `baseline` to `captured`.
+
+If this fails with `trader.connect failed rc=...` or `trader.subscribe failed rc=...`, stop — investigate before sending any order.
+
+**2. Check risk state.**
+
+```bash
+miniqmt-cli --format json risk status --account sim
+```
+
+If `breaker_tripped: true`, opening orders will be rejected at the daemon layer regardless of CLI confirmations. Closing trades and cancels still work. Resolve with `risk reset` (requires a `--note`) before opening.
+
+**3. Preview first (dry run).**
+
+```bash
+miniqmt-cli order buy --account sim --code 000001.SZ --volume 100 --price 10.50 --dry-run
+```
+
+Dry-run hits `/trade/preview` (no order sent), shows masked account id, last price, and estimated cost. Exit code 3 (`GuardExit`: "dry-run: order not sent") is the success path. Agents should read the preview numbers to catch typos (volume unit is shares not lots; price is yuan per share).
+
+**4. Place the order, wait for a terminal status in one call.**
+
+```bash
+miniqmt-cli --format json order buy --account sim --code 000001.SZ \
+    --volume 100 --price 10.50 --yes --wait 30
+```
+
+`--wait N` blocks up to N seconds after the POST returns, subscribing to `/stream/order` and waiting for a terminal status (`filled` / `cancelled` / `rejected`) on the returned `seq`. **The subscription happens after submit**, so fast fills can theoretically race — in practice miniQMT fills take enough time that `--wait` catches them, but early lifecycle events (`submitted`, `confirmed`) may be missed. For zero-loss event capture, use the separate subscribe/place pattern below.
+
+- The JSON response carries `{"seq": <order_id>, "status": "ok"|"rejected", "client_req_id": ...}`. **Persist `seq`** — you need it to cancel or to correlate stream events.
+- `client_req_id` is a UUID the CLI auto-generates for idempotency. Re-submitting with the same id within the TTL window returns the original response with `"idempotent_hit": true` instead of placing a duplicate.
+- **Note on `--format json` output**: the order command still prints human-readable preview lines (`Account:`, `Code:`, `Side:`, etc.) to stdout before the final JSON line. Parsers must read the last line, e.g. `... | tail -1 | jq -r '.seq'`.
+
+If you want to run the submit and the event loop separately (e.g. long-running agent) to avoid missing early events:
+
+```bash
+# Terminal A — subscribe BEFORE placing the order
+miniqmt-cli --format json stream order --account sim > events.jsonl &
+
+# Terminal B — place the order, capture seq from the JSON response (last line)
+SEQ=$(miniqmt-cli --format json order buy --account sim --code 000001.SZ \
+      --volume 100 --price 10.50 --yes | tail -1 | jq -r '.seq')
+
+# Watch events.jsonl for order_status where order_id == $SEQ
+```
+
+Subscribing **before** placing is the only way to guarantee you see the full lifecycle (`submitted` → `confirmed` → `filled`). If the stream subscriber is registered after the daemon has already dispatched an event, that event is lost for this subscriber (the daemon fans out only to currently-registered subscribers; see `session.py` `dispatch_order_event`).
+
+**5. Verify the outcome.**
+
+```bash
+miniqmt-cli account orders --account sim   # all of today's orders
+miniqmt-cli account trades --account sim   # all of today's fills
+miniqmt-cli account position --account sim # current positions
+```
+
+The broker is the source of truth, not the stream. If a stream event is missed (connection blip, subscriber queue overflow — drops are logged server-side), these queries reconcile.
+
+#### Cancelling
+
+Know which scenario you're in before cancelling:
+
+| Order state | Can cancel? | What happens |
+|-------------|-------------|--------------|
+| `submitted` / `confirmed` (unfilled) | Yes | Full cancel; `status` → `cancelled` |
+| `partially_filled` | Yes | Cancels the remaining unfilled portion only; already-filled shares stay |
+| `filled` / `cancelled` / `rejected` | No | Broker will reject the cancel |
+
+Cancel takes the same form for sim and live accounts — the CLI has no `--confirm-live` flag on cancel (see the Terminology table above for the full matrix). Whitelist enforcement still happens at the daemon layer.
+
+```bash
+miniqmt-cli order cancel --account sim --order-id 12345 --yes
+miniqmt-cli order cancel --account real --order-id 12345 --yes
+
+# JSON output for scripting
+miniqmt-cli --format json order cancel --account sim --order-id 12345 --yes
+```
+
+Cancel flow:
+
+1. Get `order-id` from the place response (`seq` field) or from `account orders`.
+2. POST `/trade/cancel` returns `{"status": "ok", "seq": <cancel_seq>}` synchronously — this is the **submit ack**, not confirmation the order is cancelled.
+3. Watch `/stream/order` for `order_status` where `order_id == <original order_id>` and `status == "cancelled"`. The actual cancel can take a moment, and the broker may reject if the order filled first.
+4. Reconcile with `account orders` if you need certainty.
+
+Cancels are also idempotent via `client_req_id` (CLI auto-generates). Re-running the same cancel command without changes creates a new `client_req_id`, so it **will** hit the broker again — use the HTTP API with a stable `client_req_id` if you need true idempotency across retries.
+
+#### Error Handling
+
+| Exit | Python class | Meaning | Agent action |
+|------|------|---------|-------|
+| 0 | — | Success | Proceed |
+| 2 | `BrokerReject` | Broker refused the order (out of hours, insufficient balance, price band, halted stock, etc.) | Read message, fix input, don't blindly retry |
+| 3 | `GuardExit` | Safety guard refused: `--dry-run`, user declined "yes", missing/wrong `--confirm-live` | Expected for `--dry-run`; otherwise fix flags |
+| 1 | generic | Network error, timeout, unknown failure | Check tunnel / daemon health, then retry |
+
+Risk rejections come back as HTTP 400 with body `{"error": "risk_reject", "code": "<limit_name>", "message": "..."}` — in CLI they surface as exit 1 with the message. Agents using HTTP directly should branch on `code` (e.g. `max_daily_loss`, `max_position_pct`, `max_orders_per_minute`).
+
+### Risk Control
+
+The daemon enforces risk limits independently (v0.2.0+). When a limit trips, the breaker enters **block-open-allow-close** mode: new opening orders are rejected, but closing / cancel operations still work.
+
+```bash
+# Show risk status for one account (baseline, PnL, breaker state, pending orders)
+miniqmt-cli risk status --account sim
+
+# Show all accounts
+miniqmt-cli risk status
+
+# JSON for agents
+miniqmt-cli --format json risk status --account sim
+
+# Reset the breaker (operator action — requires a justification note)
+miniqmt-cli risk reset --account sim --note "false positive: baseline re-captured"
+
+# Live (real-money) account reset requires last-4-digit confirmation
+miniqmt-cli risk reset --account real --note "manual unfreeze" --confirm-live 1234
+```
+
+`risk status` fields of interest:
+
+| Field | Meaning |
+|-------|---------|
+| `baseline_total_asset` | Opening snapshot asset at session start |
+| `baseline_imprecise` | `true` if baseline was captured after first trade (less reliable) |
+| `current_total_asset` | Latest cached asset |
+| `daily_pnl` | `current - baseline` |
+| `breaker_tripped` | Boolean — if true, `breaker_reason` explains which limit |
+| `pending_orders` | Map of `code -> {buy_volume, buy_amount, sell_volume, sell_amount}` |
+| `orders_in_window` | Count of orders in the rolling 60s frequency window |
+
+`server.toml` `[risk]` defaults:
+
+```toml
+[risk]
+enabled = true
+max_daily_loss = 50000          # yuan
+max_position_pct = 30           # % of total asset per single stock
+max_orders_per_minute = 10
+max_positions = 10
+```
+
+Per-account overrides live in `[accounts.<name>.risk]`.
+
+### Daemon Management
+
+```bash
+# Check versions (local + remote)
+miniqmt-cli version
+
+# Health check
+miniqmt-cli health
+
+# Start daemon locally on Windows (normally managed by Scheduled Task)
+miniqmt-cli serve [--host 127.0.0.1] [--port 8765] [--dry-run]
+```
+
+### Configuration
+
+```bash
+# Client config
+miniqmt-cli config client init          # Create template ~/.miniqmt_cli/client.toml
+miniqmt-cli config client show          # Print resolved config
+miniqmt-cli config client set-server-url http://127.0.0.1:8765
+
+# Server config (run on Windows)
+miniqmt-cli config server init          # Create template ~/.miniqmt_cli/server.toml
+miniqmt-cli config server show          # Print config (account IDs masked)
+```
+
+### Deployment (Mac to Windows)
+
+The `setup` wizard walks through 9 steps: parameters, client.toml, SSH check, remote Python, Windows service registration, server.toml, code deploy, SSH tunnel, smoke test.
+
+```bash
+# Full wizard (idempotent, remembers progress)
+miniqmt-cli setup
+
+# Re-run a specific step (1-9)
+miniqmt-cli setup --step 9
+
+# Start fresh
+miniqmt-cli setup --reset
+```
+
+For day-to-day code updates after initial setup:
+
+```bash
+# Deploy script (uses env from wizard state)
+WIN_HOST=<user>@<windows-host> WIN_REPO=C:/apps/trading-skills bash scripts/deploy.sh
+```
+
+Restart the daemon on Windows:
+
+```bash
+ssh <user>@<windows-host> "schtasks /run /tn MiniqmtDaemon"
+```
+
+## SSH Tunnel
+
+The tunnel is the lifeline between Mac CLI and Windows daemon.
+
+```bash
+# Manual tunnel (foreground)
+ssh -N -L 8765:127.0.0.1:8765 <user>@<windows-host>
+
+# Persistent tunnel via autossh + launchd (setup wizard can generate the plist)
+launchctl load ~/Library/LaunchAgents/com.miniqmt.tunnel.plist
+```
+
+## Config File Reference
+
+### client.toml (`~/.miniqmt_cli/client.toml`)
+
+```toml
+[client]
+mode = "auto"                         # auto | local | remote
+server_url = "http://127.0.0.1:8765"  # required when mode = remote
+
+[client.output]
+format = "table"
+```
+
+Env overrides: `MINIQMT_CLI_MODE`, `MINIQMT_CLI_SERVER_URL`, `MINIQMT_CLI_FORMAT`
+
+### server.toml (`~/.miniqmt_cli/server.toml`, on Windows)
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8765
+qmt_path = "C:/国金QMT交易端/userdata_mini"
+
+[accounts.sim]
+account_id = "1230001"
+account_type = "STOCK"
+
+[accounts.real]                       # real-money account; name is arbitrary
+account_id = "1230002"
+account_type = "STOCK"
+requires_confirm_live = true          # marks this as a "live account" — extra confirmation required
+
+[audit]
+log_path = "~/.miniqmt_cli/orders.jsonl"
+```
+
+Env overrides: `MINIQMT_CLI_SERVER_HOST`, `MINIQMT_CLI_SERVER_PORT`, `MINIQMT_CLI_SERVER_QMT_PATH`
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| "cannot reach daemon" | Tunnel down or daemon stopped | Check `ssh -N -L ...` is running; `schtasks /run /tn MiniqmtDaemon` |
+| `daemon.state == "degraded"` (xtquant_loaded=false) | `qmt_path` wrong or miniQMT not installed | Edit server.toml `qmt_path`; ensure miniQMT client directory exists |
+| `accounts.<name>.trader.state == "never_connected"` | No `account` API has been called for this account yet this daemon process lifetime. Does NOT mean miniQMT is logged out. | Not an error. Run any `account` command to trigger lazy session creation; real login failures surface there |
+| `accounts.<name>.trader.state == "lost"` | xtquant SDK reported `on_disconnected` (e.g. miniQMT client closed, broker dropped the session, transient IPC blip). The pool still holds the stale handle, and `get_trader` will return it as-is until the daemon process restarts. | **Restart the daemon** (`ssh <user>@<windows-host> "schtasks /run /tn MiniqmtDaemon"`) — that's the only reliable recovery. Re-running `account asset` does NOT trigger a reconnect: `get_trader` short-circuits on the stale entry. Read queries (`asset` / `positions`) may even appear to succeed via the SDK's local cache, but those numbers are last-known-good as of disconnect; orders and cancels will hit the dead broker channel and fail. Ensure miniQMT client is open and logged in before restart. |
+| **One specific xt API hangs while others work** (e.g. `account trades` consistently 10s 503 but `asset` / `positions` / `orders` return fast). Persists across daemon restarts. | **xtquant SDK is drifted behind the miniQMT client version.** The QMT installer historically bundles xtquant under `bin.x64/Lib/site-packages/xtquant/`, but the bundled `.py` files may be years older than the running `XtMiniQmt.exe`. When the client introduces new fields in a record type (e.g. a new field in trade records), the old SDK's parser hangs trying to read a format it doesn't know. Other queries keep working because their wire format didn't change. | Compare versions: `xttrader.py` mtime under `<qmt_root>/bin.x64/Lib/site-packages/xtquant/` vs `XtMiniQmt.exe` mtime under `<qmt_root>/bin.x64/`. If the gap is >6 months, replace the SDK with a current `pip install xtquant` build (the wheel ships its own `xtpythonclient.pyd` + dependent DLLs, so the new files dropped into the same canonical path are self-contained). Always back up `xtquant/` before overwriting. The per-label circuit breaker (`_xt_call.py`) will isolate the wedged label automatically while you investigate, so the daemon doesn't go down. |
+| `accounts.<name>.baseline == "pending"` | Trader is up but today's risk baseline wasn't captured (login-time capture failed, e.g. broker blip). Orders on the pending account will be rejected `BASELINE_PENDING`. | Run `miniqmt-cli account asset --account <name>` again — login re-captures baseline. Check daemon logs for `baseline capture after login failed` if it persists. |
+| `accounts.<name>.risk_breaker == "tripped"` | The account's risk breaker fired (e.g. daily loss limit hit). Opening orders blocked; closing sells and cancels still allowed. | `miniqmt-cli risk status --account <name>`; reset with `risk reset --account <name> --note "<reason>"` after confirming cause |
+| Exit code -1073741510 | Daemon was killed (Ctrl+C / task stopped) | Restart: `schtasks /run /tn MiniqmtDaemon` |
+| `GuardExit` on order | Safety guard blocked the order | Check: `--dry-run` was set, confirmation was declined, or `--confirm-live` missing/wrong |
+| `BrokerReject` | Broker refused the order | Check order params, market hours, account balance |
+| GBK encoding errors in SSH | Windows CMD default codepage | Use `chcp 65001` prefix or pipe through Python |
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Generic error |
+| 2 | Broker rejected the order (`BrokerReject`) |
+| 3 | Safety guard refused to proceed (`GuardExit`) |
+| 4 | Daemon-side risk layer refused the action (`RiskReject`) |
+| 5 | **Submit indeterminate** — order/cancel timed out; broker state unknown. **DO NOT RETRY.** Reconcile via `miniqmt-cli account orders --account <name>` before any next action |
+
+Exit code 5 is the contract for state-changing operations (place/cancel) that didn't get a definitive response within the submit timeout. Scripts that branch on exit code should treat it as fundamentally different from exit 1: code 1 means "we know it failed", code 5 means "we don't know whether the broker accepted it". A naive retry on code 5 risks doubling the position.
+
+## Related Skills
+
+- **trading-analysis** — Money flow + signals built on top of `miniqmt-cli ticks`

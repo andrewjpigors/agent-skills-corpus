@@ -1,0 +1,776 @@
+---
+name: smith
+description: Initialize SpecKit on a new or existing project — scans the codebase, interviews you about project details, and generates CLAUDE.md, constitution.md, and the full .specify/ scaffolding with commands and agents.
+argument-hint: [--preset flask-react|fastapi-next|cli-python|express-react]
+---
+
+# SpecKit Project Initialization
+
+Bootstrap a project with the full SpecKit spec-driven development workflow. This skill scans the existing codebase to pre-fill answers, interviews you about your project, and generates all configuration files.
+
+**Arguments:** $ARGUMENTS
+
+## Workflow
+
+### Phase 0: Locate Skill Assets
+
+The SpecKit skill assets (templates, scripts, commands, agents) are bundled at:
+
+```
+~/.claude/skills/smith/
+├── templates/          # spec, plan, tasks, checklist, agent-file templates
+├── scripts/            # Shell scripts for feature management
+├── commands/           # Slash command definitions (smith.specify, etc.)
+└── agents/             # Agent definitions (architect, senior-qa, etc.)
+```
+
+Verify this directory exists. If missing, abort with: "SpecKit skill assets not found at ~/.claude/skills/smith/. Please reinstall the skill."
+
+### Phase 1: Preset Check
+
+If `$ARGUMENTS` contains `--preset <name>`, load preset defaults and skip to Phase 3 (confirmation). Available presets:
+
+| Preset | Stack |
+|--------|-------|
+| `flask-react` | Flask 3.x + React 19 + SQLite + Tailwind + Poetry + npm |
+| `fastapi-next` | FastAPI + Next.js + PostgreSQL + TypeScript + pip + npm |
+| `cli-python` | Python CLI (Click/Typer) + no frontend + Poetry |
+| `express-react` | Express.js + React 19 + PostgreSQL + TypeScript + npm |
+
+If no preset, proceed to Phase 2.
+
+### Phase 2: Codebase Detection
+
+Scan the current working directory to detect existing project characteristics. For each signal found, record it as a pre-filled answer. Present findings as a detection report before asking questions.
+
+#### 2.1 Project Identity Detection
+
+- Check for existing `CLAUDE.md` — extract project name and description if present
+- Check for `package.json` → extract `name`, `description`
+- Check for `pyproject.toml` → extract `[tool.poetry].name`, `description`
+- Check for `Cargo.toml` → extract `[package].name`, `description`
+- Check for `go.mod` → extract module name
+- Check for `README.md` → extract first heading and description paragraph
+- Check git remote URL for project name hints
+
+#### 2.2 Tech Stack Detection
+
+**Frontend:**
+- `package.json` dependencies: `react` → React, `vue` → Vue, `svelte` → Svelte, `next` → Next.js, `@angular/core` → Angular
+- `package.json` dependencies: `tailwindcss` → Tailwind, `styled-components`, `@emotion/react`, `sass`
+- `tsconfig.json` exists → TypeScript; otherwise JavaScript
+- Check for Storybook: `.storybook/` dir or `@storybook/*` in devDeps
+
+**Backend:**
+- `pyproject.toml` or `requirements.txt`: `flask` → Flask, `fastapi` → FastAPI, `django` → Django
+- `package.json` dependencies: `express` → Express, `fastify` → Fastify, `hono` → Hono
+- `go.mod` → Go
+- `Cargo.toml` → Rust
+- `Gemfile`: `rails` → Rails, `sinatra` → Sinatra
+
+**Database:**
+- `pyproject.toml`/`requirements.txt`: `sqlalchemy` → SQLAlchemy, `psycopg2`/`asyncpg` → PostgreSQL, `pymongo` → MongoDB
+- `package.json`: `prisma` → Prisma, `typeorm` → TypeORM, `mongoose` → MongoDB, `pg` → PostgreSQL, `better-sqlite3`/`sqlite3` → SQLite
+- Look for `*.db` or `*.sqlite` files → SQLite
+- Look for `docker-compose.yml` services: `postgres`, `mysql`, `redis`, `mongo`
+
+**Package Managers:**
+- `poetry.lock` → Poetry; `Pipfile.lock` → Pipenv; `requirements.txt` → pip
+- `package-lock.json` → npm; `yarn.lock` → Yarn; `pnpm-lock.yaml` → pnpm
+- `Cargo.lock` → Cargo; `go.sum` → Go modules
+
+**Auth:**
+- Search for `oauth`, `jwt`, `passport`, `flask-login`, `next-auth`, `auth0` in dependencies or code
+
+#### 2.3 Tooling Detection
+
+- **Linting**: `.eslintrc*` or `eslint.config.*` → ESLint; `ruff.toml` or `[tool.ruff]` in pyproject.toml → Ruff; `.pylintrc` → Pylint
+- **Formatting**: `.prettierrc*` → Prettier; Ruff format → Ruff
+- **Testing**: `vitest` or `jest` in package.json → Vitest/Jest; `pytest` in pyproject.toml → Pytest; `go test` patterns → Go test
+- **CI/CD**: `.github/workflows/` → GitHub Actions; `.gitlab-ci.yml` → GitLab CI; `Jenkinsfile` → Jenkins
+- **Docker**: `Dockerfile` or `docker-compose.yml` → Docker
+- **Storybook**: `.storybook/` directory → Storybook
+
+#### 2.4 Structure Detection
+
+- `frontend/` + `backend/` → Web app (separate dirs)
+- `src/` only → Single project
+- `apps/` or `packages/` → Monorepo (directory heuristic)
+- `ios/` or `android/` → Mobile
+- Check for existing `.specify/`, `.claude/commands/`, `.claude/agents/`
+
+#### 2.4.1 Monorepo Tool Detection
+
+Detect monorepo orchestration tools by their config files. These take precedence over directory heuristics:
+
+**Config file detection:**
+- `pnpm-workspace.yaml` → pnpm workspaces
+- `package.json` with `workspaces` field → npm/yarn workspaces (parse JSON to confirm)
+- `nx.json` → Nx monorepo
+- `turbo.json` → Turborepo
+- `lerna.json` → Lerna
+- `rush.json` → Rush
+
+**When monorepo config is found:**
+1. Set structure type to "Monorepo" with high confidence
+2. Record the orchestration tool (e.g., "pnpm workspaces", "Nx", "Turborepo")
+3. Parse workspace configuration to identify package locations:
+   - **pnpm**: Parse `packages` array from `pnpm-workspace.yaml`
+   - **npm/yarn**: Parse `workspaces` field from `package.json` (can be array or object with `packages` key)
+   - **Nx**: Parse `projects` from `nx.json` or scan for `project.json` files; check `workspaceLayout` for custom paths
+   - **Turbo**: Note presence; Turbo typically layers on top of npm/yarn/pnpm workspaces
+   - **Lerna**: Parse `packages` array from `lerna.json`; check `useWorkspaces` flag
+   - **Rush**: Parse `projects` array from `rush.json`
+4. Identify the monorepo root (where the config file lives) — this may differ from cwd if running from a sub-package
+5. Store detected workspace globs for use in CLAUDE.md generation
+
+**Multiple tools:** If multiple configs exist (e.g., `turbo.json` + `pnpm-workspace.yaml`), record both — Turbo is often used alongside a workspace manager.
+
+#### 2.5 Existing Configuration Detection
+
+- Check for existing `CLAUDE.md` — warn user it will be regenerated (offer to preserve or replace)
+- Check for existing `.specify/` — warn and offer to update or replace
+- Check for existing `.claude/commands/` — same
+- Check for existing `.claude/agents/` — same
+- Check for existing constitution at `.specify/memory/constitution.md`
+
+#### 2.6 Present Detection Report
+
+Display findings in a clear table:
+
+```markdown
+## Codebase Detection Report
+
+| Category | Detected | Confidence | Value |
+|----------|----------|------------|-------|
+| Project Name | Yes | High | "my-project" (from package.json) |
+| Structure | Yes | High | Monorepo |
+| Monorepo Tool | Yes | High | pnpm workspaces (from pnpm-workspace.yaml) |
+| Workspace Packages | Yes | High | packages/*, apps/* |
+| Frontend | Yes | High | React 19 + TypeScript |
+| Styling | Yes | High | Tailwind CSS |
+| Backend | Yes | High | Flask 3.x + Python 3.12 |
+| Database | Yes | Medium | SQLite (found .db files) |
+| Package Manager | Yes | High | pnpm (from pnpm-lock.yaml) |
+| Auth | No | — | Not detected |
+| Linting | Yes | High | ESLint + Ruff |
+| Testing | Yes | High | Vitest + Pytest |
+| CI/CD | Yes | High | GitHub Actions |
+| Docker | Yes | High | Docker Compose |
+| Storybook | No | — | Not detected |
+| Default Branch | Yes | High | development (from origin/HEAD) |
+
+Items marked "No" or "Medium" confidence will be asked about in the interview.
+```
+
+**Default-branch detection step**: Detect the repository's default/integration branch and
+record it for the report row above and the base-branch interview question. Run:
+```bash
+git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'
+```
+If this resolves (e.g. `development`, `develop`, `trunk`), use it as the detected value;
+if it fails (no `origin` remote, detached HEAD), fall back to `main`. This value seeds the
+base-branch interview question (below) and is written to the constitution as `base_branch:`.
+
+### Phase 3: Generate Init Intake Document
+
+Instead of prompting the user interactively, generate a persistent intake document at `specs/init-intake.md`.
+
+**IMPORTANT**: This file is the permanent record of project configuration decisions. **Never delete it.** If it already exists, read it and use the existing answers — do not regenerate unless the user explicitly asks to refresh it.
+
+#### 3.1 Create `specs/` directory if it doesn't exist
+
+```bash
+mkdir -p specs
+```
+
+#### 3.2 If `specs/init-intake.md` does NOT exist, generate it
+
+Create `specs/init-intake.md` with:
+- A frontmatter block with generation date, project name, and status
+- The full **Codebase Detection Report** table from Phase 2
+- All 29 questions organized in 5 groups (Project Identity, Tech Stack, Development Tooling, Quality Standards, Workflow Preferences)
+- For each question: the options, a **Recommended** answer with rationale based on codebase detection, and an **Answer** field pre-filled with the recommendation
+
+**Base-branch question (Workflow Preferences group)**: Include a question — distinct from
+the feature-branch *naming* question (Q25) — that asks which branch is the project's
+integration/base branch. Smith cuts feature branches from it and targets PRs at it. Wording:
+"Which branch is your integration/base branch? (Smith cuts feature branches from it and
+targets PRs at it.)" Auto-detect the recommended value and pre-fill the **Answer** with it:
+```bash
+git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'
+```
+If detection fails (no `origin` remote, detached HEAD), recommend `main`. The user may
+override the recommendation with any branch name (e.g. a `development → main` promotion flow
+where the user targets `development` even though `origin/HEAD` points at `main`). The chosen
+value is written to the constitution frontmatter as `base_branch:` in Phase 4.
+- A **Project-Specific Notes** section capturing any important context detected during the scan that doesn't fit the standard questions (e.g., multi-service architecture, N8N workflows, custom patterns)
+
+The recommended answers should be based on:
+1. High-confidence codebase detections (use detected values directly)
+2. Best practices for the detected stack (when no detection available)
+3. Project context from memory, STATUS.md, or other project docs
+
+#### 3.3 If `specs/init-intake.md` ALREADY exists, read and use it
+
+Parse the existing file to extract the **Answer** lines for each question. These answers drive all subsequent file generation in Phase 4. Tell the user: "Found existing `specs/init-intake.md` — using your recorded answers. Edit the file and re-run `/smith` to change any decisions."
+
+#### 3.4 Interactive Walkthrough
+
+After generating (or loading) the intake document, walk the user through **every question interactively**, one at a time. For each question, present:
+
+1. **Question number and text** (e.g., "Q5. Frontend framework")
+2. **Context** — why this decision matters for the project
+3. **Options** — each option with a brief explanation of trade-offs
+4. **Recommended answer** — your recommendation with reasoning based on codebase detection and project context
+5. **Current answer** — what is currently recorded in the intake file
+
+Then wait for the user's response. Accepted responses:
+- A specific choice → update the Answer line in `specs/init-intake.md` immediately
+- "ok" / "yes" / pressing enter with no input / confirming the recommendation → keep the current answer, move to next question
+- A question or comment → answer it, then re-present the same question
+- "skip" → keep current answer, move to next question
+- "back" → return to the previous question
+
+After all questions are answered, present a final summary table of all answers and ask the user to confirm before proceeding to Phase 4.
+
+Update `specs/init-intake.md` in real-time as the user answers — do not batch updates.
+
+### Phase 4: Generate Files
+
+After the interactive walkthrough is complete and the user confirms, generate all project files.
+
+#### 4.1 Scaffold Project Directories
+
+Create the directory structure and copy files from the skill assets:
+
+```bash
+mkdir -p .specify/memory .specify/templates .specify/scripts/bash
+mkdir -p docs/sessions
+mkdir -p specs/questions
+mkdir -p .smith/vault/sessions .smith/vault/agents .smith/vault/queue .smith/vault/bank .smith/vault/ledger
+mkdir -p .smith/vault/active-workflows
+
+# Bootstrap marker so the workflow-gate hook (PreToolUse) allows the
+# rest of /smith init to write the remaining scaffold. Without this,
+# the gate would deny every subsequent Write/Edit because no marker
+# exists yet. Cleared at the end of /smith init (see Phase 4.10).
+cat > .smith/vault/active-workflows/bootstrap.yaml << EOF
+workflow: smith
+feature: project-initialization
+# NOTE: this captures the CURRENT HEAD branch (the branch /smith init runs on),
+# not the project's integration/base branch. The `|| echo main` is the
+# current-branch fallback for a detached HEAD — it is intentionally NOT the
+# configured base branch and must not be replaced with get-base-branch.sh.
+branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+started: $(date -u +"%Y-%m-%dT%H:%M:%S")
+EOF
+```
+
+The `docs/sessions/` directory holds session chat logs (timestamped Q&A records with YAML frontmatter for searchability). The `specs/questions/` directory holds structured question files generated before complex changes (numbered questions with options, recommendations, and answer fields). Both are required by the global workflow tenets in `~/.claude/CLAUDE.md`.
+
+The `.smith/vault/ledger/` directory holds the Ledger — Smith's learned knowledge from past workflow executions. After creating the directory, scaffold the Ledger template files: `patterns.md`, `antipatterns.md`, `tool-preferences.md`, `edge-cases.md`, `project-quirks.md` (each with a header and empty-state message), and `meta.yaml` (initialized with creation date and zero counters). See the `smith-reflect` skill for the exact file formats.
+
+Copy from `~/.claude/skills/smith/`:
+- `templates/*` → `.specify/templates/`
+- `scripts/*` → `.specify/scripts/bash/`
+
+This `scripts/*` glob copies **every** helper in `skills/smith/scripts/`, including
+`get-base-branch.sh` and `clear-active-workflow.sh` — no per-script copy instruction is
+needed, and `get-base-branch.sh` is scaffolded to `.specify/scripts/bash/get-base-branch.sh`
+automatically.
+
+Make scripts executable:
+```bash
+chmod +x .specify/scripts/bash/*.sh
+```
+
+#### 4.2 Generate Constitution (`.specify/memory/constitution.md`)
+
+Generate a constitution file using the interview answers. Structure:
+
+```markdown
+---
+base_branch: [from the base-branch interview answer; default `main` if unanswered]
+---
+
+# [Project Name] Constitution
+
+## Core Principles
+
+### I. Code Quality Standards
+[Generated based on detected linters, languages, component patterns]
+
+### II. Testing Standards
+[Generated based on detected test frameworks, coverage target from Q20]
+
+### III. User Experience Consistency
+[Generated only if frontend detected — based on styling framework, component tool]
+
+### IV. Performance Requirements
+[Generated from Q21 answers, or standard defaults]
+
+## Technology Constraints
+[Generated from tech stack answers Q5-Q13]
+
+## Development Workflow
+
+### Branch Strategy
+[Generated from Q25 (feature-branch naming) and the base-branch question. State the
+configured integration/base branch — the value written to `base_branch:` in the
+frontmatter above — so it is human-readable here as well as machine-readable in the
+frontmatter that `get-base-branch.sh` parses.]
+
+### SpecKit Workflow
+[Standard — always included]
+
+### Commit Standards
+[Generated from Q26, Q28]
+
+### Quality Gates
+[Generated from Q23, Q27]
+
+## Governance
+[Standard boilerplate with project name, version 1.0.0, current date]
+```
+
+Use the following rules for content generation:
+- **Python backend**: Include Ruff linting, Pydantic validation, snake_case naming
+- **JavaScript/TypeScript frontend**: Include ESLint, PascalCase components, camelCase functions
+- **React + Storybook**: Include component directory pattern, Storybook-first development
+- **Tailwind**: Include "Tailwind utility classes required; custom CSS MUST be justified"
+- **Docker**: Include container-related standards
+- **SQLAlchemy**: Include "No N+1 queries" rule
+- **Monorepo**: Include workspace-aware rules (see below)
+- Only include sections relevant to the detected/selected stack
+
+**Monorepo-specific constitution rules** (only if monorepo detected):
+- Include "Changes affecting multiple packages require cross-package testing"
+- Include "Shared packages must maintain backwards compatibility or coordinate breaking changes"
+- Include workspace dependency guidelines (internal vs external)
+- For Nx: Include affected-based testing rules (`nx affected:test`)
+- For Turborepo: Include pipeline caching expectations
+- For pnpm: Include workspace protocol usage (`workspace:*`)
+
+#### 4.3 Generate CLAUDE.md
+
+Generate a CLAUDE.md file at the project root using the interview answers. Structure:
+
+```markdown
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+[Project name and description from Q1-Q2]
+
+### Project Governance
+See `.specify/memory/constitution.md` for binding project principles.
+
+### Business Domain
+[Domain from Q3, entities from Q4 if provided]
+
+## Tech Stack
+
+### Frontend
+[From Q5-Q7, only if frontend exists]
+
+### Backend
+[From Q8-Q12, only if backend exists]
+
+### Monorepo Structure
+[Generated only if monorepo detected — include workspace layout, package locations, and orchestration tool]
+
+## Git Commit Guidelines
+[Generated from Q26, Q28 — include linking format, co-author trailer]
+
+## Common Commands
+
+### CI/CD Scripts
+[Generated based on detected CI scripts, or suggest creating them]
+
+### Docker Development
+[Generated only if Docker detected]
+
+### Frontend Development
+[Generated from frontend stack — npm/yarn commands]
+
+### Backend Development
+[Generated from backend stack — poetry/pip commands, test commands]
+
+### Database
+[Generated from database choice — migration commands if ORM detected]
+
+### Monorepo Commands
+[Generated only if monorepo detected — include workspace-aware commands]
+
+## Architecture
+
+### Backend Structure
+[Generated from directory scan or standard template for the stack]
+
+### Frontend Structure
+[Generated from directory scan or standard template for the stack]
+
+### Key Patterns
+[Generated based on stack — e.g., "Application Factory" for Flask, "API Routes" for Next.js]
+
+## SpecKit Workflow
+[Standard section — always included, customized with review gate selections from Q27]
+
+### Issue-Driven Workflow
+[Standard — customized with issue tracker from Q24]
+
+### Subagent Usage
+[Standard — always included]
+
+### Review Gates (Mandatory)
+[Generated from Q27 selections]
+
+### When Asked "What's Next?"
+[Standard — always included]
+
+### Directory Structure
+[Standard .specify/ structure]
+
+### Branch Naming
+[From Q25]
+
+## E2E Testing with Playwright MCP
+[Generated only if Playwright MCP selected in Q19]
+```
+
+**IMPORTANT rules for CLAUDE.md generation:**
+- Only include sections relevant to the stack (no Docker section if no Docker, no Storybook section if no Storybook, etc.)
+- Generate actual commands based on the real package manager and frameworks
+- If existing CLAUDE.md was found and user chose to preserve, merge new sections with existing content
+- Include the SpecKit Workflow section verbatim — this is the standard workflow
+- **Do NOT add a `## Recent Changes` / changelog section, and do NOT `@`-reference
+  a doc that any workflow then appends per-change prose to** (e.g. a `data-model.md`
+  with a growing "Last Updated" header). `@`-referenced files are loaded into context
+  **in full, every session**, and per-change appends turn them into multi-hundred-KB
+  context sinks that also cause merge conflicts on every branch. The durable
+  per-change record already lives in `.smith/vault/sessions/` + the Ledger + git —
+  **those ARE the changelog.** Keep `CLAUDE.md` and any `@`-referenced doc small and
+  stable: structural/durable content only (overview, tech stack, ERD, entity tables,
+  enums), never accumulating history.
+
+**Monorepo-specific CLAUDE.md content** (only if monorepo detected):
+
+For the `### Monorepo Structure` section, include:
+- Orchestration tool name and version (e.g., "pnpm workspaces", "Nx 17.x", "Turborepo")
+- Workspace root location (usually cwd, but note if different)
+- Package locations parsed from config (e.g., `packages/*`, `apps/*`)
+- Brief description of each discovered package/app if parseable
+
+For the `### Monorepo Commands` section, generate tool-specific commands:
+
+**pnpm workspaces:**
+```
+pnpm install                    # Install all workspace dependencies
+pnpm -F <package> add <dep>     # Add dependency to specific package
+pnpm -F <package> run <script>  # Run script in specific package
+pnpm -r run build               # Run build in all packages
+pnpm -F "...<package>" test     # Test package and its dependents
+```
+
+**npm/yarn workspaces:**
+```
+npm install                     # Install all workspace dependencies
+npm -w <package> run <script>   # Run script in specific package
+npm run <script> --workspaces   # Run script in all workspaces
+```
+
+**Nx:**
+```
+npx nx run <project>:<target>   # Run target in specific project
+npx nx affected:build           # Build only affected projects
+npx nx affected:test            # Test only affected projects
+npx nx graph                    # Visualize project dependencies
+npx nx run-many -t build        # Run build in all projects
+```
+
+**Turborepo:**
+```
+turbo run build                 # Run build with caching
+turbo run test                  # Run tests with caching
+turbo run build --filter=<pkg>  # Build specific package
+turbo run build --filter=...<pkg>  # Build package and dependents
+```
+
+**Lerna:**
+```
+lerna bootstrap                 # Link local packages
+lerna run build                 # Run build in all packages
+lerna run test --scope=<pkg>    # Run test in specific package
+lerna publish                   # Publish changed packages
+```
+
+**Rush:**
+```
+rush install                    # Install dependencies
+rush build                      # Build all projects
+rush build -t <project>         # Build specific project and deps
+rush test                       # Run tests
+```
+
+#### 4.4 Set Up `.claude/commands/`
+
+Create the project's `.claude/commands/` directory and copy command files from the skill assets:
+
+```bash
+mkdir -p .claude/commands
+```
+
+Copy from `~/.claude/skills/smith/commands/`:
+- All `smith.*.md` files → `.claude/commands/`
+- `review-respond.md` → `.claude/commands/`
+
+#### 4.5 Set Up `.claude/agents/` (Optional)
+
+If the user selected review gates in Q27, create custom agent definitions:
+
+```bash
+mkdir -p .claude/agents
+```
+
+Copy from `~/.claude/skills/smith/agents/`:
+- If architect gate enabled: `architect.md` → `.claude/agents/`
+- If product-manager gate enabled: `product-manager.md` → `.claude/agents/`
+- Always copy: `senior-qa.md`, `staff-backend.md`, `staff-frontend.md`, `staff-fullstack.md`, `staff-infrastructure.md`
+
+After copying, replace `[PROJECT_NAME]` placeholders in the agent files with the actual project name from Q1.
+
+#### 4.6 Create `.claude/settings.json` (if not exists)
+
+If no `.claude/settings.json` exists, create one with sensible defaults:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git branch:*)",
+      "Bash(./.specify/scripts/*:*)",
+      "Bash(.specify/scripts/bash/clear-active-workflow.sh:*)",
+      "Bash(.specify/scripts/bash/get-base-branch.sh:*)"
+    ]
+  }
+}
+```
+
+The `clear-active-workflow.sh` entry is listed explicitly so Smith workflow cleanup still works on projects that add `Bash(rm:*)` to the `deny` list as a safety rail. The helper is narrow (single file, no globs, path-escape guarded) and lets skills remove the active-workflow marker without weakening the deny rule.
+
+The `get-base-branch.sh` entry is listed explicitly for the same reason: every Smith skill that needs the integration branch resolves it via `.specify/scripts/bash/get-base-branch.sh`, so projects with strict `Bash` allow/deny rails must permit it. The helper is read-only (no writes, no globs, no recursion) and always echoes a branch name (`main` on any non-resolution).
+
+Add framework-specific permissions based on detected stack:
+- npm projects: `"Bash(npm run:*)"`, `"Bash(npm install:*)"`
+- Poetry projects: `"Bash(poetry run:*)"`, `"Bash(poetry install:*)"`
+- Docker projects: `"Bash(docker:*)"`, `"Bash(docker compose:*)"`
+- CI scripts: `"Bash(./scripts/*:*)"`
+
+Add monorepo-specific permissions based on detected orchestration tool:
+- pnpm workspaces: `"Bash(pnpm:*)"`, `"Bash(pnpm -F:*)"`, `"Bash(pnpm -r:*)"`
+- Nx: `"Bash(npx nx:*)"`, `"Bash(nx:*)"`
+- Turborepo: `"Bash(turbo:*)"`, `"Bash(turbo run:*)"`
+- Lerna: `"Bash(lerna:*)"`, `"Bash(npx lerna:*)"`
+- Rush: `"Bash(rush:*)"`
+
+If `.claude/settings.json` already exists, do NOT overwrite — inform the user they may want to add the `.specify/scripts` permission manually, plus `Bash(.specify/scripts/bash/clear-active-workflow.sh:*)` if their config includes a broad `Bash(rm:*)` deny rule (needed so Smith workflow cleanup can remove active-workflow markers), and `Bash(.specify/scripts/bash/get-base-branch.sh:*)` so base-branch resolution works under strict `Bash` rails.
+
+#### 4.7 Create `.gitignore` Entries
+
+If `.gitignore` exists, append SpecKit-related entries if not already present:
+
+```
+# SpecKit / Claude Code
+.claude/agent-memory/
+.claude/todos/
+```
+
+If `.gitignore` doesn't exist, create one with standard patterns for the detected stack plus the above entries.
+
+**Then merge the canonical Smith vault & index policy** (the team-shareable selective policy from feature 36). This is a single source of truth shipped as a template asset — do NOT inline-duplicate the list here; read it from the installed path and merge idempotently using sentinel markers.
+
+Source template (prefer the installed copy, fall back to the repo-dev copy):
+- `~/.claude/skills/smith-index/templates/.gitignore-smith-additions`
+- (fallback) `skills/smith-index/templates/.gitignore-smith-additions`
+
+And the matching `.gitattributes` policy (de-emphasizes generated `.meta` in diffs):
+- `~/.claude/skills/smith-index/templates/.gitattributes-smith-additions`
+- (fallback) `skills/smith-index/templates/.gitattributes-smith-additions`
+
+**Idempotent sentinel merge contract:**
+- The template block is wrapped in `# >>> smith-gitignore-policy >>>` … `# <<< smith-gitignore-policy <<<` (and `# >>> smith-gitattributes-policy >>>` … `# <<< smith-gitattributes-policy <<<` for `.gitattributes`).
+- If the project file already contains the opening sentinel, replace everything between the opening and closing sentinel (inclusive) with the fresh template block.
+- Otherwise append the whole block (creating `.gitattributes` if it does not exist).
+- Lines OUTSIDE the sentinels are never touched.
+
+**Staleness guard (Feature 38).** A pre-Feature-36 installed template is the
+*inverse* policy (it IGNORES `index/files/` + `index/systems/`) and lacks the
+`# >>> smith-gitignore-policy >>>` sentinel. `/smith` init has no upstream clone to
+auto-repair from (unlike `/smith-update`), so if the resolved installed template is
+stale it must NOT be applied. Prefer the repo-dev copy if it is current; otherwise
+warn the user to run `/smith-update` and SKIP the policy merge rather than writing
+the wrong (inverted) policy.
+
+Run this self-contained `python3` block (robust sentinel replace-or-append — no `sed` portability issues):
+
+```bash
+# Resolve the template source (installed path first, repo-dev fallback).
+SENTINEL='# >>> smith-gitignore-policy >>>'
+SMITH_TPL_DIR="$HOME/.claude/skills/smith-index/templates"
+[ -f "$SMITH_TPL_DIR/.gitignore-smith-additions" ] || SMITH_TPL_DIR="skills/smith-index/templates"
+
+# Staleness guard: if the resolved template lacks the sentinel, it's a pre-Feature-36
+# (inverted) policy. Try the repo-dev copy; if that's also stale/absent, skip the merge.
+if ! grep -qF "$SENTINEL" "$SMITH_TPL_DIR/.gitignore-smith-additions" 2>/dev/null; then
+    if grep -qF "$SENTINEL" "skills/smith-index/templates/.gitignore-smith-additions" 2>/dev/null; then
+        SMITH_TPL_DIR="skills/smith-index/templates"
+    else
+        echo "WARNING: the installed Smith gitignore template is stale (pre-Feature-36,"
+        echo "         no sentinel marker) and no current repo-dev copy was found. Skipping"
+        echo "         the .gitignore/.gitattributes policy merge to avoid writing the wrong"
+        echo "         (inverted) policy. Run /smith-update to refresh the installed template,"
+        echo "         then re-run /smith init (or just /smith-update, which re-merges the policy)."
+        SMITH_TPL_DIR=""
+    fi
+fi
+
+if [ -n "$SMITH_TPL_DIR" ]; then
+python3 - "$SMITH_TPL_DIR" <<'PYEOF'
+import sys, pathlib
+
+tpl_dir = pathlib.Path(sys.argv[1])
+
+def merge(target_path, tpl_path, open_marker, close_marker):
+    tpl = pathlib.Path(tpl_path)
+    if not tpl.exists():
+        print(f"WARNING: template not found: {tpl_path} — skipping")
+        return
+    block = tpl.read_text().rstrip("\n") + "\n"
+    target = pathlib.Path(target_path)
+    existing = target.read_text() if target.exists() else ""
+
+    if open_marker in existing and close_marker in existing:
+        # Replace the managed region (inclusive) with the fresh block.
+        pre = existing.split(open_marker, 1)[0]
+        post = existing.split(close_marker, 1)[1]
+        new = pre.rstrip("\n") + ("\n\n" if pre.strip() else "") + block + post.lstrip("\n")
+        action = "refreshed"
+    else:
+        sep = "" if (not existing or existing.endswith("\n\n")) else ("\n" if existing.endswith("\n") else "\n\n")
+        new = existing + sep + block
+        action = "appended"
+    target.write_text(new)
+    print(f"{action}: {open_marker.split()[1]} in {target_path}")
+
+merge(".gitignore", tpl_dir / ".gitignore-smith-additions",
+      "# >>> smith-gitignore-policy >>>", "# <<< smith-gitignore-policy <<<")
+merge(".gitattributes", tpl_dir / ".gitattributes-smith-additions",
+      "# >>> smith-gitattributes-policy >>>", "# <<< smith-gitattributes-policy <<<")
+PYEOF
+fi   # end: SMITH_TPL_DIR non-empty (merge not skipped by staleness guard)
+```
+
+The policy is a **negative list**: `.smith/` is NOT ignored wholesale. Only the specific volatile paths in the block are ignored; everything else under `.smith/` (the `manifest.md`, `config/`, `index/files/` + `index/systems/` `.meta` describe layer, `ledger/`, `bank/`, `agents/`, and `sessions/*.md`) is committed and shared with the team. Re-running `/smith` init replaces the managed region in place, so the block never duplicates.
+
+#### 4.8 Optionally Scaffold System Specs
+
+Smith v2 path-resolver tier 1 reads `.specify/systems/<id>/spec.md` YAML frontmatter (`system`, `paths`) to bucket files into systems. Declaring systems upfront lets `/smith-index` route files correctly from day one. This step is **optional** — skip if the project is small, exploratory, or doesn't yet have clear system boundaries. Systems can also be added later manually or via `/smith-migrate-system-paths` on a project that grew `.specify/systems/` organically.
+
+Ask the operator:
+
+> "Does this project have logical systems you'd like to declare upfront, so `/smith-index` can route files correctly from day one? (yes/skip)"
+
+If the operator answers anything other than yes / y / Y, skip this step silently.
+
+If yes, enter a per-system loop:
+
+1. **Ask for a short kebab-case name** for the system (e.g. `email-pipeline`, `command-center`, `auth`). Re-prompt on blank input. Strip surrounding whitespace.
+2. **Compute the system id** as `system-NN-<short-name>` where `NN` is the count of `.specify/systems/system-*/` directories that exist so far in this run, plus one, zero-padded to two digits (`01`, `02`, ...).
+3. **Ask for directory prefixes** that belong to this system, one per line. Terminate the inner loop on a blank line. For each entry:
+   - Strip surrounding whitespace.
+   - **Reject** entries containing any glob character (`*`, `?`, `[`, `]`, `{`, `}`, `!`) — v1 supports literal prefixes only. Print: `"Glob characters not allowed in v1 — please enter a literal prefix."` and re-prompt for the same slot.
+   - Auto-append a trailing `/` if missing.
+   - Collect into a list.
+4. **Copy the template**: read `~/.claude/skills/smith/templates/system-spec-template.md`, and write it to `.specify/systems/<id>/spec.md` with these substitutions in the YAML frontmatter block ONLY (do not touch the body):
+   - `system: system-<NN>-<short-kebab-name>` → `system: <id>`
+   - The single placeholder list item `  - <relative-prefix>/` is replaced by one `  - <prefix>` line per collected entry, preserving two-space indentation. If the list is empty, emit `paths: []` on a single line in place of the multi-line block.
+   - `status: draft` stays as-is.
+   - `also_affects: []` stays as-is.
+   - The body skeleton stays as-is — the user can flesh it out later (or A3 can be re-run, though A3 only adds paths, not body).
+5. **Ask whether to declare another system**. If yes, loop back to step 1. If no, exit the loop.
+
+**Validation invariant** (enforced by step 3): every prefix written into the `paths:` list contains no glob characters and ends with `/`. The resolver loads paths defensively, but this step is also the first line of defense.
+
+After the loop completes, print a summary:
+
+```
+Scaffolded N system spec(s):
+  - .specify/systems/system-01-<name>/spec.md (2 paths)
+  - .specify/systems/system-02-<name>/spec.md (1 path)
+You can edit the body of each spec at any time. Run `/smith-migrate-system-paths` to bulk-propose paths from existing prose.
+```
+
+If the operator types `skip` at any per-system prompt, skip that system (do not write a spec for it) and continue the outer "another system?" loop.
+
+#### 4.10 Clear Bootstrap Marker
+
+The bootstrap marker created in Phase 4.1 has done its job — Phase 4 file generation is complete. Remove it via the shipped helper:
+
+```bash
+.specify/scripts/bash/clear-active-workflow.sh "bootstrap"
+```
+
+After this, the workflow-gate hook enforces normal discipline: subsequent file edits require one of the four top-level workflows (`/smith-new`, `/smith-bugfix`, `/smith-debug`, `/smith-build`) or `/smith-finish` to be active.
+
+### Phase 5: Verification & Report
+
+After generating all files, present a summary:
+
+```markdown
+## SpecKit Initialization Complete
+
+### Files Created
+| File | Status |
+|------|--------|
+| `CLAUDE.md` | Created / Updated |
+| `.specify/memory/constitution.md` | Created |
+| `.specify/templates/` (5 files) | Created |
+| `.specify/scripts/bash/` (5 files) | Created |
+| `.claude/commands/` (10 files) | Created |
+| `.claude/agents/` (7 files) | Created |
+| `.claude/settings.json` | Created / Skipped (exists) |
+| `docs/sessions/` | Created (session chat logs) |
+| `specs/questions/` | Created (pre-implementation question files) |
+| `specs/init-intake.md` | Created (permanent project config decisions) |
+| `.specify/systems/system-*/spec.md` (N files) | Created / Skipped (4.8) |
+
+### Available Commands
+| Command | Description |
+|---------|-------------|
+| `/smith.specify <description>` | Create feature spec |
+| `/smith.clarify` | Clarify spec ambiguities |
+| `/smith.plan` | Generate implementation plan |
+| `/smith.tasks` | Generate task breakdown |
+| `/smith.analyze` | Cross-artifact consistency check |
+| `/smith.implement` | Execute tasks |
+| `/smith.checklist` | Generate quality checklist |
+| `/smith.constitution` | Update project constitution |
+
+### Next Steps
+1. Review `CLAUDE.md` and `.specify/memory/constitution.md` — adjust any generated content
+2. Commit the generated files: `git add CLAUDE.md .specify/ .claude/ && git commit -m "chore: initialize SpecKit workflow"`
+3. Start your first feature: `/smith.specify <your feature description>`
+```
+
+## Important Notes
+
+- **Never modify files in the source project** — this skill only reads from `~/.claude/skills/smith/` and writes to the current working directory
+- **Existing files**: Always ask before overwriting. If `CLAUDE.md` exists, offer to merge or replace
+- **Idempotent**: Running `/smith.init` again should detect existing setup and offer to update
+- **Minimal questions**: Skip any question where codebase detection has high confidence. The goal is to confirm, not interrogate
+- The generated CLAUDE.md and constitution are starting points — users should customize them for their specific needs

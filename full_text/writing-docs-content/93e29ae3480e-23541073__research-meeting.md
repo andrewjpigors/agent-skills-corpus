@@ -1,0 +1,698 @@
+---
+name: research-meeting
+description: Session coordinator for persistent, multi-session research discussions.
+version: 1.0.0
+---
+
+# Research Meeting
+
+## Mission
+
+Coordinate persistent, multi-session research discussions on a single active project. The skill is responsible for bootstrapping session context at startup, maintaining productive discussion flow throughout, and ensuring all decisions and progress are durably persisted at close. Every session must leave the project in a state where a future session — possibly with no shared context — can resume cleanly.
+
+## Inputs
+
+Logical input fields inferred by the agent from the user's request. These are not a JSON schema — the skill is model-agnostic and does not assume programmatic invocation.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `active_project` | string | yes | — | Research project name or path. Resolved to an absolute project root at session start (see Project Root Resolution below). |
+| `session_objective` | string | no | none | What the user wants to accomplish this session. Inferred from opening statement. |
+| `agenda_items` | list of strings | no | none | Specific topics. Inferred from user or carried from `tasks.md`. |
+| `theory_graph_root` | string | no | auto-detected | Path to a project-local theory-graph vault. When omitted, the agent probes `<project_root>/theory/` against the detection signature (see Session Conduct → Theory graph). Explicit override is supported but rarely needed. |
+
+### Validation
+
+- `active_project` must resolve to an existing directory via the Project Root Resolution rules below. If no directory is found, report this and ask whether to create the project scaffold or abort.
+- `session_objective` and `agenda_items` are informational. No validation beyond basic presence.
+- `theory_graph_root`, if provided, must resolve to an existing directory containing a verifier script and at least one populated theoretical-object subdirectory. If the path is provided but does not satisfy the signature, warn and proceed as if the field were absent.
+
+### Project Root Resolution
+
+At session start, the agent resolves `active_project` to an absolute filesystem path called the **project root** (`<project_root>`). This path is used by all protocols and downstream skills (session-handoff, experience-logger, etc.) for the duration of the session. It is resolved once and never re-resolved mid-session.
+
+**Resolution priority:**
+
+1. **Explicit path** — if `active_project` contains a `/` or starts with `~`, treat it as a direct path. Validate the directory exists.
+2. **Handoff context** — if a handoff document is loaded at session start and contains a project root in its metadata, use that path.
+3. **Bare name lookup** — if `active_project` is a bare name (no path separators), check these locations in order:
+   a. `~/Documents/Research/<active_project>/`
+   b. `~/Documents/Playground/projects/<active_project>/`
+   c. The current working directory, if its basename matches `active_project`.
+4. **CWD inference** — if `active_project` is not provided and the current working directory appears to be a project root (contains `handoff.md`, `tasks.md`, or `domain-prior.md`), use the CWD.
+5. **Ask the user** — if none of the above resolves, ask the user for the project path.
+
+When a match is found, confirm it with the user: "Resolved project root to `<path>`. Correct?" This confirmation prevents silent misrouting of session artifacts.
+
+### How inputs are communicated
+
+The user does not fill out a form. Typical invocation patterns:
+
+- "Let's work on the point-process project." — `active_project` resolved from project folder names via bare name lookup.
+- "Let's work on `~/Documents/Playground/projects/skill-publication/`." — `active_project` used as explicit path.
+- "I want to discuss the simulation results and plan the next experiment." — `session_objective` and `agenda_items` inferred.
+- The agent may ask for clarification if `active_project` is ambiguous (e.g., multiple projects match). This is the only case where the agent asks a question at session start before entering the startup protocol.
+
+## Hard Boundaries
+
+- Do not embed step-by-step procedural instructions in this file. Those live in protocol files under `protocols/`.
+- Do not define roles for specialist agents. Those are Phase 4 scope (`roles/`).
+- Do not include output format templates. Those are Phase 3+ scope (`templates/`).
+- Do not restate general user interaction preferences (conciseness, no unsolicited suggestions, etc.). Those are injected by `memory-retriever` from central memory. Restating them here risks duplication and drift.
+- Do not embed memory-retriever logic. It is a separate skill invoked as a dependency.
+- Do not embed session-handoff format. It is a separate skill.
+- Do not auto-invoke `session-handoff` during close. The user decides when and whether to write a handoff.
+
+## Dependencies
+
+| Dependency | Type | When Invoked |
+|------------|------|-------------|
+| `memory-retriever` | hard (degraded mode available) | During startup protocol (full context bootstrap) and mid-session (agent-initiated topic-specific recall via `query` parameter, silent to user). |
+| `session-handoff` | soft | User-invoked. Close protocol reminds but does not auto-invoke. |
+| `experience-logger` | soft | During close protocol — writes session experience log. |
+| `research-synthesizer` | soft | During literature pipeline Stage 4 (synthesis). *(Phase 5.)* |
+| Scheduling mechanisms | soft | When setting up living review or health digest schedules. *(Phase 5.)* |
+
+Dependencies are referenced by name only. The agent locates and invokes each through the standard skill-discovery mechanism. If a soft dependency is unavailable at runtime, the agent warns and proceeds without it. If `memory-retriever` is unavailable, the startup protocol runs in degraded mode: the core identity pre-flight (Step 1) and memory retrieval (Step 2) are skipped, and the session proceeds with only the project context files from Step 3. The agent warns the user that session context is limited. Core features (discussion, checkpoints, close protocol, specialist initialization) remain fully functional.
+
+## Load Order
+
+### Always load (at skill activation)
+
+1. This file (`SKILL.md`) — read first, keep in context throughout the session.
+
+### Load on demand (routed by session phase)
+
+- `protocols/session-startup.md` — loaded once at session start, then eligible for context eviction after execution.
+- `protocols/context-checkpoint.md` — loaded when the user asks to persist mid-session progress.
+- `protocols/session-close.md` — loaded once when the session is ending.
+
+Protocol files are designed so that their procedural steps are not needed after execution. The outcomes persist as conversational context, but the step-by-step instructions themselves become eligible for eviction. Runtimes with context compression should treat completed protocol files as low-priority for retention.
+
+## Session Conduct
+
+These directives are always active during a research-meeting session, regardless of phase. They are not routed to sub-files — they live here because they must be loaded once and remembered throughout.
+
+### Context protection
+
+The main agent's context window is sacred. Any task that would require approximately 40 kb or more of context (reading large files, generating lengthy output, literature searches) must be delegated to a subagent. The main agent preserves its context budget for the ongoing research discussion.
+
+### Discussion discipline
+
+Important conclusions and decisions are written to files, not left in chat history. Quick exchanges stay in the conversation; anything that must survive the session is persisted to durable project files. Use the context-checkpoint protocol for mid-session persistence when needed.
+
+### In-turn mistake capture
+
+When a mistake is identified mid-session — whether by user pushback (a correction in chat) or by self-recognition (the agent notices its own error) — log it immediately as a one-line breadcrumb in the Tier 1 Error Knowledge section of `<project_root>/memory/latest-summary.md`. Do not defer to session close; details fade fast.
+
+1. **Detection.** A correction is signaled by user phrases such as *actually*, *wait*, *no*, *stop*, *wrong*, *that's not*, *let's not*, *don't*, *you missed*, *I'd rather*, *instead*. If a `UserPromptSubmit` hook flags such a phrase, the agent reads the prefilter signal as a candidate; the agent then decides whether the message is actually a correction (model veto on false positives). Self-recognition — for example, after a tool failure traceable to the agent's own misjudgment — is also a valid trigger.
+2. **Breadcrumb format.** Append a single line to the Error Knowledge section:
+
+   ```
+   - <breadcrumb-id>: [unconfirmed] <verbatim user phrase or self-noted issue> [logged YYYY-MM-DD turn N]
+   ```
+
+   `<breadcrumb-id>` is a short kebab-case slug derived from the issue (e.g., `ignored-positive-rule-framing`, `over-bounded-citation-claim`).
+3. **Acknowledgment.** Reply in chat with one line: `logged as <breadcrumb-id>`. No further interruption to the discussion.
+4. **Do NOT write a Tier 2 file mid-turn.** Mid-turn structured writes disrupt flow without benefit. The breadcrumb is enough; promotion to a structured Tier 2 file at `memory/errors/<error-id>.md` happens at session close (`protocols/session-close.md` Step 1.6), with positive "when situation S occurs, do Y" rule conversion at promotion.
+5. **Apologies in chat must accompany, not replace, the breadcrumb.** A brief acknowledgment is fine; the substance lives in the breadcrumb.
+
+The Tier 1 Error Knowledge section is loaded into context at session startup and included unconditionally in every subagent dispatch brief. Promotion at close converts breadcrumbs to retrievable Tier 2 detail files; subagent dispatches retrieve the top-k matching Tier 2 files via hybrid query (see `protocols/subagent-delegation.md` §5).
+
+### Conversational norms
+
+Research-meeting sessions are collaborative discussions. The general "never end a response with a question" rule from central memory does not apply here — the agent may ask clarifying, confirmatory, or exploratory questions as a natural part of the research conversation. Other central memory interaction preferences (conciseness, no unsolicited suggestions) still apply.
+
+### Discussion pacing
+
+Research-meeting turns mimic a real discussion — one idea at a time, paced for back-and-forth. These norms constrain how a turn is structured, supplementing (not replacing) the central-memory preference for concision.
+
+1. **One idea per turn.** Raise the single most important point, then stop. Do not pre-enumerate follow-up points the user has not asked about.
+2. **Long structured content belongs in files, not chat.** Multi-part analyses (rewrites, proposals, comparative tables, option menus) are written to a file under the project root and referenced in one line, not inlined.
+3. **No speculative menus.** Do not offer "option A / option B / option C" before the user signals they want to choose. Ask one question, hear the answer, then advance.
+4. **Exception — explicitly requested summaries.** When the user asks for a summary, plan, or overview, the longer form is appropriate. These norms apply to *unsolicited* structured breakdowns.
+
+**Worked negative example.** Asked to discuss a user's inline comments on a synthesis document, the agent replied with a confirmation, a multi-bucket breakdown categorizing the comments, a sketch of a replacement approach, and several numbered decision questions — roughly 500 words in one turn. This violates norms 1, 2, and 3: the breakdown belongs in a file, and the numbered questions pre-enumerate decisions the user did not ask for. The correct response raises the single most important point and waits.
+
+### Subagent trace rule
+
+Every subagent writes a structured output file following `templates/subagent-report.md`. The main agent reads the Executive Summary section only; the full report is available for reference. This keeps subagent results accessible without bloating the main agent's context. Background subagent outputs that remain unreviewed at session close are flagged during the close protocol.
+
+### Async subagent completions
+
+When a background subagent completes while a discussion is active on an unrelated or subsequent topic, the main agent does not break the current thread to present results.
+
+1. **Do not interrupt.** Async completions do not become a new topic on their own. Continue the current thread.
+2. **One-sentence headline.** Acknowledge completion in at most ~20 words, with a path to the subagent's report — e.g., "Literature scan complete — findings at `subagent-outputs/<timestamp>-lit-scan.md`."
+3. **Do not inline results.** The findings live in the subagent's report file (see Subagent trace rule). The main agent links; it does not paste the Executive Summary or synthesis into chat.
+4. **Wait for explicit request.** Do not raise the subagent's content again until the user asks for it.
+5. **Exception — actionable failure.** If the subagent completed with a failure that blocks the current discussion (e.g., a paper that was about to be discussed could not be acquired), surface it immediately and briefly.
+
+When multiple subagents finish close together, combine them into one compound headline.
+
+### Writing-style retrieval
+
+When the session will produce written artifacts that should carry the user's writing style — manuscript text, review reports, theorem or assumption blocks, polished drafts, research summaries, published documents — load the user's writing-style feedback memories into context before drafting begins.
+
+1. **Trigger: automatic.** When the agent is about to produce, or dispatch a subagent to produce, writing that needs to reflect the user's style, invoke `memory-retriever` with the keyword `"writing"`. Rely on memory-retriever's matching to surface relevant feedback memories (rules about acronyms, em-dashes, restatement, assumption structure, review phrasing, etc.). Do not hard-code specific feedback filenames — the set evolves.
+2. **Timing: once per session if still in context.** Before each new writing-producing phase, check whether the writing-style memories are already in the coordinator's context from an earlier retrieval this session. If they are, no re-retrieval is needed. If context has evicted them, or they were never loaded, retrieve now.
+3. **Subagent handoff.** When dispatching a subagent that will produce writing, pass the retrieved writing-style rules as part of the delegation brief — either inline in the Constraints, or as a referenced context file. Alternatively, instruct the subagent to re-retrieve with the same keyword. Either path works; the choice is per-dispatch and based on context budget. The goal is that the subagent never drafts writing without the user's style rules loaded.
+4. **Silent consumption.** The subagent applies the rules in its output; it does not echo back which rules it consulted. The evidence that retrieval worked is that the output conforms to the user's style, not that the subagent documents its style-check.
+
+Writing-producing phases include: polishing subagent outputs into manuscript-form text; drafting theorem, lemma, or assumption blocks; consolidating trial-document content into manuscript sections; writing review reports; composing polished communications. Phases that do NOT require retrieval: mathematical verification, proof-sketch internal work, subagent coordination, status updates, scratch notes.
+
+### Naming discipline
+
+When writing user-facing labels for assumptions, theorems, lemmas, or techniques, do not coin new names. Default to a numbered identifier ("Assumption 1, 2, ...") with no descriptor; naming is opt-in. When a name is genuinely useful for cross-reference, use only an existing literature term with **multiple-precedent** evidence — at least two distinct published papers using the term for the same concept. If no literature term covers the concept, write a descriptive English phrase in the body and do not invent a label.
+
+Three coining vehicles trigger this rule:
+
+1. **Parenthetical labels** — e.g. `(L1, well-posedness)`. The descriptor must satisfy multiple-precedent or be omitted.
+2. **Bare descriptive phrases functioning as introduced labels** — e.g. "the predictable variation ceiling." A noun phrase introduced as a stand-in for a concept counts as a label even without parenthetical formatting.
+3. **Sub-letter sub-labels** — e.g. `(L1.a)`, `(L1.b)`. If a single condition needs splitting, use separate numbered assumptions instead.
+
+Once a name appears in a draft, re-validate it on every subsequent reference. If a name is later found to be agent-coined, fix the entire downstream chain — coined names spread.
+
+Subagents producing formal labels — paper-reader extractions, manuscript drafting, proof writeups — carry a hard naming-gate in their dispatch brief (see `protocols/subagent-delegation.md` §5 Naming-gate awareness). Other subagent types (paper-discovery, visual-architect, knowledge-maester, citadel-lookup) do not produce formal labels and are unaffected.
+
+For defense in depth, an on-demand **naming audit** can be dispatched: a one-shot subagent scans the working manuscript or draft, lists every introduced named label, classifies each (inherited / descriptive / agent-coined), and flags those needing remediation. Use this when manuscript edits accumulate or when the meeting agent suspects an anchored coining.
+
+This enforces the central-memory rule `feedback_no_fabricated_terminology.md` at the skill level. **Decision (2026-05-09):** soft directive for the meeting agent; hard gate conditioned on label-producing task types for subagents (rather than every dispatch); on-demand audit as defense in depth. If violations recur after rollout, escalate the meeting-agent side to a hard gate.
+
+### Theory graph
+
+When the active project carries a *theory graph* — a project-local vault at `<project_root>/theory/` holding one markdown file per theoretical object (definition, notation, assumption, theorem statement, theorem proof, lemma statement, lemma proof, corollary statement, corollary proof, interpretive remark, case-study verification) — the following directives are always active for the session.
+
+#### Detection
+
+A project carries a theory graph when both of the following hold:
+
+1. `<project_root>/theory/` exists, AND
+2. The directory contains a verifier script (e.g. `check_theory_graph.py`) AND at least one populated theoretical-object subdirectory.
+
+Both conditions are required. A stray `theory/` folder without a verifier or content is not a vault, and every directive in this subsection silently falls inactive in that case. Detection runs once at session start (see `protocols/session-startup.md` Step 5e); the result is fixed for the remainder of the session.
+
+The optional Inputs field `theory_graph_root` overrides auto-detection when provided.
+
+#### Vault is canonical for theoretical content
+
+The vault is the source of truth for theoretical content. The working document (manuscript, draft, paper) is downstream — a published surface translated from the vault. When a session turn touches a theoretical object (drafting, restructuring, fixing, proof-verifying), the vault file is the editing target. The working document is updated as a translation, after the vault edit is verifier-clean. The agent does not modify theoretical content directly in the document.
+
+#### Verifier-clean is a hard gate
+
+The verifier runs over the vault and reports per-check error and warning counts. Each check is classified by the verifier itself as either *structural* (vault/document parity, graph integrity, verbatim drift — these are blocking) or *advisory* (warning-only). The agent does not re-classify; it parses errors and warnings from the verifier's summary line.
+
+**Structural errors block theoretical edits.** When the structural error count is non-zero, the agent does not begin any theoretical-content subagent dispatch and does not write theoretical content into the document. Vault-side cleanup must reduce the count to zero first. Advisory warnings surface but do not gate.
+
+#### Read-before-discuss
+
+Before substantive discussion of a specific theoretical object, the agent reads the corresponding vault file. The trigger is **explicit object reference** in the user turn — a labelled item such as `Theorem N`, `Assumption Lk`, `Lemma N.k`, or a named definition — not heuristic topic detection. For sessions ranging over many objects, the read is amortised: read on the first turn that mentions an object, re-read only on substantive edit.
+
+This is a soft directive on the meeting agent, parallel to the soft-side of Naming discipline. The hard gate lives on subagent dispatches (see `protocols/subagent-delegation.md` §5 Vault-first awareness).
+
+#### Cross-reference
+
+The underlying motivation for the vault-first workflow lives in the central-memory rule `feedback_theory_graph_first_protocol.md`. This subsection is the operational form. Naming discipline (above) enforces label integrity; the theory graph enforces content integrity. The two directives are orthogonal and contribute independently to every theoretical-content subagent brief.
+
+#### Scaffolding on request
+
+When the user asks the agent to scaffold a theory graph for the active project (conversational cue, no input field), the agent loads `protocols/theory-graph-scaffold.md` and follows it. The scaffolder lays the canonical directory tree under `<project_root>/theory/`, drops a project-agnostic verifier copy with substituted defaults, writes `_meta/config.yaml` plus severity overrides, seeds a single `notation/_stub.md` to satisfy the detection signature, and optionally installs a `SessionStart` hook at `<project_root>/.claude/settings.json`.
+
+Scaffolding is one-shot per project. Re-invoking on a project that already has a vault triggers the protocol's refuse-to-overwrite rule (abort, augment, or two-step-confirmed overwrite). The scaffolder is the one operation exempt from the Vault-first hard gate — it brings the canonical surface into existence rather than editing inside one (see `protocols/subagent-delegation.md` §5 Vault-first awareness).
+
+After scaffolding, `theory-vault-writer` `add-object` authors the first real theoretical node, which removes the scaffold stub automatically.
+
+#### Lean translation (optional)
+
+A project with a theory graph may additionally opt into Lean 4 verification of its vault proof nodes via the `lean-translator` skill (`~/Documents/skills/research-session/lean-translator/`). When the user invokes the skill's `scaffold-lean-project` operation, the project gains a per-vault Lean workspace at `<project_root>/theory/lean/` paralleling the vault subdirectory structure. The skill then provides operations for vault triage (`audit`), per-node translation (`translate`), compile-state verification (`verify`), and failure-rollup surfacing (`digest`).
+
+Lean verification is **advisory only**. It never blocks vault edits, never blocks subagent dispatch, and does not enter the structural-verifier hard gate from the Theory graph subsection above. Failures and pending-review states surface through two channels: when the user asks mid-session (pull, via `digest`), and at the start of the next session via the handoff's optional `## Lean status` section (push). Failures are **not** surfaced at session close — the user has time and energy to react at session start, not at wind-down.
+
+The `lean-translator` skill ships with a statement-parity human gate: every translator dispatch that produces a compiling Lean file leaves the vault node at `verified-pending-review` until the user approves that the Lean statement faithfully captures the vault statement. Only on approval does the badge flip to `verified`. This gate is the mitigation for silent semantic drift — Lean compiling against ad-hoc local definitions that do not reflect the source theorem.
+
+For the full operation specifications, see `~/Documents/skills/research-session/lean-translator/SKILL.md`.
+
+### Memory-retriever auto-triggers (mid-session)
+
+Beyond the writing-style retrieval (above) and the session-startup retrieval, `memory-retriever` is invoked automatically at two named inflection points during a session. Each trigger uses **hybrid query construction**: the agent rewrites the trigger context into 2–4 focused sub-queries; deterministic vector retrieval then runs against `memory-retriever` over those sub-queries. The query rewrite is LLM-side; the retrieval over the rewritten queries is deterministic.
+
+1. **Pre-subagent-dispatch (mandatory).** Fires before every subagent dispatch. Query inputs: the dispatched task description and the subagent's role. Output is folded into the brief's Context Files section alongside the unconditional Tier 1 + top-k Tier 2 error-knowledge surface (see `protocols/subagent-delegation.md` §5). This is the keystone trigger — pre-dispatch is the most consequential inflection point in a session, and missed retrieval here costs the most downstream because the subagent runs in isolation.
+2. **Pre-substantive-design-recommendation (explicit-signal-gated).** Fires when the user's message contains explicit cues such as "how should we", "what do you think", "what's the best way to", "let's discuss", or other clear opens for a design question. Query input: the topic of the design question. Output is consulted by the meeting agent before drafting its recommendation. The trigger is gated on explicit user signals, not on automatic topic-shift detection — dialogue-segmentation classifiers are not yet reliable enough to drive auto-retrieval in production agent frameworks.
+
+#### Surfacing format
+
+When a trigger fires and returns N memories, the agent surfaces a single bracketed line in chat after retrieval:
+
+```
+[memory: N entries on <topic> — flag if surprising]
+```
+
+Suppress the line when N = 0 or when all returned memories were already loaded earlier in the session. Session-level dedup is the retriever's responsibility (see `memory-retriever/SKILL.md`).
+
+#### What is NOT a trigger
+
+- **Topic-shift detection.** Automatic dialogue-segmentation is not reliable enough to drive retrieval; rely on explicit user signals (the "let's discuss" cues above) instead.
+- **Every user turn.** Per-turn retrieval over-retrieves and degrades answer quality past a point. The named triggers fire on inflection moments only, not continuously.
+
+The session-startup retrieval handles bootstrap context. The writing-style retrieval handles writing-producing phases. These two triggers handle the remaining discussion-time inflection points.
+
+### Pipeline results at startup
+
+If a literature pipeline has active results (discovery queue, completed synthesis), the group lead presents a brief summary during the opening ritual. The full results are in `pipeline/` — do not load them into the main context unless the user asks.
+
+### Health digest at startup
+
+If a recent health digest exists, the group lead reads the "Alerts" and "Suggested Actions" sections and presents them. The full digest stays on disk.
+
+### Voice mode acknowledgment
+
+If the user activates `/voice`, the group lead acknowledges it and reminds the user of the hybrid input norms: speak for discussion, type for equations and code. For the full voice conduct norms, see `protocols/voice-input.md` (norms V1–V4).
+
+### Voice input awareness and cleanup
+
+Voice transcription introduces routine errors. The agent treats every user message as potentially voice-transcribed, applies cleanup against two glossaries, and surfaces every cleanup explicitly in chat. The behavior is **always active**, not gated on `/voice` activation, because voice-vs-keyboard detection is heuristic and the matcher must have data available before classifying any given message.
+
+#### Glossaries (loaded at session start)
+
+Two glossaries feed the cleanup matcher:
+
+1. **Central memory — universal personal pronunciation patterns.** `~/.claude/projects/<project-dir>/memory/feedback_voice_input_patterns.md`. Cross-project user-level patterns (e.g., the user pronouncing "skill" as `scale`). Loaded by `protocols/session-startup.md` Step 5d via a hardcoded Read — not via `memory-retriever` keyword pull.
+2. **Per-project — project-specific terms.** `<project_root>/voice-glossary.yaml`. Paper authors, assumption labels, technique names, manuscript math vocabulary, any project-bound terminology. Loaded at Step 5d if present.
+
+The matcher consults both. **Central-memory entries win on conflict.**
+
+#### Cleanup discipline
+
+1. **Phonetic-distance gate.** Apply cleanup only when phonetic similarity (Metaphone / Double Metaphone) is below threshold. Edit-distance similarity alone (e.g., `distraction` → `direction` — short edit distance, phonetically distinct) is not enough to trigger a cleanup.
+2. **Surface every cleanup.** For every applied cleanup, render in chat: `voice cleanup: '<transcribed>' → '<intended>' (matched: <pattern-name>)`. Never silently rewrite — the user's review is ground truth, and silent rewriting compounds errors invisibly.
+3. **Anchoring evidence.** When the cleanup matches a glossary entry, cite the source. Unanchored guesses are flagged as guesses, not as glossary matches.
+4. **When uncertain, do not correct — ask.**
+
+#### Voice-vs-keyboard detection
+
+The agent classifies each message as voice or typed:
+
+- **Voice indicators:** repetition disfluency (`let me let me ...`), colloquial / run-on structure, sparse or missing punctuation, near-homophone density, conversational fillers.
+- **Keyboard indicators:** explicit `this is typed` sentinel, terse command-style phrasing, code blocks, file paths, structured pasted content.
+- **When indicators conflict or are absent:** ask once — `voice or typed?` — and use the answer for the rest of that message stream.
+
+Cleanup is applied only to messages classified as voice. The user does not habitually announce voice input; heuristics carry the load.
+
+#### Promotion of new patterns
+
+Cross-project personal pronunciation patterns observed during the session are promoted to the central-memory file by `experience-logger` at session close per its promotion gate (judgment-based, harsh-bias toward exclusion — see `experience-logger/SKILL.md` § Voice Input Pattern Promotion). Project-specific terms are added to the per-project `voice-glossary.yaml` directly during the session by the meeting agent.
+
+See `protocols/voice-input.md` Tier 2 for the matcher mechanics, glossary schema, and maintenance protocol.
+
+## Protocol Routing
+
+The agent determines the current session phase from conversational context. Phase detection is implicit — there is no explicit `session_phase` parameter.
+
+| Phase | Protocol File | When to Load |
+|-------|--------------|--------------|
+| startup | `protocols/session-startup.md` | Beginning of session, before any discussion. |
+| checkpoint | `protocols/context-checkpoint.md` | When the user asks to persist progress mid-session. |
+| close | `protocols/session-close.md` | When the user signals session end, or when the agent determines the agenda is exhausted. |
+| delegation | `protocols/subagent-delegation.md` | Before spawning any subagent. |
+| multi-agent | `protocols/multi-agent-session.md` | When the user opts in to multi-agent mode. Loaded once at session start alongside startup. *(Opt-in — single-agent is the default.)* |
+| specialist-init | `protocols/specialist-initialization.md` | When initializing specialist agents for a multi-agent session. Loaded after multi-agent protocol. |
+| pipeline | `protocols/literature-pipeline.md` | When the user requests a literature review run, or when presenting pipeline results at session start. |
+| health | `protocols/health-digest.md` | When generating or presenting a health digest. |
+| voice | `protocols/voice-input.md` | When voice mode is active (loaded at session start if `/voice` is detected or user mentions voice). |
+
+### Phase transitions
+
+- **Startup → Active discussion:** The startup protocol completes. The agent operates under this file's Session Conduct directives. No additional protocol file is loaded.
+- **Startup → Multi-agent init:** When the user opts in to multi-agent mode during startup, the agent loads `protocols/multi-agent-session.md` and then `protocols/specialist-initialization.md` to spawn and initialize specialist agents before entering active discussion.
+- **Active discussion → Close:** The user says something like "let's wrap up" or the agent has no more agenda items. The agent loads the close protocol and follows it.
+- **Active discussion → Checkpoint:** The user asks to persist progress mid-session. The agent loads the checkpoint protocol, executes it, and returns to active discussion.
+
+When the startup protocol finishes and the agent transitions to active discussion, Session Conduct (this file) is the persistent authority. If any protocol file and Session Conduct give conflicting guidance, Session Conduct takes precedence.
+
+### Multi-agent mode
+
+Multi-agent mode is **opt-in**. The default session mode is single-agent (one group lead, no persistent specialists). The user activates multi-agent mode by requesting it during session startup — for example, "let's run this as a multi-agent session" or "bring in the specialists."
+
+When multi-agent mode is active, the group lead loads the multi-agent session protocol and the specialist initialization protocol in sequence. Specialist role definitions are read from `roles/<specialist-name>.md`.
+
+### Model assignment defaults
+
+When running in multi-agent mode, the following model assignments apply unless the user overrides them:
+
+| Role | Default Model | Rationale |
+|------|---------------|-----------|
+| Group Lead (Coordinator) | Opus | Best reasoning for synthesis, turn management, and discussion control. |
+| Specialists | Sonnet | Good domain reasoning at lower cost. Sufficient context for session-long persistence. |
+| One-shot subagents | Sonnet or Haiku | Haiku for exploration/search tasks. Sonnet for reasoning tasks. |
+
+Model names refer to Claude model families. The group lead uses these defaults when constructing specialist initialization prompts. The user may override assignments per-specialist or per-session.
+
+## Project Summary Format (`memory/latest-summary.md`)
+
+The project summary is the project's institutional memory — a single file that captures accumulated understanding across all sessions. It is distinct from the session handoff (which serves onboarding for the next session). The summary is a living document that grows incrementally; the handoff is a disposable snapshot written for the next session's bootstrap.
+
+### Content Schema
+
+The summary contains exactly 7 sections in fixed order. Each has a line budget (soft limit). Exceeding a budget triggers compaction.
+
+| # | Section | Line Budget | Purpose |
+|---|---------|-------------|---------|
+| 1 | Project Identity | 5–8 | Project name, one-line mission, domain, creation date. Rarely changes after creation. |
+| 2 | Architectural State | 10–20 | Current technical architecture, key components, data flow. Updated when architecture changes. |
+| 3 | Key Findings | 15–25 | Important research results, validated hypotheses, significant observations. Append-only within a session. |
+| 4 | Active Decisions Log | 10–20 | Decisions currently in effect with brief rationale. Superseded decisions are compacted out. |
+| 5 | Error Knowledge | 8–15 | Compact index of recurring errors and known failure modes. Two-tier system (see below). |
+| 6 | Current State | 5–10 | What was last worked on, what is next, overall project health. Updated every session close. |
+| 7 | Open Questions | 5–15 | Unresolved questions, uncertainties, things to investigate. Items are added and resolved over time. |
+
+**Total budget:** ~58–113 lines. Target: under 100 lines for most projects.
+
+All 7 section headers are permanent — they are never removed, reordered, or renamed. An empty section uses `None.` as its sole content line.
+
+### Update Protocol: Anchored Iterative Extension
+
+The project summary is **never rewritten from scratch**. Updates follow the anchored iterative extension protocol:
+
+1. **Read** the existing summary in full before making any changes.
+2. **Anchor** on the existing section structure — all 7 section headers are permanent anchors that define the document skeleton.
+3. **Identify** which sections need changes based on the current session's outcomes.
+4. **Extend** by appending new entries within the appropriate section or updating existing entries in place.
+5. **Compact** by removing or condensing entries that are superseded, resolved, or no longer relevant — but only within sections being updated.
+6. **Write** the complete file back with the targeted edits applied.
+
+Rules:
+- Never delete a section header, even if the section is empty.
+- Never reorder sections — the 7-section sequence is fixed.
+- Never discard information that has no replacement — if a finding is removed, it must be because a later finding supersedes it.
+- Each update pass touches only the sections affected by the current session. Sections with no changes are passed through verbatim.
+
+### Error Knowledge Two-Tier System
+
+Error knowledge uses a two-tier structure to keep the summary compact while preserving full diagnostic context.
+
+**Tier 1 — Summary entries** (in the Error Knowledge section of `memory/latest-summary.md`)
+
+Each entry is a single line:
+```
+- `<error-id>`: <one-line description> → <resolution or status> [detail: memory/errors/<error-id>.md]
+```
+
+The `[detail: ...]` suffix is present only when a Tier 2 file exists.
+
+**Tier 2 — Detail files** (in `memory/errors/`)
+
+Each significant error gets a dedicated file at `memory/errors/<error-id>.md` containing:
+- Full error message or stack trace.
+- Context: what was being attempted when the error occurred.
+- Root cause analysis.
+- Resolution steps taken.
+- Prevention notes for future sessions.
+
+**Tier rules:**
+- Every Tier 2 file must have a corresponding Tier 1 entry. The summary section is the authoritative index.
+- Tier 1 entries may exist without a Tier 2 file for trivial or transient errors that did not require investigation.
+- A Tier 2 file is created when the error required investigation beyond a simple retry.
+- When the Error Knowledge section exceeds its line budget, the oldest resolved entries are removed from Tier 1. Tier 2 detail files are retained for archaeology.
+- Error IDs are short, descriptive, kebab-case identifiers (e.g., `latex-bib-missing`, `sim-oom-large-grid`).
+
+### Compaction Rules
+
+Compaction keeps the summary within its line budgets. It is performed during session close (Step 1.7) or during a maintenance session.
+
+**Per-section compaction** — triggered when a section exceeds its line budget by 50% or more:
+- Merge redundant entries.
+- Remove resolved items from Open Questions and Active Decisions Log.
+- Condense Key Findings entries that have been superseded by later findings.
+- Archive resolved Error Knowledge Tier 1 entries (Tier 2 files persist).
+- Never compact Project Identity — this section is effectively immutable after creation.
+
+**Full compaction** — triggered when the total summary exceeds 120 lines:
+- Apply per-section compaction to all sections.
+- If still over budget after per-section compaction, recommend a maintenance session.
+
+**Maintenance session triggers** (recommendation, not automatic):
+- The summary has exceeded its total line budget for 2+ consecutive session closes.
+- The `memory/errors/` directory contains 10+ detail files.
+- The user explicitly requests cleanup.
+
+The maintenance session protocol is defined in the Maintenance Session Protocol section below.
+
+## Maintenance Session Protocol
+
+A maintenance session is a special-purpose research-meeting session dedicated to housekeeping rather than research. It restores the project's persistent artifacts to a clean, compact state so that future sessions start efficiently.
+
+### Trigger Conditions
+
+A maintenance session is recommended (never automatic) when any of the following conditions are met:
+
+1. **Consecutive budget overruns** — The project summary (`memory/latest-summary.md`) has exceeded its total line budget (120 lines) for 2 or more consecutive session closes.
+2. **Error file accumulation** — The `memory/errors/` directory contains 10 or more Tier 2 detail files.
+3. **User request** — The user explicitly asks for a cleanup or maintenance session.
+4. **Vault health degradation** *(applies when a theory graph is present)* — The verifier has reported non-zero structural errors at 2 or more consecutive session closes, OR the advisory warning count has grown beyond its session-baseline threshold (default: warnings have at least doubled since the last clean reading; tunable as live use settles).
+
+The agent may suggest a maintenance session when it detects any of conditions 1, 2, or 4 during session startup or close. The user decides whether to proceed.
+
+### Protocol Steps
+
+When running a maintenance session, execute the following steps in order:
+
+#### Step 1 — Full Compaction
+
+Apply per-section compaction to all 7 sections of `memory/latest-summary.md`, regardless of whether individual sections have exceeded their budgets:
+
+- Merge redundant entries across all sections.
+- Remove resolved items from Open Questions and Active Decisions Log.
+- Condense Key Findings entries that have been superseded by later findings.
+- Archive resolved Error Knowledge Tier 1 entries (Tier 2 files persist).
+- Never compact Project Identity — this section is effectively immutable after creation.
+- Target: bring the total summary under 100 lines.
+
+#### Step 2 — Error Index Review
+
+Audit the two-tier error knowledge system:
+
+- Review all Tier 1 entries in the Error Knowledge section. Remove entries for errors that are fully resolved and unlikely to recur.
+- Review all Tier 2 files in `memory/errors/`. Flag files whose corresponding Tier 1 entry was removed — these files are retained for archaeology but should not have dangling references.
+- Ensure every Tier 2 file has a corresponding Tier 1 entry (or was explicitly archived in Step 1).
+- If error files exceed 10, identify candidates for deletion: fully resolved errors with no pattern value. Confirm deletions with the user before proceeding.
+
+#### Step 2.5 — Vault Audit (when triggered)
+
+*Executed when the maintenance session was triggered by condition 4, or when a vault is present and the user requests a full review.*
+
+Run the vault verifier in full (all checks, no abbreviation) and classify findings:
+
+- **Structural drift** — verifier reports a structural error: vault/document parity mismatch, missing vault node for a document-labelled object, broken wikilink, undeclared symbol.
+- **Verbatim drift** — vault body and document body diverge after canonicalisation of comment syntax and spacing commands.
+- **Orphan vault node** — a vault file with no corresponding labelled object in the working document.
+- **Stale anchor** — vault frontmatter `document_anchor` points to a path or label that no longer exists in the working document.
+
+Produce a remediation list grouped by classification, with one line per finding (file, classification, brief diagnostic, suggested remediation). Surface the list to the user; remediation decisions are made together.
+
+A **content second pass** — content drift the verifier cannot detect, where statements compile and parse but no longer reflect the intended object — is **not** part of this automatic audit. Content audit is a user-queued task and must be requested explicitly.
+
+#### Step 3 — Open Question Cleanup
+
+Review the Open Questions section of the project summary and all session histories for unresolved questions:
+
+- Resolve questions that have been answered by later sessions (mark as resolved, remove from summary).
+- Consolidate duplicate or overlapping questions.
+- Re-prioritize remaining questions based on current project direction.
+- Move stale questions (unaddressed for 5+ sessions) to a `Parked` annotation at the end of the Open Questions section, or remove them with user confirmation.
+
+#### Step 4 — Memory Promotion Review
+
+Review the project's accumulated knowledge for candidates that should be promoted to central memory:
+
+- Scan Key Findings, Active Decisions, and Error Knowledge for entries that generalize beyond this project.
+- Present promotion candidates to the user with a brief rationale for each.
+- If the user approves, note the candidates for the memory-management capability to process. The research-meeting skill does not write to central memory directly.
+
+### Session History for Maintenance Sessions
+
+A maintenance session produces a session history like any other session. Use the tag `maintenance` (register it in `sessions/_tags.md` if not already present). The session history records what was compacted, reviewed, cleaned up, and any promotion candidates identified.
+
+### Constraints
+
+- A maintenance session does not advance research. If the user raises a research topic during maintenance, suggest deferring it to the next regular session.
+- All compaction and cleanup edits follow the anchored iterative extension protocol — the same update rules that apply to regular session closes.
+- Memory promotion is a recommendation step only. This skill identifies candidates; the memory-management capability handles the actual promotion to central memory.
+
+## Session History Format (`sessions/YYYY-MM-DD-NNN.md`)
+
+Session histories are the factual, write-once record of what happened during each research-meeting session. They are distinct from experience logs — session histories capture _what happened_ while experience logs capture _what was learned_. These are fully independent systems; never combine or derive one from the other.
+
+### File Location
+
+Each session history file lives at:
+
+```
+<project_root>/sessions/YYYY-MM-DD-NNN.md
+```
+
+- `YYYY-MM-DD` — the date the session took place.
+- `NNN` — a zero-padded sequence number for the day (e.g., `001`, `002`), allowing multiple sessions per day.
+
+### Frontmatter Schema
+
+Every session history file begins with YAML frontmatter:
+
+```yaml
+---
+session_id: "YYYY-MM-DD-NNN"
+date: YYYY-MM-DD
+project: "<active_project>"
+session_label: "<brief human-readable label>"
+status: "completed" | "interrupted" | "aborted"
+tags:
+  - <tag>
+  - <tag>
+---
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Matches the filename stem. Unique identifier for this session. |
+| `date` | date | yes | ISO 8601 date of the session. |
+| `project` | string | yes | The `active_project` name. |
+| `session_label` | string | yes | Short, human-readable description of the session's focus (e.g., "simulation parameter sweep design"). |
+| `status` | enum | yes | One of `completed`, `interrupted`, or `aborted`. `completed` = normal close protocol ran. `interrupted` = session ended before close protocol could finish. `aborted` = session ended before meaningful work occurred. |
+| `tags` | list of strings | no | Tags from the tag registry (`sessions/_tags.md`). Used for filtering and retrieval. |
+
+### Required Sections
+
+Every session history file contains these 8 sections in fixed order. An empty section uses `None.` as its sole content line. Section headers are never removed, reordered, or renamed.
+
+| # | Section | Description |
+|---|---------|-------------|
+| 1 | **Objective** | What the session set out to accomplish. Taken from the opening ritual or user's stated goal. |
+| 2 | **Summary** | 2–5 sentence narrative of what actually happened during the session. |
+| 3 | **Decisions** | Each decision made, with rationale and any dissenting considerations noted. |
+| 4 | **Changes Made** | Files created, modified, or deleted during the session, with brief descriptions. |
+| 5 | **Errors Encountered** | Errors that occurred and how they were resolved (or not). References Tier 2 error files if applicable. |
+| 6 | **Findings and Insights** | Research observations, results, or conceptual breakthroughs from the session. |
+| 7 | **Open Questions** | Questions raised but not resolved during the session. |
+| 8 | **Next Steps** | Concrete actions to take in future sessions, derived from this session's work. |
+
+### Optional Sections
+
+These sections are included only when relevant. They appear after the 8 required sections, in the order listed.
+
+| Section | When to Include | Description |
+|---------|----------------|-------------|
+| **Subagent Dispatches** | When subagents were invoked during the session. | Summary of each subagent dispatch: task delegated, output file path, key results. _(Full subagent dispatch protocol is Phase 3 scope — M7.)_ |
+| **Literature Discussed** | When papers, articles, or other literature were referenced or discussed. | Citation keys or references, with brief notes on relevance to the session. |
+
+### Template
+
+```md
+---
+session_id: "YYYY-MM-DD-NNN"
+date: YYYY-MM-DD
+project: "<active_project>"
+session_label: "<label>"
+status: completed
+tags:
+  - <tag>
+---
+
+# Session History — YYYY-MM-DD-NNN
+
+## Objective
+
+<What this session set out to accomplish.>
+
+## Summary
+
+<2–5 sentence narrative of what happened.>
+
+## Decisions
+
+- **Decision:** <what was decided>
+  **Rationale:** <why>
+
+## Changes Made
+
+- `path/to/file` — description of change.
+
+## Errors Encountered
+
+None.
+
+## Findings and Insights
+
+- <observation or result>
+
+## Open Questions
+
+- <unresolved question>
+
+## Next Steps
+
+- <concrete action for future sessions>
+```
+
+### Tag Registry (`sessions/_tags.md`)
+
+Tags provide a lightweight classification system for filtering and retrieving session histories. All tags used in session frontmatter must be registered in `sessions/_tags.md`.
+
+The tag registry file lives at:
+
+```
+<project_root>/sessions/_tags.md
+```
+
+#### Registry Format
+
+```md
+# Session Tags
+
+## Domain Tags
+- `<tag-name>` — <one-line description>
+
+## Activity Tags
+- `<tag-name>` — <one-line description>
+
+## Status Tags
+- `<tag-name>` — <one-line description>
+```
+
+#### Registry Rules
+
+- Tags are lowercase, kebab-case identifiers (e.g., `simulation-design`, `literature-review`, `bug-fix`).
+- Every tag has a one-line description explaining when to apply it.
+- Tags are organized into three categories:
+  - **Domain tags** — the research topic or subarea (e.g., `point-process`, `bayesian-inference`).
+  - **Activity tags** — what kind of work was done (e.g., `experiment-design`, `data-analysis`, `code-review`, `literature-review`).
+  - **Status tags** — session outcome signals (e.g., `breakthrough`, `blocked`, `routine`).
+- New tags may be added at any time by appending to the appropriate category. Tags are never removed — only deprecated by adding `(deprecated)` to the description.
+- A session should use 1–5 tags. Prefer specificity over exhaustiveness.
+
+### Write-Once Immutability
+
+Session history files are **write-once**: once a session history is written during the close protocol, its content is considered immutable. This ensures that session histories are a reliable, tamper-evident record of what happened.
+
+#### Post-Session Correction Exception
+
+The sole exception to write-once immutability is **post-session corrections**, which are permitted under these conditions:
+
+1. **Factual error** — the session history contains a demonstrably incorrect statement of fact (e.g., a wrong file path, a misattributed decision, an incorrect date).
+2. **Correction, not revision** — the change corrects a factual error. It does not add new information, reinterpret decisions, or revise the narrative with hindsight.
+3. **Correction block** — every correction is appended as a clearly marked correction block at the end of the file, preserving the original text:
+
+```md
+---
+
+## Corrections
+
+- **Corrected YYYY-MM-DD:** <section> — <what was wrong> → <what is correct>.
+```
+
+4. **Original text preserved** — the original text in the body is not modified. The correction block serves as an erratum that readers apply mentally. This preserves the write-once property of the original content while allowing factual errors to be flagged.
+
+#### What is NOT a valid correction
+
+- Adding information that was omitted from the original session history.
+- Rewriting a decision's rationale based on later outcomes.
+- Changing tags or session_label after the fact (unless the original was factually wrong).
+- Any change motivated by "we now know better" rather than "this was wrong at the time."

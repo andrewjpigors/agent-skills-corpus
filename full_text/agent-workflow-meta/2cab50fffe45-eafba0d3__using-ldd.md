@@ -1,0 +1,739 @@
+---
+name: using-ldd
+description: Use whenever the user prefixes a message with "LDD:" or mentions LDD, loss-driven development, loss, gradient, SGD on code, drift, refinement loop, outer loop, inner loop, method evolution, or "apply LDD". Bootstrap / entry-point skill that explains how to dispatch the other LDD skills and the trigger-phrase table they respond to.
+---
+
+# Using LDD — the bundle entry-point for **Gradient Descent for Agents**
+
+## The Metaphor
+
+**The conductor before the orchestra.** Twelve instruments sit ready — violins ([`reproducibility-first`](../reproducibility-first/SKILL.md)), brass ([`root-cause-by-layer`](../root-cause-by-layer/SKILL.md)), percussion ([`loss-backprop-lens`](../loss-backprop-lens/SKILL.md)), a vocalist who sings counter-arguments ([`dialectical-reasoning`](../dialectical-reasoning/SKILL.md)), a second vocalist who sings the per-step dialectic for reasoning chains ([`dialectical-cot`](../dialectical-cot/SKILL.md)). The conductor plays none of them. She picks *which* and *when* each enters, watches the composition (the loss curve), and cues the next instrument from the score (the trace). `using-ldd` is the conductor. Every other skill is an instrument on one of the four axes of the gradient descent.
+
+## Overview
+
+Loss-Driven Development (LDD) is **[Gradient Descent for Agents](../../docs/theory.md)** — a twelve-skill bundle that treats code changes, output revisions, skill edits, and reasoning steps as SGD steps on four distinct parameter spaces, and forbids overfitting to the current test. This entry-skill exists so you (the agent) know **when to reach for which LDD skill** without the user having to name each one by hand. It also owns the [thinking-levels auto-dispatch](../../docs/ldd/thinking-levels.md) (v0.10.1), the step-size controller that picks rigor (L0…L4) per task before any gradient descends.
+
+**Core principle:** if the user prefixes their message with `LDD:` or mentions any of the trigger phrases below, LDD discipline is explicitly requested. Match their intent to the right sub-skill and announce which one you are applying. The four-loop structure is:
+
+- **Inner** (`θ` = code, `∂L/∂code`) — [`reproducibility-first`](../reproducibility-first/SKILL.md), [`root-cause-by-layer`](../root-cause-by-layer/SKILL.md), [`loss-backprop-lens`](../loss-backprop-lens/SKILL.md), [`e2e-driven-iteration`](../e2e-driven-iteration/SKILL.md), [`loop-driven-engineering`](../loop-driven-engineering/SKILL.md)
+- **Refinement** (`y` = deliverable, `∂L/∂output`) — [`iterative-refinement`](../iterative-refinement/SKILL.md)
+- **Outer** (`m` = method, `∂L/∂method`) — [`method-evolution`](../method-evolution/SKILL.md), [`drift-detection`](../drift-detection/SKILL.md)
+- **CoT** (`t` = reasoning chain, `∂L/∂thought`) — [`dialectical-cot`](../dialectical-cot/SKILL.md)
+- **Cross-cutting** — [`dialectical-reasoning`](../dialectical-reasoning/SKILL.md), [`docs-as-definition-of-done`](../docs-as-definition-of-done/SKILL.md), [`define-metric`](../define-metric/SKILL.md)
+- **Opt-in** — [`architect-mode`](../architect-mode/SKILL.md) (5-phase greenfield discipline; reached via L3/L4 preset or explicit flag)
+
+## Trigger phrases (user → skill mapping)
+
+When the user's message contains any of these patterns, invoke the paired skill.
+
+| User signal | Invoke |
+|---|---|
+| `LDD:` prefix, "apply LDD", "use LDD" | Enter full LDD mode — default entry = `loop-driven-engineering` unless a more specific sub-skill matches below |
+| "failing test", "CI is red", "flaky", "one-off failure", "intermittent" | First `reproducibility-first`, then `root-cause-by-layer` if the failure is real |
+| "bug", "error", "exception", "unexpected behavior", "why is this breaking" | `root-cause-by-layer` |
+| "I've tried this 3 times", "keeps failing the same way", five fix-commits in one area | `loss-backprop-lens` (local-minimum trap) |
+| "this fix works but I'm not sure it generalizes", "will this break sibling tests" | `loss-backprop-lens` (generalization check) |
+| "I'm mid-debug", "is the fix done yet", before closing any fix-loop | `e2e-driven-iteration` |
+| "should we ship this", "is this the right approach", design trade-off | `dialectical-reasoning` |
+| "this doc/diff/output is okay but could be better", "polish this" | `iterative-refinement` |
+| "same thing keeps happening across tasks", "the skill itself might be wrong" | `method-evolution` |
+| "is this codebase healthy", release-candidate review, weekly check | `drift-detection` |
+| "about to commit", "ready to merge", "declaring this done" | `docs-as-definition-of-done` |
+| "design X", "architect Y", "greenfield", "from scratch", "how should I structure", "propose an architecture", "decompose this problem", "what's the right shape for X" | `architect-mode` (opt-in — three paths: inline `LDD[level=L3]:` / `/ldd-architect` command / these trigger phrases — plus the auto-dispatch scorer landing at L3/L4; see skill for the 5-phase protocol and the hand-off back to reactive) |
+
+### Precedence when multiple rows match (v0.13.1)
+
+A single user message may hit multiple rows — e.g. `"bug: I've tried this 3 times"` matches both the generic `"bug"` row (→ `root-cause-by-layer`) **and** the specific `"I've tried this 3 times"` row (→ `loss-backprop-lens`). Two rules resolve the conflict, applied in order:
+
+1. **Specificity wins.** Longer / more literal triggers beat shorter / more generic ones. `"I've tried this 3 times"` is more specific than `"bug"` — `loss-backprop-lens` fires first because the agent has *already* diagnosed + fixed three times and the meta-signal is "the local-fix strategy is stuck," not "find the bug."
+2. **Table order is the tiebreaker.** On equal specificity, the upper row wins. The table is ordered from narrowest-scope (reproducibility check — must run before any gradient use) to broadest-scope (architect-mode — whole-design discipline).
+
+When the primary skill completes but the *other* matches still apply (e.g. `loss-backprop-lens` diagnoses a local-minimum trap → the agent now needs a fresh structural pass), the agent **MAY** chain-invoke the secondary skill in the same iteration, and must announce both invocations explicitly per §"Announcing skill invocation." Chains of ≥ 3 skills in one iteration are a red flag (the iteration is doing too much; split it).
+
+Mutual exclusion on the same error: once `root-cause-by-layer` has closed with a named structural/conceptual origin, `loss-backprop-lens` must NOT re-invoke on the *same* error signal within that task — the structural diagnosis is the gradient; re-running the meta-lens on it produces oscillation. Inversely, once `loss-backprop-lens` has declared a local-minimum trap, a fourth `root-cause-by-layer` invocation on the unchanged error must NOT fire — escalate to architectural rethink per `loop-driven-engineering` § Escalation.
+
+## Auto-dispatch: thinking-levels
+
+Every non-trivial task enters the LDD bundle through a **level scorer** that picks one of five thinking levels (L0..L4) and emits a mandatory dispatch-header line. The user does not need to configure anything; the scorer runs on the task text. The user also does not need to know the scorer exists — an override is a single inline token away (see §Override syntax below).
+
+**Default is L2, not L0.** Zero-config users get a deliberate baseline — one rank above reflexive pattern-matching — because **"lieber ein klein wenig schlau als zu dumm"** (asymmetric loss: a low-side miss ships a silent symptom-patch; a high-side miss wastes tokens). The scorer is designed to bias upward on boundaries.
+
+### The 5 levels
+
+The **Name** column is the canonical human-readable label. Every display of a
+level (dispatch header, trace log meta line, statusline) uses the combined
+`L<n>/<name>` form — e.g. `L3/structural`. The old separate `mode=reactive /
+architect` axis is **derived** from the level (L0–L2 ⇒ reactive, L3/L4 ⇒
+architect) and is no longer displayed or user-facing (v0.11.0).
+
+| Level | Name | Preset — `k_max` / `reproduce_runs` | Creativity applies? | Skill floor (minimum set invoked) |
+|---|---|---|---|---|
+| **L0** | `reflex` | 2 / 1 | no | `e2e-driven-iteration` |
+| **L1** | `diagnostic` | 3 / 2 | no | + `reproducibility-first`, `root-cause-by-layer` |
+| **L2** | `deliberate` *(default baseline)* | 5 / 2 | no | + `dialectical-reasoning`, `loss-backprop-lens`, `docs-as-definition-of-done` |
+| **L3** | `structural` | 5 / 2 | yes — defaults to `standard` | + `architect-mode` (standard), `drift-detection`, `iterative-refinement` |
+| **L4** | `method` | 8 / 3 | yes — defaults to `inventive` (ack-gated) | + `method-evolution`, `dialectical-cot`, `define-metric` |
+
+**Skill floor is a floor, not a ceiling.** A task at L2 that benefits from `drift-detection` may still invoke it; a task at L3 is **not allowed to skip** `architect-mode`.
+
+The `architect-mode` skill's 5-phase protocol is active automatically at L3/L4 — there is no separate `mode=architect` axis to set. Score the task; if it lands at L3 or L4, architect-mode is active by preset.
+
+### The 9-signal scorer
+
+Deterministic, pure function of the task text plus (optional) history of recently-touched files. No LLM call. Reference implementation: [`../../scripts/level_scorer.py`](../../scripts/level_scorer.py).
+
+| Signal | Weight | Detect via |
+|---|---|---|
+| Greenfield (`"from scratch"`, `"new service"`, `"new module"`, `"no existing code"`, `"design a new"`) | **+3** | literal phrase match |
+| ≥ 3 new components (≥ 2 matches of the components pattern, or ≥ 3 distinct `"new <noun>"` phrases) | **+2** | pattern / noun count |
+| Cross-layer (`"across"`, `"between … and"`, `"integrate"`, `"wire"`, `"bridge"`, `"hook into"`) | **+2** | literal phrase match |
+| Ambiguous requirements (`"somehow"`, `"after my last change"`, `"I'm not sure"`, `"when … doesn't"`) | **+2** | literal phrase match |
+| Explicit bug-fix (`"fix"`, `"failing"`, `"broken"`, `"off-by-one"`, `"typo"`) | **−5** | literal phrase match |
+| Single-file known-solution (exactly one file path AND (line ref OR fix verb OR `rename`/`move`/`delete`/`remove`)) | **−3** | path + bounded-work signal |
+| **Layer-crossings** (≥ 2 named layer / subsystem terms from the LDD/AWP vocabulary — validator, critique, delegation loop, runner, manager, orchestration, etc.) | **+2** | vocabulary count |
+| **Contract / R-rule hit** (`R\d+`, `"schema"`, `"contract"`, `"API surface"`, `"invariant"`, `"confidence (field\|threshold)"`, `"critique gate"`, `"deliverable_presence"`) | **+2** | literal phrase match |
+| **Unknown-file-territory** (paths not seen in `.ldd/trace.log` history of the last 20 runs; when log is empty or absent, contributes 0) | **+1** | trace-log lookup |
+
+The three bolded signals are new in the thinking-levels design; the other six are inherited from the pre-thinking-levels architect-mode scorer.
+
+### Score-to-level buckets (Phase-1-tuned, upward-biased)
+
+| Summed score | Level |
+|---|---|
+| `score ≤ −7` (explicit-bugfix AND single-file both fire, nothing else) | **L0** |
+| `−6 ≤ score ≤ −2` | **L1** |
+| `−1 ≤ score ≤ 3` | **L2** *(zero-signal baseline lands here)* |
+| `4 ≤ score ≤ 7` | **L3** |
+| `score ≥ 8` | **L4** |
+
+**Creativity-clamp rule (L4 ↔ L3 interaction).** When the score buckets L4 BUT the creativity inferrer returns `standard`, the level clamps to L3. Reason: L4's preset mandates `creativity=inventive (ack-gated)`; running L4 with `standard` would mix two loss functions into one gradient (violates `../architect-mode/SKILL.md` §"Cannot switch mid-task"). The dispatch header MUST show `[clamped from L4]` when this fires (the creativity is already echoed inline in the main body — no parenthetical duplicate). The clamp is one-directional: it cannot promote L3 → L4 when creativity would be inventive.
+
+### Creativity inference (applied at L3 / L4)
+
+The creativity inferrer is unchanged from the pre-thinking-levels design; it now runs at L3 and L4 only.
+
+| Level | Triggering signals | Notes |
+|---|---|---|
+| `conservative` | `"regulated"`, `"compliance"`, `"HIPAA"`, `"PCI"`, `"SOC2"`, `"migration of production"`, `"existing stack only"`, `"no new tech"`, `"on-call"`, `"tight deadline"`, `"team of N"` | Any one hit → `conservative` |
+| `standard` (default) | none of the other levels' signals dominate | Picked when L3/L4 fires but no conservative/inventive cue is present |
+| `inventive` | `"novel"`, `"research"`, `"prototype"`, `"no known pattern"`, `"invent"`, `"experimental"`, `"paradigm"` | Scorer **proposes** `inventive`; ack-gate must pass before the inventive loss function activates (see §Inventive ack below) |
+
+Conservative beats inventive on a tie.
+
+### Mandatory trace-header echo
+
+On every non-trivial task, the agent MUST emit exactly one line in the trace header before doing any work. The format is **single-line** (v0.11.0) — no more second `mode: architect, creativity: …` line:
+
+```
+Dispatched: L<n>/<name> (signals: <sig1>=<±N>, <sig2>=<±N>)
+Dispatched: L<n>/<name> · creativity=<value> (signals: <sig1>=<±N>, <sig2>=<±N>)
+Dispatched: L<n>/<name> · creativity=<value> (signals: ...) [clamped from L4]
+Dispatched: L<n>/<name> · creativity=<value> (user-explicit; scorer proposed L<m>)
+Dispatched: L<n>/<name> (user-bump from L<m>, fragment: "<fragment>")
+Dispatched: L<n>/<name> · creativity=<value> (user-override-down from L<m>). User accepts loss risk.
+```
+
+Rules for the single line:
+
+- The level is always rendered with its canonical name: `L0/reflex`, `L1/diagnostic`, `L2/deliberate`, `L3/structural`, `L4/method`.
+- The `· creativity=<value>` segment is emitted **only at L3 and L4**. It is omitted at L0/L1/L2 (where creativity does not apply).
+- The auto-dispatch case is **implicit** — no `auto-level` keyword. If no dispatch-source phrase (`user-explicit` / `user-bump` / `user-override-down`) appears in the parenthetical, the line is an auto-dispatch.
+- The bracketed clamp reason is the bare `[clamped from L4]` — the old `(creativity=standard)` parenthetical is dropped because the creativity is already inlined before the signals.
+- Signal pairs are the top-2 by absolute weight, stable tie-break by signal name. The agent can invoke the scorer via `python scripts/level_scorer.py "<task>"` (CLI) or `from level_scorer import score_task` (library).
+
+### Worked example
+
+> User: *"design a webhook replay service that stores every inbound webhook and lets partners replay arbitrary subsets; ~500/min, 6-8 week timeline, team of 2"*
+
+Scorer run (deterministic):
+
+- greenfield (`"design … service"`): **+3**
+- components≥3 (intake + store + replay + CLI): **+2**
+- cross-layer (`"… and …"` spans ingestion + persistence + delivery): **+2**
+- ambiguous (no stack chosen, no retention named): **+2**
+- layer-crossings (no LDD/AWP vocabulary hit): 0
+- contract-rule-hit (no R-rule / schema named): 0
+- others: 0
+- **sum: +9 → L4 bucket.**
+
+Creativity inference: no inventive cues, no conservative cues → `standard`.
+
+Creativity-clamp rule fires: L4 + standard → **clamp to L3**.
+
+Trace header (single line — the old `mode: architect, creativity: …` second line is gone in v0.11.0; the creativity is echoed inline):
+
+```
+Dispatched: L3/structural · creativity=standard (signals: greenfield=+3, components>=3=+2) [clamped from L4]
+```
+
+### Relation to the trigger-phrase table above
+
+The trigger-phrase table (§Trigger phrases) still fires specific skills when literal phrases match (e.g. `"failing test"` → `reproducibility-first`). Auto-dispatch is parallel to that, not in competition: the trigger-phrase table picks **which skills to invoke inside the level's skill floor**. The scorer picks **the level**. Both run; they refine each other.
+
+## The "LDD:" buzzword
+
+Users who want **guaranteed** LDD activation (no reliance on auto-triggering) can prefix their message with `LDD:`. When you see this prefix:
+
+1. Load `loop-driven-engineering` as the orchestrating skill
+2. Before any code, announce in one sentence which sub-skill you are reaching for and why
+3. Apply that sub-skill's discipline literally, not "in spirit"
+4. Report which rubric items you satisfied at the end of the task
+
+Example:
+
+> User: `LDD: the checkout test is failing and I need to ship in an hour`
+> You: "Invoking `reproducibility-first` first to check whether this is a real gradient or noise. [runs check] Confirmed reproducible — invoking `root-cause-by-layer` next to diagnose at layer 4/5 before editing."
+
+### Inline hyperparameter overrides: `LDD[k=N]:`
+
+Users can override hyperparameters for a single task by writing flags in square brackets after `LDD` and before the colon:
+
+```
+LDD[k=3]: quick exploratory fix
+LDD[k=10, reproduce=4]: deep dive on this flaky test
+LDD[max-refinement=1]: one polish pass on this doc, then ship
+LDD[no-reproduce]: I've already confirmed reproducibility — go straight to root-cause
+LDD[level=L3]: explicit level L3, overrides the auto-level scorer
+```
+
+Accepted flags (full reference in [`../../docs/ldd/hyperparameters.md`](../../docs/ldd/hyperparameters.md)):
+
+- `k=<N>` / `kmax=<N>` — inner-loop `k_max` (range 1–20)
+- `reproduce=<N>` — `reproducibility-first` Branch A rerun count (0–10; 0 is allowed but warned)
+- `no-reproduce` — shortcut for `reproduce=0`
+- `max-refinement=<N>` — refinement-loop hard cap (1–10)
+- `level=<L0..L4>` — explicit thinking-level, overrides the auto-level scorer. When the explicit level is below the scorer's proposal, the dispatch header emits `user-override-down` with the "User accepts loss risk" warning. `level` is **not** a persisted hyperparameter (cannot be set in `.ldd/config.yaml` or via `/ldd-set`); it is per-task only, parsed from the inline flag.
+- `creativity=<conservative|standard|inventive>` — sub-parameter selecting the **loss function** for this task (three discrete objectives, not a continuous freedom dial). **Only valid at L3/L4.** At L0/L1/L2 the flag is ignored and a trace warning is emitted: `ignored (level=L<n> does not accept creativity)`. `inventive` triggers the one-line acknowledgment flow (see §Inventive ack below). Cannot be set project-level (per-task only).
+
+**Deprecated (v0.11.0, removed in v0.12.0):** `mode=architect` and `mode=reactive` are removed as user-facing overrides — mode is a pure function of level (L0–L2 ⇒ reactive, L3/L4 ⇒ architect). For one release, the parser silently rewrites the deprecated forms and emits a note in the trace header:
+
+```
+LDD[mode=architect]: <task>   →  LDD[level=L3]: <task>     (deprecated)
+LDD[mode=reactive]:  <task>   →  LDD[level=L2]: <task>     (deprecated)
+```
+
+Trace header note on a deprecated invocation: `deprecated: mode= is derived from level; use level= instead`.
+
+Multiple flags are comma-separated. Inline flags **beat everything else** (session `/ldd-set`, `.ldd/config.yaml`, bundle defaults).
+
+### Relative bumps — when the user knows they want "more"
+
+Shortcuts for "bump one or two levels above auto-dispatch". These are category 3 in the §Precedence below — lower than `LDD[level=Lx]`, higher than natural language.
+
+```
+LDD+:  <task>      → auto-level + 1
+LDD++: <task>      → auto-level + 2
+LDD=max: <task>    → L4 directly (equivalent to LDD[level=L4])
+```
+
+Clamp rule: the bumped level is capped at L4. Bumping beyond L4 is a no-op. A bump of `LDD+` on a task that already auto-dispatches to L4 emits a trace note `(bump ignored — already at L4)`.
+
+### Natural-language bumps — for users who don't know the syntax
+
+The user does not need to know any LDD syntax. These phrases in the task text are recognized as "be more careful than the scorer said":
+
+| Phrase fragments (case-insensitive) | Effect |
+|---|---|
+| `"take your time"`, `"think hard"`, `"think carefully"`, `"careful"`, `"denk gründlich"`, `"denke gründlich"`, `"sorgfältig"`, `"durchdacht"` | **+1 level** |
+| `"really think"`, `"think really hard"`, `"very careful"`, `"ultra-careful"`, `"maximum rigor"`, `"think thoroughly"`, `"sehr sorgfältig"` | **+2 levels** |
+| `"full LDD"`, `"use everything"`, `"maximum deliberation"`, `"volle Kanne"` | **clamp to L4** |
+
+All `+1` phrases **dedup semantically** — `"take your time and think hard"` contributes +1 total, not +2. Both express the same "be careful" intent. A +2 bump requires an explicit strong phrase from the second row.
+
+The natural-language path is the lowest-priority override (category 4); any explicit LDD-syntax flag above beats it.
+
+### Dispatch-header echo for overrides
+
+When ANY override fires (explicit flag, relative bump, or natural-language bump), the dispatch header surfaces it so the user can see what actually ran. The format is single-line (v0.11.0) — creativity is inlined at L3/L4 only:
+
+```
+Dispatched: L3/structural · creativity=standard (user-explicit; scorer proposed L2)
+Dispatched: L2/deliberate (user-bump from L0, fragment: "LDD++")
+Dispatched: L2/deliberate (user-bump from L0, fragment: "take your time")
+Dispatched: L4/method · creativity=inventive (user-bump from L0, fragment: "LDD=max")
+Dispatched: L0/reflex (user-override-down from L3). User accepts loss risk.
+```
+
+If the user expresses a budget in prose ("budget of 3 iterations", "give me only one refinement pass"), parse the intent and apply — echo in the trace as `(parsed from prose)`. When ambiguous, ask one clarifying question rather than guessing.
+
+### Inventive ack — user consent to switch the loss function
+
+`creativity=inventive` uses a **different loss function** than `standard` or `conservative` (see `../architect-mode/SKILL.md` §"The neural-code-network framing"). The agent is **never** allowed to activate inventive on its own — it can only propose, and the user consents.
+
+Three paths to consent, in order of precedence:
+
+1. **Explicit inline flag.** `LDD[creativity=inventive]:` or the `/ldd-architect inventive` command. Consent is carried in the flag; no further ack needed.
+2. **Literal ack token.** When the scorer proposes inventive (via cues like `"novel"`, `"prototype"`, `"research"`), the agent asks the user for explicit consent. The canonical ack is the word `acknowledged`. But any of these natural-language affirmatives also count (bilingual):
+
+   | Positive (→ inventive activates) | Negative (→ silent downgrade to `standard`) |
+   |---|---|
+   | `"acknowledged"`, `"ack"`, `"yes"`, `"ja"`, `"go"`, `"go ahead"`, `"proceed"`, `"los"`, `"okay mach"`, `"okay machen"`, `"passt"`, `"mach"` | `"no"`, `"nein"`, `"stop"`, `"cancel"`, `"abbruch"`, `"halt"`, or silence |
+
+   Ambiguous replies (`"hmm"`, `"maybe"`, `"let me think"`) do NOT activate inventive — they require the literal `acknowledged` or a positive token.
+
+3. **Implicit ack from the original task prompt.** When the user's initial message already contains **≥ 2 inventive cues** (`"novel"`, `"research"`, `"prototype"`, `"no known pattern"`, `"invent"`, `"experimental"`, `"paradigm"`) AND is **≥ 100 characters long**, the agent treats the prompt itself as consent — the user has already verbalized inventive intent in a substantive task description. The dispatch header MUST surface this explicitly:
+
+   ```
+   Dispatched: L4/method · creativity=inventive (signals: …) [implicit ack from ≥2 inventive cues in prompt]
+   ```
+
+   If the prompt is shorter than 100 characters or contains only 1 inventive cue, fall back to path 2 (explicit ack).
+
+Neither path 2 nor path 3 allows the AGENT to select inventive on its own. Both still require user-originated consent — path 2 via a reply, path 3 via the task text itself. The moving-target-loss protection (the user is the only authority that can set the loss function) is preserved.
+
+### Precedence — level selection (highest wins)
+
+```
+1. LDD[level=Lx]:               explicit level              ← highest
+2. LDD=max: / "volle Kanne"     literal max (→ L4)
+3. LDD++: / LDD+:               relative bump
+4. Natural-language phrases     "take your time" etc.
+5. Auto-scorer output           9-signal scorer bucket       ← lowest
+```
+
+`LDD[level=L0]:` on a task the scorer would bucket L3 is an explicit downward override — honored, but `user-override-down` warning is emitted. No silent demotions.
+
+### Precedence — other hyperparameters (k, reproduce, max-refinement, creativity)
+
+```
+inline LDD[...] flags         ← highest priority
+    ↓
+/ldd-set session overrides
+    ↓
+.ldd/config.yaml in project
+    ↓
+bundle defaults               ← lowest
+```
+
+Use `/loss-driven-development:ldd-config` to see the full stack with per-key provenance. Only the knobs listed in `docs/ldd/hyperparameters.md` are exposed — `level` itself is a DERIVED value (the auto-scorer's output or an explicit override), not a persisted hyperparameter. Requests to tune other parameters (learning rates, loss weights, skill-enable flags) are moving-target-loss risks and are refused per `docs/ldd/hyperparameters.md` §"What is NOT exposed (by design)".
+
+## The LDD trace — mandatory visible output
+
+For every non-trivial LDD task, emit a **visible trace block** inline in your reply so the user can see what discipline is running, how the loss is moving, and which skill fired. The user wants to audit this in real-time; the block is part of the deliverable, not an internal monologue.
+
+**Emit a trace line AFTER EVERY ITERATION** (not per skill invocation — within one iteration multiple skills may fire; they share ONE trace emission at iteration close). Two formats exist — pick by the emission trigger, not by taste:
+
+- **Compact inline format (default per-iteration, v0.14.0+)** — 2 lines for `i1/i2`, 3 lines from `i3` onward. Used for live iteration progress in normal task flow. Spec: see `### Compact inline format` below.
+- **Full trace block** — 15–25 lines with header, per-iteration section, mini chart, close block. Used for task close, explicit `/ldd-trace` request, and post-hoc reconstruction. Spec: see `### Full trace block format` below.
+
+Re-emit the compact line at the end of each message when the task spans multiple messages. At loop close, **switch to the full block** (terminal status + layer fix + docs-sync verdict + full sparkline + mini chart). Consecutive compact emissions still grow the sparkline suffix monotonically from `i3` onward — iteration k's line differs from k−1's by one new sparkline glyph and a fresh Δ-arrow.
+
+**Post-hoc reconstruction exception:** when the user hands you a COMPLETED task's iteration data (losses, skill names, actions already known) and asks you to render the trace, emit ONE final **full block** with all iterations — the per-iteration compact rule does not apply because no real iterations are happening. The `tests/fixtures/using-ldd-trace-visualization/` fixture exercises this exception (all three scenarios are post-hoc).
+
+**Budget — why compact is the default.** The full block's token cost multiplies by iteration count. A 5-iteration task previously emitted ~100–125 lines of trace just for the per-iteration channel; the compact format delivers the same load-bearing signal (who fired, which loop, what loss, where it's moving, what was done) in ~10–15 lines total over the same 5 iterations — about 1/8 the token cost. The full block still lands once at close, so the audit-after-the-fact is unchanged.
+
+### Compact inline format (default per-iteration, v0.14.0+)
+
+Line layout — two-liner for the first two iterations, three-liner once a sparkline becomes meaningful:
+
+```
+# i1 / i2 (no trajectory history yet):
+LDD i<k>/<loop> · loss=<norm> (<raw>)[ Δ<±value> <arrow>] · <skill-name>
+     → <one-line concrete action the iteration produced>
+
+# i3+ (sparkline suffix appears once ≥ 3 data points exist):
+LDD i<k>/<loop> · loss=<norm> (<raw>) Δ<±value> <arrow> · ▂▅▃  <trend>
+     *<skill-name>*
+     → <one-line concrete action>
+```
+
+Worked example — three inner-loop iterations on a contract-violation bug:
+
+```
+LDD i1/inner · loss=0.500 (4/8) · reproducibility-first
+     → 5/5 reruns reproducible, no flake
+```
+```
+LDD i2/inner · loss=0.375 (3/8) Δ−0.125 ↓ · root-cause-by-layer
+     → L4 (contract): filter ignores None; L5 (concept): implicit total-function assumption
+```
+```
+LDD i3/inner · loss=0.000 (0/8) Δ−0.375 ↓ · ▇▅·  ↓
+     *e2e-driven-iteration*
+     → contract made explicit, 8/8 green
+```
+
+Rules:
+
+- **Line 1** is the control line — iteration-counter / loop / normalized-loss / raw-violations / (from i2 onward) step-Δ with arrow / (from i3 onward) sparkline-suffix + net-trend arrow / skill name.
+- **Line 2** is the action line — indented `→` prefix, one concrete sentence about what the iteration actually changed. Never restate the loss number here; never write "fixed the bug" — name the specific change.
+- **Line 3** (optional, i3+) — when the sparkline suffix requires a separate visual break, or when more than one skill fired and you want to name them explicitly via `*skill*` list. Can be merged into line 2 if space allows.
+- **Sparkline-suffix rule:** built from the same `▁▂▃▄▅▆▇█` block glyphs as the full block, auto-scaled to the max observed loss in the current task. Zero values render as `·`. The final glyph is the current iteration's loss; the sparkline carries the full history.
+- **Trend-arrow semantics** are identical to the full block: `↓` if `(last − first) < −0.005`, `↑` if `> +0.005`, `→` otherwise. Computed net-direction, never local.
+- **Step-Δ arrow** (per-iteration, separate from the net-trend arrow) appears from i2 onward inline in line 1 — `Δ−0.125 ↓` means this iteration dropped the loss by 0.125 vs. the previous one. Threshold is the same `0.005` boundary.
+- **Loop labels** — `inner`, `refine`, `outer`, `cot`, `design` (L3/L4 architect-mode uses `design` with a `p<k>` prefix instead of `i<k>`).
+- **Close the loop with the FULL block**, not a compact line. The reader wants to see the mini chart once, at the end, with the Close section.
+
+Compact is a per-iteration convenience, not a replacement for the full block's audit surface. `drift-detection` and `method-evolution` skills still read the `.ldd/trace.log` persisted record — compact only shortens the user-visible display, not the on-disk format.
+
+### Full trace block format
+
+```
+╭─ LDD trace ─────────────────────────────────────────╮
+│ Store     : <tier scope — see bootstrap-userspace>
+│ Task      : <one-line description of what the user asked>
+│ Loop      : inner | refinement | outer
+│ Loss-type : <see "Loss-types" below — primary is normalized [0,1]>
+│ Budget    : k=<current>/K_MAX=<max>     (inner loop)
+│
+│ Iteration 1:
+│   *Invoking <skill-name-1>*
+│     <1-line result — branch chosen, layer named, verdict>
+│   *Invoking <skill-name-2>*
+│     <1-line result>
+│   loss_1 = 0.000  (0/<max> violations)
+│
+│ Iteration 2 (if applicable):
+│   ...
+│   loss_2 = 0.125  (1/8 violations)
+│   Δloss = −0.125  (regression — revert before next edit)
+│
+│ Close:
+│   Fix at layer: <4: structural-name, 5: conceptual-name>
+│   Docs synced : yes | N/A | no (BLOCKED)
+│   Terminal   : complete | partial | failed | aborted
+╰─────────────────────────────────────────────────────╯
+```
+
+Keep it compact. The goal is **one screenful** the user can eyeball. If the trace grows beyond ~25 lines (many iterations), collapse older iterations to one summary line each.
+
+### Loss-types — how to display the loss number
+
+Four display modes, chosen per task by the nature of the measurement. Pick one, name it on the `Loss-type` header line, use it consistently for the whole trace block.
+
+| Loss-type | When it applies | Display format | Example |
+|---|---|---|---|
+| **`normalized [0,1] (violations / rubric_max)`** | Binary rubric items (the default for most LDD skills): count violations, divide by rubric max | **Primary:** float in [0, 1] with 3 decimals. **Secondary:** raw `(N/max violations)` in parens | `loss_0 = 0.375  (3/8 violations)` |
+| **`rate (already in [0,1])`** | Ratio signals already bounded: flake rate, passing-test fraction, coverage | Single float, secondary raw optional | `loss_0 = 0.333  (3/9 runs failed)` |
+| **`absolute (continuous, no natural max)`** | Unbounded signals: latency / throughput / queue depth | Absolute value **with unit**, NO normalization attempt | `loss_0 = 45.0 ms  (p99 regression)` |
+| **`vector (multi-dim Pareto)`** (v0.13.x Fix 1) | Multi-objective tasks where forcing a scalar would hide Pareto dominance (latency AND memory AND correctness; three different SLOs you must all hit) | One value per dim, `name:value` pairs in `loss_vec=`. Scalar `loss=` stays alongside as a mean-view fallback for non-vector consumers. Δ across iterations is rendered as a **Pareto-dominance arrow** `⇓`/`⇔`/`⇑` instead of scalar `↓`/`→`/`↑` | `loss_vec=lat:0.5,mem:0.3,corr:0.2  (Pareto ⇓ vs prev)` |
+
+Scalar `loss=` **and** `loss_vec=` may coexist on the same iteration. Readers that understand vector mode use `loss_vec`; pre-v0.13 readers fall back to the scalar.
+
+**Normalization rule (primary Loss-type):**
+
+```
+loss_normalized = violations / rubric_max
+Δloss           = loss_{k-1} − loss_k    # positive = progress, negative = regression
+```
+
+Normalization makes Δloss **comparable across skills** (drift-detection with 6 rubric items vs. architect-mode with 10 items become apples-to-apples). The raw `(N/max)` in parens keeps it **actionable** — the user still sees exactly which items are still open.
+
+**Anti-pattern:** never display a normalized float without the raw denominator in parens. "`loss_0 = 0.375`" alone implies a measurement precision that isn't there — it hides the fact that it's `3/8`. Show both; the normalized form is for comparison, the raw form is for action.
+
+**Anti-pattern:** never compute a normalized float from a count that has no natural max (commit counts, latency, token usage). Those stay absolute with units — trying to normalize them invents a denominator and produces fake precision.
+
+### Epoch marker — Δloss across rubric/scope shifts is suppressed
+
+The monotonicity assumption `Δloss = loss_{k-1} − loss_k` relies on a **stable measurement frame**. Mid-task rubric changes, bedrohungsmodell shifts, or explicit scope expansions break that assumption: iteration `k+1`'s loss is not comparable to iteration `k`'s, and pretending otherwise produces a fake gradient.
+
+v0.13.x Fix 1 introduces a first-class **epoch** field — an integer that increments at every deliberate frame change. Writers call the `epoch` subcommand to bump the counter AND persist a reason in the same step:
+
+```bash
+./.ldd/ldd_trace epoch --reason "PSD2 SCA compliance added to rubric mid-task"
+# → epoch 0 → 1
+```
+
+Subsequent iterations pass `--epoch 1` (the writer-side discipline; the renderer reads both the epoch on the current iteration and the previous to decide whether to render a Δ). The visual contract:
+
+- Scalar sparkline: `┊` at every epoch boundary. `▅▃▅ ┊ ▃▁·` means two epochs, a trend arrow is still emitted but covers the full range honestly.
+- Value sequence: vertical bar `│` between epochs: `0.500 → 0.250 │ 0.400 → 0.000`.
+- Per-iteration Δ-column: the first iteration in a new epoch shows `Δ n/a (epoch boundary)` instead of a scalar delta. The reader is **told** the comparison is invalid; nothing is fabricated.
+
+**Anti-abuse guard:** epoch bumps are monitored by `drift-detection`. More than one bump per 5 iterations in the same task is a surface signal for moving-target-loss — an agent gaming the convergence display by resetting the frame whenever Δ goes the wrong way. The bump reason is written alongside the counter; drift-scan reads both.
+
+### Loss visualization — sparkline, mini chart, mode+info line, trend arrow
+
+The numeric loss per iteration gives the user the value. To make the **trajectory** auditable at a glance AND the **work done per iteration** reviewable at a glance, the trace block carries four parallel channels. Mandatory thresholds:
+
+| Channel | When mandatory | What it is |
+|---|---|---|
+| **Trajectory sparkline** | ≥ 2 iterations | Single-line Unicode-block series (`▁▂▃▄▅▆▇█`), one char per iteration, auto-scaled to `max(loss_observed)`. Zero values render as `·`. Sits on a `Trajectory:` line inside the trace block. |
+| **Trend arrow** | ≥ 2 iterations | Single glyph at the end of the sparkline line: `↓` net descent, `↑` net regression, `→` flat. Reflects **first-vs-last** loss delta, NOT local or majority direction. |
+| **Mini ASCII loss-curve chart** | ≥ 3 iterations | Multi-line chart: y-axis auto-scaled to smallest `0.25`-step multiple `≥ max(loss)`, values snap round-half-up to the nearest gridline; x-axis labels are the iteration labels (`i1`, `r2`, `o1`, …) with label first-char aligned to the data marker column. Data marker: `●`. |
+| **Per-iteration mode + info line** | every iteration | The iteration-label line names the loop AND the mode (e.g. `(inner, reactive)`, `Phase p1 (architect, inventive)`, `(refine)`, `(outer)`) so the reader can tell at a glance which discipline was active. An indented continuation line carries `*<skill-name>*` + a one-line description of what concrete change the iteration produced — so the user can follow the skill's work step-by-step without scrolling elsewhere. |
+
+The sparkline gives **micro-dynamics** (8-level resolution — separates a converged tail where losses differ by 0.05). The mini chart gives **macro-trajectory** (tail convergence collapses to the baseline row, which is visually honest — the loss IS flat below the snap step). The mode+info line gives **audit surface** — which mode, which skill, which action, per iteration. Consistency constraint: the sparkline's last bar, the chart's last marker, and the final iteration's `loss=` value must all reflect the same number.
+
+**Phase-indicator grammar (per iteration label, v0.11.0):**
+
+- Inner loop, default discipline → `Iteration i<k> (inner, reactive)`
+- Design phase (L3/L4, architect-mode protocol) → `Phase p<k> (design, <creativity>)` where `<creativity>` is one of `standard` / `conservative` / `inventive`. The word `Phase` (not `Iteration`) signals the 5-phase protocol is running. The parenthetical carries the **creativity** (already displayed once in the header) but no separate `mode=` word — the level is the mode.
+- Refine loop → `Iteration r<k> (refine)` — no mode/creativity (refine is always y-axis work on a deliverable)
+- Outer loop → `Iteration o<k> (outer)` — no mode/creativity (outer is always θ-axis work on a skill/rubric)
+
+A session that fires the design-phase protocol and then hands off to reactive inner iterations renders both in the same trace: `Phase p1..p5` followed by `Iteration i1..i<k>`.
+
+**Delta column (≥ 2 iterations):** every iteration after iter 1 appends `Δ <±value> <arrow>` to its loss line, where arrow is `↓` (progress), `↑` (regression), or `→` (plateau, `|Δ| < 0.0005`). This is the *per-step* arrow — distinct from the *end-to-end* trend arrow on the sparkline line.
+
+**Rendering recipe (deterministic — copy verbatim):**
+
+```
+sparkline char  : ▁▂▃▄▅▆▇█ indexed by round(v / max(v) * 7); v == 0 → ·
+trend arrow     : ↓ if (last − first) < −0.005 · ↑ if > +0.005 · → otherwise
+chart y-axis    : ylim = ceil(max(v) / 0.25) * 0.25 ; rows at 0, 0.25, 0.50, … , ylim
+chart data snap : row = floor(v / 0.25 + 0.5) * 0.25    (round-half-up)
+chart x-axis    : "└─" + "─".join(labels) + "→  iter"   (label first-char = col start)
+mode indicator  : (<loop>, <mode>[, <creativity>])  as specified above
+info line       : "  *<skill-name>* → <one-line description of change produced>"
+```
+
+**Example — inner (reactive) → refine → outer, 6 iterations:**
+
+```
+│ Store      : local (.ldd/trace.log)
+│ Trajectory : █▆▃▂··   0.500 → 0.375 → 0.125 → 0.100 → 0.000 → 0.000  ↓
+│
+│ Loss curve (auto-scaled, linear):
+│   0.50 ┤ ●  ●
+│   0.25 ┤       ●
+│   0.00 ┤          ●  ●  ●
+│        └─i1─i2─i3─r1─r2─o1→  iter
+│        Phase prefixes: i=inner · r=refine · o=outer
+│
+│ Iteration i1 (inner, reactive)    loss=0.500  (4/8)
+│   *reproducibility-first* + *root-cause-by-layer* → guard empty list, filter None values
+│ Iteration i2 (inner, reactive)    loss=0.375  (3/8)   Δ −0.125 ↓
+│   *e2e-driven-iteration* → isinstance-based filter for non-numeric types
+│ Iteration i3 (inner, reactive)    loss=0.125  (1/8)   Δ −0.250 ↓
+│   *loss-backprop-lens* → sibling-signature generalization check 3/3 green
+│ Iteration r1 (refine)             loss=0.100  (1/10)  Δ −0.025 ↓
+│   *iterative-refinement* → docstring sections + ValueError on all-invalid
+│ Iteration r2 (refine)             loss=0.000  (0/10)  Δ −0.100 ↓
+│   *iterative-refinement* → runtime invariants via assert
+│ Iteration o1 (outer)              loss=0.000  (0/8)   Δ ±0.000 →
+│   *method-evolution* → skill rubric updated; 3 sibling tasks no longer regress
+```
+
+**Example — L4 design phase (inventive) hand-off into reactive inner:**
+
+```
+│ Phase p1 (design, inventive)      loss=0.857  (6/7)
+│   constraints: 7 requirements named; 2 uncertainties flagged (consistency bound, write throughput)
+│ Phase p2 (design, inventive)      loss=0.714  (5/7)   Δ −0.143 ↓
+│   non-goals: 3 concrete scope boundaries (no global consensus, no strict serializability, …)
+│ Phase p3 (design, inventive)      loss=0.429  (3/7)   Δ −0.286 ↓
+│   candidates: 3/3 on partial-order axis (MPO-CRDT, version-vector-with-dominance, lattice-merge)
+│ Phase p4 (design, inventive)      loss=0.143  (1/7)   Δ −0.286 ↓
+│   scoring: MPO-CRDT wins 0.778; antithesis on write amplification survived with mitigation
+│ Phase p5 (design, inventive)      loss=0.000  (0/7)   Δ −0.143 ↓
+│   deliverable: arch.md + scaffold + 6 failing tests + acknowledgment accepted @ 2026-04-21T12:14Z
+│ Iteration i1 (inner, reactive)    loss=0.857  (6/7)
+│   *e2e-driven-iteration* → first failing scaffold test now compiles (schema bound)
+```
+
+**Non-monotonic trajectories** — the end-to-end trend arrow is computed from `last − first`, so a run that regresses in the middle but recovers below the starting loss is still `↓`. Example: `0.667 → 0.833 → 0.167` ends at `−0.500` vs. start → `↓`, even though i1→i2 is a local `↑`. The per-step `Δ` arrows on each iteration line carry the local direction; the sparkline arrow carries the net direction. Don't conflate them.
+
+**Compression rule (tight context):** if the trace would exceed one screenful, collapse the info-lines to a single word each (the skill name), but never drop the mode indicator or the sparkline — those are load-bearing for audit. The user wants to know *which discipline* fired at *which iteration* even when full prose doesn't fit.
+
+**Loss-type-specific rendering:**
+
+- `normalized [0,1]` or `rate` → chart and trend arrow use `[0,1]` directly.
+- `absolute (with unit)` → sparkline auto-scales to `max_observed`; put the unit in the trajectory label (`Trajectory (ms):  ▇▅▁  …`). The mini chart is omitted for absolute loss (no natural [0,1] denominator — see the anti-pattern above); sparkline + mode+info line + trend arrow remain.
+
+**Why no per-iteration magnitude bar** — an earlier draft of this spec included a 20-character `█`/`░` bar per iteration. It was removed in favor of the mode+info line because the information density is strictly worse: the bar re-encodes data already carried by the sparkline and chart, while the mode+info line carries *new* information (which skill fired, what concrete action it produced) the user cannot reconstruct from loss numbers alone.
+
+**Design-phase (L3/L4) trace-block header:** the variant block (next subsection) uses phases instead of iterations. The header carries the single-line `Dispatched: L<n>/<name> · creativity=<value>` and identifies the loop as `design (5-phase protocol)`. The same four visualization channels apply, with `p1`..`p5` labels in place of `i1`/`r1`/`o1`.
+
+### Design-phase (L3/L4) variant of the trace block
+
+When the level lands at L3 or L4, the `architect-mode` skill's 5-phase protocol runs — and the trace uses **phases** instead of iterations. The 5 phases are prescribed by the `architect-mode` skill. Example:
+
+```
+╭─ LDD trace ─────────────────────────────────────────╮
+│ Task       : design a billing service for 50M users
+│ Dispatched : L3/structural · creativity=standard (signals: greenfield=+3, cross-layer=+2)
+│ Loop       : design (5-phase protocol)
+│ Budget     : phase <k>/5, no K_MAX (phases are sequential, not iterative)
+│ Loss-fn    : L = rubric_violations  (standard baseline; λ=0)
+│ Loss-type  : normalized [0,1] (violations / 10)
+│
+│ Phase 1 — Constraints  : 7 requirements named; 2 uncertainties flagged
+│ Phase 2 — Non-goals    : 3 concrete non-goals
+│ Phase 3 — Candidates   : 3/3 on load-bearing axis (monolith / CQRS / event-driven)
+│ Phase 4 — Scoring      : CQRS wins, 0.778 (14/18); antithesis passed
+│ Phase 5 — Deliverable  : arch.md + scaffold + 6 failing tests
+│
+│ Final loss : 0.000  (0/10 violations — no known gaps)
+│ Hand-off   : next: default LDD inner loop, loss_0 (inner) = 0.857  (6/7 integration tests failing)
+╰─────────────────────────────────────────────────────╯
+```
+
+Header carries a single `Dispatched:` line with the level/name and (at L3/L4) the inline `creativity=<value>`. The architect-mode protocol is active because the level is L3 or L4 — there is no separate `mode:` line. The `Loss-fn` line names the objective being minimized; the `Loss-type` line names how the loss is displayed (which of the three display modes applies for this run).
+
+For `creativity: conservative` the `Loss-fn` line reads: `L = rubric_violations + λ · novelty_penalty`. The rubric max becomes 11 (standard 10 + novelty-penalty #11); `Loss-type : normalized [0,1] (weighted violations / 11)`. Scoring cells in Phase 4 are displayed as normalized floats too: `A: 0.667 (20.0/30.0)` instead of raw `A: 20.0/30.0` alone.
+
+For `creativity: inventive` the `Loss-fn` line reads: `L = rubric_violations_reduced + λ · prior_art_overlap_penalty`. The inventive rubric has 7 items (1–4 retained, 5–8 replaced by #I1–#I3) plus 9 and 10 always applied — so the denominator is 9; `Loss-type : normalized [0,1] (violations / 9)`.
+
+Phase completion is reported as it happens (the block grows as the task progresses). On close, rubric score and hand-off line are added. If `inventive` was activated, also emit a line `Acknowledgment : accepted @ <timestamp>` or `downgraded to standard (not acknowledged)` so the user can verify what ran.
+
+### When to emit
+
+- **Always** on any invocation triggered by `LDD:` prefix or any trigger-phrase match (initial full block carries header + budget, no iterations yet; subsequent iterations use compact)
+- **After every iteration** during live task execution — emit the **compact line** (2–3 lines, v0.14.0+ default). Iteration-close without a trace emission is a RED FLAG, see below.
+- **Always when closing a loop** — switch back to the **full block** with Close section (terminal status + layer fix + docs-sync verdict + mini chart + complete sparkline)
+- **At the end of each message** if the task spans multiple messages — compact line if mid-task, full block if closing
+- **On request** when the user types the `/ldd-trace` command or asks for the current state — full block
+- **Not** for trivial one-shot replies (file read, single grep, typo fix) where no skill fires
+- **Not** per-iteration when reconstructing a post-hoc trace from completed data the user supplied — emit ONE final **full block** (compact is for live flow, not reconstruction)
+
+### HOW to emit — the inline block is the user-visible channel (v0.13.1)
+
+This is the **authoritative agent instruction**. Two things happen per iteration close; they are different channels and both must fire:
+
+1. **Inline ASCII in your assistant reply** — **PRIMARY user-visible channel.** Render the trace — compact line per iteration, full block at task close — as plain text (inside a fenced code-block or directly) *in the message you send to the user*. This is what the user sees scrolling past them in real time. The Bash tool's stdout is NOT a substitute — Bash output lands in your agent context, not automatically in the user's visible transcript. If the trace is not in your reply text, the user sees nothing. This channel is non-negotiable and is what the skill means by "inline in your reply."
+
+2. **Persistence via `ldd_trace append`** — **side channel.** Invoke the tool to write a structured line to `.ldd/trace.log` (or the active bootstrap-userspace tier). The tool also prints a rendered block to its stdout, which you may read to confirm what was persisted, but you **must still copy the block into your reply text** — do not rely on Bash stdout reaching the user.
+
+**Concrete decision table:**
+
+| Situation | What to do |
+|---|---|
+| Iteration close, filesystem available | (a) render block inline in reply, (b) `ldd_trace append` for persistence. Both. |
+| Iteration close, no filesystem (Tier 1–4) | (a) render block inline in reply. (b) persist via the active tier (artifact / conversation-history marker / memory pointer). |
+| `ldd_trace` not installed / throws | (a) still render block inline. Log a one-line note in trace telemetry; do NOT suppress the user-visible block because persistence failed. |
+| User said `--no-trace` | Skip BOTH channels. |
+| Trivial reply (lookup, typo, rename) | Skip BOTH channels. |
+
+**Why the redundancy is load-bearing:** the inline block is audit-in-the-moment; the persisted log is audit-across-sessions. Losing either degrades a different observability property. If forced to choose one (e.g. token budget), keep the **inline block** — the persisted log can be reconstructed from chat history later (via `ldd_trace ingest`), but the user cannot reconstruct a real-time loss curve they never saw.
+
+**Anti-pattern — "the Stop-hook will render it":** the Stop-hook is configurable (`display.verbosity` in `.ldd/config.yaml`) and is set to `off` in the LDD plugin's own repo precisely because it duplicates the inline block. Do NOT assume the hook renders on your behalf. The inline block in YOUR reply is the authoritative render.
+
+**Anti-pattern — "I invoked the tool, that counts":** no. Tool invocation writes the log. It does not put anything in the user-visible transcript unless you explicitly emit the block in your reply text.
+
+### RED FLAGS — per-iteration trace emission is load-bearing
+
+v0.5.1 adds explicit red flags because empirical observation (`scripts/ldd_trace/test_ldd_trace.py`, narralog post-mortem) showed the v0.5.0 mandate was regularly violated under time pressure:
+
+| Thought | Reality |
+|---------|---------|
+| "The iteration succeeded, I'll show the trace at the end of the task" | No — every iteration ends with a trace emission (compact line in-flow, full block at close). The user needs to see *during* convergence, not post-mortem. |
+| "Rendering the chart is a lot of ASCII; I'll describe the loss in prose" | No — compact is 2–3 lines (cheap), full block lands once at close. Manual prose descriptions of loss are a rubric violation at the method layer. |
+| "I re-emitted the summary, that counts" | No — the compact line has 4 load-bearing fields (iter/loop, loss with raw + Δ + arrow, sparkline from i3, skill + action); the full block adds the mini chart and Close section. A summary table is neither. |
+| "The loss didn't change this iteration, no point re-rendering" | No — a plateau IS a signal; the `Δ ±0.000 →` token in the compact line lets the user see the plateau forming. |
+| "Compact means I can drop the action line" | No — action line (`→ <one-line concrete change>`) is load-bearing. Dropping it makes the trace a loss-counter, not an audit trail. |
+
+An iteration close without a trace emission (compact or full) is treated as a `method-evolution` trigger at the next outer-loop checkpoint.
+
+### Persisted trace at `.ldd/trace.log` — bidirectional
+
+**Write.** When operating in a project directory, append a structured line to `.ldd/trace.log` at the project root on every iteration close. Create the directory if needed. Format (v0.11.0 — breaking change; see `CHANGELOG.md`):
+
+```
+2026-04-22T02:24:45Z  meta  L3/structural  creativity=standard  dispatch=auto  task="..."  loops=design,inner,refine,outer
+2026-04-22T02:24:50Z  inner  k=0  baseline       loss=1.000  raw=5/5   loss_type=rate
+2026-04-22T02:25:22Z  inner  k=1  skill=reproducibility-first  action="..."  loss=0.600  raw=3/5   Δloss=-0.400
+2026-04-22T02:26:10Z  inner  close  terminal=complete  layer="3: ..."  docs=synced
+```
+
+Per-line rules (v0.11.0):
+
+- Meta line carries the thinking-level as the positional `L<n>/<name>` token, an optional `creativity=<value>` (only at L3/L4), and a short `dispatch=<auto|explicit|bump|override-down>`.
+- Per-iter lines use `loss=` (was `loss_norm=`) and `Δloss=` (was `Δloss_norm=`).
+- `loss_type=normalized-rubric` is **omitted** when it equals the default; only non-default types (e.g. `loss_type=rate`) are written.
+- The per-iter `mode=` and `creativity=` fields are **gone** — mode is derived from level, creativity lives once on the meta line.
+- The `design` loop replaces what pre-v0.11.0 called `architect` (it is the protocol's design phase, not a separate loop).
+- Read-compat: the store's parser accepts BOTH formats; pre-v0.11.0 traces still project correctly.
+
+One line per iteration or close event. ISO-8601 UTC first. Space-separated key=value; values with spaces are double-quoted.
+
+**Read.** At task start (before any new iteration), **if `.ldd/trace.log` exists in the project, read the last ~10 entries** via `python -m ldd_trace status --project <root>` or by tailing. This is how LDD recovers context across sessions — you cannot know what iteration `k` you are at, or what skills have already been tried, without reading prior state.
+
+**Tool.** `scripts/ldd_trace` is the reference implementation. Subcommands:
+
+```bash
+python -m ldd_trace init --project . --task "one-line title" --loops inner,refine
+python -m ldd_trace append --project . --loop inner --auto-k \
+    --skill e2e-driven-iteration --action "what concretely changed" \
+    --loss-norm 0.333 --raw 2/6 --loss-type normalized-rubric
+python -m ldd_trace close  --project . --loop inner --terminal complete \
+    --layer "3: <contract> · 5: <invariant>" --docs synced
+python -m ldd_trace render --project .        # re-print the current block
+python -m ldd_trace status --project .        # machine-readable last-k per loop
+```
+
+Each `append` / `close` call prints the FULL current trace block to stdout — so running the tool IS the per-iteration emission. The single-file module lives at `scripts/ldd_trace/` in the plugin repo; copy it into `$PROJECT_ROOT/.ldd/ldd_trace/` if the plugin isn't in PYTHONPATH.
+
+**Permanent statusline on Claude Code.** When the host is Claude Code, also dispatch [`host-statusline`](../host-statusline/SKILL.md) once per session, in parallel with `bootstrap-userspace`. That skill auto-installs a bottom-of-screen statusline that reads `.ldd/trace.log` (or ⟪LDD-TRACE-v1⟫ markers from the session JSONL) and renders a one-line LDD monitor — task · loop · iteration · loss · Unicode sparkline · trend. Install is project-local (`.ldd/statusline.sh` + a single `statusLine` key in `.claude/settings.local.json`), idempotent, merge-safe, silent. The user never has to configure it. The `│ Store :` line in the trace block gains a `statusline: installed` suffix so they see it went live.
+
+**If `.ldd/` cannot be written** (read-only filesystem, no project root, sandboxed chat host like Claude Desktop without MCP filesystem or ChatGPT without an Actions server) — delegate to `bootstrap-userspace`. That skill inspects the host's tool inventory and picks the most durable alternative tier silently, without prompting the user:
+
+- **Tier 0 — Filesystem** — this bidirectional path (the default); `bootstrap-userspace` is a no-op.
+- **Tier 1 — Artifact / Canvas** — maintain a persistent document titled `ldd-trace.log` inside the conversation.
+- **Tier 2 — Conversation-History** — emit `⟪LDD-TRACE-v1⟫`-prefixed trace lines in the visible reply; the host's chat retention IS the persistence. A CLI session can later promote these lines to Tier 0 via `python -m ldd_trace ingest < pasted.txt`.
+- **Tier 3 — Memory-pointer** — personal-memory API holds a one-line pointer to where the trace actually lives (Tier 1 or 2). Never trace data directly.
+- **Tier 4 — Inline-only** — degraded fallback; trace is ephemeral, lost at session end.
+
+The chosen tier is always disclosed in the trace block's header via a `│ Store  : <scope>` line (see format below). Full protocol: [`../bootstrap-userspace/SKILL.md`](../bootstrap-userspace/SKILL.md).
+
+### When NOT to emit the trace block
+
+- Pure lookups ("what does this function do") — answer directly, no trace
+- Rename / typo / one-line formatting edits — no skill fires, no trace
+- The user explicitly says `--no-trace` or equivalent
+
+The trace is a **loss-visibility tool**, not a template to apply mechanically. Empty or contentless traces ("Loop: unknown, k=?") are worse than no trace — they signal LDD is not actually active.
+
+## Announcing skill invocation
+
+Every time you invoke an LDD skill — whether auto-triggered or via `LDD:` — **say which skill you are invoking, in one sentence, before applying it**. This is non-negotiable; it lets the user verify which discipline is in effect and override you if you picked wrong.
+
+Format: `*Invoking <skill-name>*: <one-line reason>.`
+
+Example: `*Invoking root-cause-by-layer*: the symptom is a contract-violation `TypeError`; walking the 5-layer ladder before proposing a fix.`
+
+## The four loops — which one is active
+
+LDD distinguishes **four optimization loops** across four parameter spaces (see [Gradient Descent for Agents](../../docs/theory.md)). Name which one you're in before iterating:
+
+| Loop | Parameter | You edit | When |
+|---|---|---|---|
+| **Inner** | `θ` = code | Code | Ordinary bug / feature / refactor |
+| **Refinement** | `y` = deliverable | A deliverable (doc, diff, design) | "Good enough, not great" — polish |
+| **Outer** | `m` = method | A skill / rubric | Same rubric violation across ≥3 tasks |
+| **CoT** | `t` = reasoning chain | Reasoning steps themselves | Verifiable multi-step reasoning (math / code / logic / proofs) |
+
+If you cannot name which loop is active, stop and ask. Running the wrong loop wastes budget and can regress the artifact.
+
+## Minimum compliance behaviors
+
+Even without an explicit `LDD:` prefix, if the bundle is installed you are expected to:
+
+1. **Never ship a symptom patch** (`try/except`, `hasattr`-shim, retry loop, `xfail`) without first walking `root-cause-by-layer` to layers 4–5.
+2. **Never update code based on a single failed run** without invoking `reproducibility-first`.
+3. **Never declare "done"** without running `docs-as-definition-of-done` against the touched files.
+4. **Never give a non-trivial recommendation** without running `dialectical-reasoning` (thesis → antithesis → synthesis).
+5. **Never exceed K_MAX=5 iterations** silently — escalate per `loop-driven-engineering` § Escalation.
+
+## When LDD is not applicable
+
+Skip the bundle for:
+- Trivial edits (rename a variable, fix a typo, delete dead code you already understand)
+- Pure lookups (what does this function do — read it and answer)
+- Pure factual questions with no code change involved
+
+The bundle is for **multi-step engineering under uncertainty**, not for every keystroke.
+
+## Discovery order for a new session
+
+At session start, if LDD is installed:
+1. Read this skill's description.
+2. Note that the other nine are available.
+3. Apply the trigger-phrase table above to the user's first message.
+4. If the first message doesn't clearly trigger any specific skill, proceed normally — LDD discipline activates when a trigger appears later.
+
+## Compatibility with `superpowers`
+
+If the `superpowers` plugin is also installed:
+- `loop-driven-engineering` will dispatch to `superpowers:brainstorming` / `writing-plans` / `test-driven-development` / `verification-before-completion` / `requesting-code-review` at the moments noted in its dispatch table.
+- `superpowers:systematic-debugging` overlaps with `root-cause-by-layer`: prefer `root-cause-by-layer` when you want the explicit 5-layer discipline, `systematic-debugging` for broader investigation framing.
+
+## Signal that LDD is working
+
+A session with LDD correctly applied shows:
+- At least one `*Invoking <skill>*:` announcement per non-trivial task
+- Commit messages that name layers / structural origins / Δloss when relevant
+- No symptom-patch constructs shipped under pressure
+- Doc updates in the same logical commit as behavior changes
+
+If none of these appear in a long session, LDD is installed but dormant — re-check the trigger-phrase table, or ask the user to prefix `LDD:` explicitly.

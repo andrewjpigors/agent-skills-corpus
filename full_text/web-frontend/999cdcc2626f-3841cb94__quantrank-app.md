@@ -1,0 +1,630 @@
+---
+name: quantrank-app
+description: Build, modify, or extend QuantRank — a static-site US equity ranking application that combines fundamental, technical, factor, sentiment, and ML analysis into a 0-100 composite StockRank with ensemble fair price. Architecture is GITHUB-ACTIONS-FIRST (no backend server, no database) — Python script computes scores weekly and outputs JSON files; Next.js static site reads JSON and renders the UI; everything deploys free via Vercel. Roadmap is OPTION B (research-backed) with Option A as fallback. Use when the user wants to create QuantRank from scratch, add new analysis pillars or metrics, improve scoring methodology, integrate new free data sources, build the GitHub Actions compute pipeline, design the JSON output schema, build the Next.js static frontend, set up scheduled refresh workflows, deploy to Vercel, or troubleshoot any part of this static ranking system.
+---
+
+# QuantRank — Build & Maintenance Skill
+
+A skill for building and extending **QuantRank**, a static-site US equity stock ranking application that ranks stocks 1..N using 60+ classical analysis techniques plus advanced ML/NLP/regime-detection methods, augmented by **research-backed peer-reviewed libraries** (Option B roadmap).
+
+**Project knowledge files** (loaded into the project):
+- `stock_ranking_knowledge.md` — authoritative reference for ALL classical formulas, data sources, normalization rules. **Always consult before implementing any analysis technique** — never invent formulas.
+- `WORKFLOW.md` — phase-by-phase build plan (9 phases, 0-8). Always check current phase before working.
+- `RESEARCH_FINDINGS.md` — research-backed stretch additions for Phase 4-8 (Option B roadmap).
+
+## Contents
+
+- [Core Project Goal](#core-project-goal)
+- [Architecture: Static-Site Pattern](#️-architecture-static-site-pattern-option-d)
+- [Required Tech Stack](#required-tech-stack)
+- [Roadmap Strategy](#roadmap-strategy-option-b-with-option-a-fallback)
+- [Repository Structure](#repository-structure)
+- [JSON Output Schema](#json-output-schema-critical-contract) — includes schema-version table
+- [**Core Behavior Rules**](#core-behavior-rules) — Rules 1-18, the canonical rulebook
+- [When the user asks for…](#when-the-user-asks-for)
+- [Anti-Patterns to Refuse](#anti-patterns-to-refuse)
+- [Communication Style](#communication-style)
+- [End State Definition](#end-state-definition)
+
+### Rules at a glance
+
+| # | Rule | Most-cited from |
+|---|---|---|
+| 1 | Always reference the knowledge documents | — |
+| 2 | Phase discipline | WORKFLOW.md |
+| 3 | GitHub-Actions-first development | — |
+| 4 | Free-tier first + license verification | THIRD_PARTY_NOTICES.md |
+| 5 | Point-in-time data discipline | — |
+| 6 | Sector-relative for fundamentals | — |
+| 7 | Missing data → sector median | — |
+| 8 | Test golden values | — |
+| 9 | JSON schema is sacred | CLAUDE.md §Conventions |
+| 10 | No paid data, no real-money, no live trading | — |
+| 11 | Trademark caution | — |
+| 12 | Atomic JSON writes | — |
+| 13 | Fallback discipline (Option B specific) | — |
+| 14 | Decay monitoring (Option B specific) | — |
+| 15 | Performance ceiling honesty | — |
+| 16 | **Defense layer is annotate-and-veto-Top-N** | CLAUDE.md §Conventions · `.claude/skills/top5-rotation-audit/SKILL.md` |
+| 17 | Frontend design system + threshold-symbolic tests | `.claude/skills/frontend-design-system/SKILL.md` |
+| 18 | **Observability-before-wiring** | CLAUDE.md §Conventions · WORKFLOW.md · `.claude/skills/portable-observability-before-wiring/SKILL.md` |
+
+---
+
+## Core Project Goal
+
+Build a **static web app** (no backend server, no database) that:
+1. Pulls free-tier financial data for US stocks (S&P 500 → S&P 1500 in stages)
+2. Computes 60+ classical metrics + advanced sentiment/ML/regime features
+3. **Phase 4+: Augments with peer-reviewed library factors** (OSAP, JKP, Qlib Alpha158, IPCA)
+4. Normalizes them sector-relative into 8 pillar scores (0-100 each)
+5. Combines via meta-learner into a final composite StockRank (0-100)
+6. Computes ensemble Fair Price (DCF + Graham + Residual Income + multiples)
+7. Surfaces top-5 SHAP explanations per stock
+8. Outputs everything as JSON files committed to the repo
+9. Refreshes weekly via GitHub Actions cron
+10. Renders via Next.js static site deployed on Vercel
+11. **Public GitHub repo** — fully reproducible, free GitHub Actions
+
+---
+
+## ⚠️ ARCHITECTURE: STATIC-SITE PATTERN (Option D)
+
+**This is the most important rule. Read carefully.**
+
+### What this app IS:
+- A **GitHub Actions cron job** that runs Python weekly to compute rankings
+- A **Next.js static site** that reads pre-computed JSON files
+- A **public GitHub repo** with auto-committed JSON outputs
+- Deployed to **Vercel free tier** with auto-deploy on push
+- **Phase 5+: Hybrid compute** — heavy ML training on Kaggle/Modal, light scoring on GitHub Actions
+
+### What this app is NOT:
+- ❌ NOT a FastAPI/Flask/Express backend
+- ❌ NOT using PostgreSQL/SQLite/MongoDB at runtime
+- ❌ NOT making live API calls from the frontend
+- ❌ NOT computing scores on user request
+- ❌ NOT a real-time/intraday system
+
+### Compute Flow (Phase 0-3):
+```
+[GitHub Actions cron, Mon-Fri 22:00 UTC — PR 4f, was weekly Sunday]
+    ↓
+Python script → fetch data → compute features → output JSON
+    ↓
+Auto-commit JSON files to public/data/ in repo
+    ↓
+Push triggers Vercel auto-deploy
+    ↓
+[User opens site] → Next.js loads pre-computed JSON → renders UI
+```
+
+### Compute Flow (Phase 5+ with heavy ML):
+```
+[GitHub Actions weekly cron]
+    ↓
+Light pipeline (ingestion + scoring) → JSON
+    ↓
+[Kaggle Notebooks monthly]
+    ↓
+Heavy training (LightGBM, autoencoder, FinBERT batch) → models
+    ↓
+[Modal $30/mo credits, quarterly]
+    ↓
+Whisper transcription + Llama-3 MD&A inference → embeddings
+    ↓
+All artifacts → repo public/data/ → Vercel deploy
+```
+
+### Why this architecture:
+- **Free forever**: Vercel hobby + GitHub Actions on public repo + Kaggle/Modal free tiers = $0
+- **Mobile-friendly dev**: Claude Code app + GitHub mobile + Vercel mobile = full workflow
+- **Fast for users**: pre-computed JSON served via CDN, no DB queries
+- **Simple**: no auth, no rate limiting, no API design needed
+
+---
+
+## Required Tech Stack
+
+**DO NOT deviate without explicit approval.** Canonical stack list
+lives in [`CLAUDE.md`](CLAUDE.md) §Stack — Python 3.11+ · Next.js 14.2
+· GitHub Actions · Vercel · SEC EDGAR + yfinance. Below covers only
+the phase-specific additions + license caveats that the long-form
+rulebook needs.
+
+### Phase 4+ stretch additions (Option B)
+
+| Layer | Tech | Why |
+|---|---|---|
+| Heavy ML Training | Kaggle Notebooks (30 GPU-hr/wk) | Free T4/P100 |
+| LLM Inference | Modal ($30/mo credits) | ~50 GPU-hrs T4 free |
+| Audio Transcription | OpenAI Whisper (open source) | Free local/Modal inference |
+| Factor Library | OSAP + JKP + Qlib + IPCA | Peer-reviewed replicated factors |
+
+**Optional-dep additions by phase** (gated behind `[project.optional-dependencies]`):
+
+| Phase | Deps | License |
+|---|---|---|
+| 4 (factor scout) | `openassetpricing` · `ipca` · `pyqlib` | MIT (OSAP / IPCA / Qlib) |
+| 4i.1 (JKP integration) | uses CSV downloads, no pip dep | **CC BY-NC 4.0** — see #115 |
+| 5 (ML meta-learner) | `mapie` (conformal) | BSD-3-Clause |
+| 6 (Sentiment v2) | `sentence-transformers` · `openai-whisper` | Apache-2.0 / MIT |
+| 7 (Portfolio v2) | `skfolio` · `gtda` | BSD-3-Clause / AGPL-3.0 (verify) |
+| 4.5e + Phase 5+ | `supabase` (cross-run state) | Apache-2.0 |
+
+**Supabase note**: connector is registered (`mcp__supabase__*` in
+Claude Code) but the Python client is **deferred** — add `supabase`
+to `pyproject.toml` only inside the implementation PR that first
+wires a real table call. See `CLAUDE.md` §Connectors.
+
+**mlfinlab is BANNED** — all-rights-reserved (Hudson & Thames commercial
+license). Reimplement Triple-Barrier + Meta-Labeling + Purged CV from
+López de Prado 2018 directly under MIT. Algorithms are not patented.
+
+---
+
+## Roadmap Strategy: Option B with Option A Fallback
+
+### Active Plan: Option B (Research-Backed)
+- **Phases 0-3** unchanged from original WORKFLOW.md → ship v1.0
+- **Phase 4 NEW**: Factor Consolidation (OSAP + JKP + Qlib + IPCA)
+- **Phase 5 ENHANCED**: ML + Triple-Barrier + Meta-Labeling + Conformal Prediction
+- **Phase 6 ENHANCED**: Sentiment v2 (Whisper + 8-K events + Lazy Prices)
+- **Phase 7 ENHANCED**: Regime v2 (Student-t HMM + TDA + NCO)
+- **Phase 8**: Universe expansion to S&P 1500
+
+### Fallback Plan: Option A (Original WORKFLOW.md)
+Triggers reverting to Option A per-phase if:
+- Library integration > 1 week of blockers
+- License conflict (e.g., mlfinlab AGPL incompatibility)
+- Heavy compute setup fails (Kaggle/Modal access issues)
+- Validation shows no alpha lift from research addition
+
+Each phase has explicit fallback triggers in WORKFLOW.md.
+
+### Performance Expectations
+
+| Path | Net Alpha vs SPY | Sharpe Lift | Time |
+|---|---|---|---|
+| Option A (original) | 2-4% | +0.2 to +0.4 | ~5-6 weeks |
+| Option B (research) | 3-7% | +0.3 to +0.5 | ~7-8 weeks |
+
+**Honest hedge**: 3-7% is research-suggested upper bound; 2-4% is realistic floor. Wide confidence interval [0%, +5%] on any single 3-year window. Some research papers cited may have decay, replication issues, or in-sample bias — see RESEARCH_FINDINGS.md caveats.
+
+---
+
+## Repository Structure
+
+[`CLAUDE.md`](CLAUDE.md) §Layout has the live top-level path table.
+[`AGENTS.md`](AGENTS.md) §Project structure has the granular tree
+with file-purpose annotations. This file's role: lock the
+**module-level breakdown** that future phases must align with.
+
+| Path | Purpose | Phase introduced |
+|---|---|---|
+| `compute/ingest/` | Data fetchers (EDGAR / yfinance / FRED / 13F / 8-K / OSAP / JKP / Qlib) | 1-6 |
+| `compute/features/` | Pure feature computation (fundamental / value / quality / growth / momentum / technical / health / risk / sentiment / anomaly / macro_regime / IPCA / Alpha158 / lazy_prices / vdq / tda_regime) | 1-7 |
+| `compute/scoring/` | Normalize · pillars · composite · risk_overlay · Tier-2 events · going_concern · Beneish · Dechow | 2-4 |
+| `compute/valuation/` | 6-method fair-price ensemble (DCF · RIM · Graham · Multiples · Tangible Book · …) | 3 |
+| `compute/ml/` | LightGBM walk-forward · IC validation · SHAP · Triple-Barrier · Meta-Labeling · Conformal · Autoencoder | 5 |
+| `compute/portfolio/` | HRP · NCO · Black-Litterman | 7 |
+| `compute/output/` | Pydantic schemas · JSON writers · schema-snapshot guard | 0 |
+| `compute/main.py` | Weekly orchestrator | 0 |
+| `compute/cache/` | 🚫 gitignored | — |
+| `.github/workflows/` | `compute-rankings.yml` (cron) · `compute-monthly.yml` · `ci.yml` · `manual-trigger.yml` · `pre-merge-prod-sim.yml` | 0+ |
+| `frontend/` | Next.js static export (App Router; per-stock pages) | 0 |
+| `tests/` | pytest suite (offline + `@network` gated) | 0+ |
+| `docs/` | `stock_ranking_knowledge.md` · `RESEARCH_FINDINGS.md` · `ARCHITECTURE.md` · `METHODOLOGY.md` · `archived/PHASE_0_3_WORKFLOW.md` | — |
+| `.claude/skills/` | 47 invocation-triggerable skills + `phase-N/` planning docs | — |
+
+---
+
+## JSON Output Schema (Critical Contract)
+
+The `compute/` and `frontend/` are decoupled by these JSON contracts. **Never break them.**
+
+Schema versions:
+
+| Schema | Phase | What changed |
+|--------|-------|--------------|
+| `0.1.0-phase0` | Phase 0 | Placeholder JSON only — frontend skeleton ships, no compute output yet. |
+| `0.2.0-phase1` | Phase 1 | Universe (S&P 500 from Wikipedia) + per-stock prices via yfinance. Single momentum-only ranking field. |
+| `0.3.0-phase2` | Phase 2 | SEC EDGAR fundamentals snapshot per stock — `revenue`, `net_income`, full balance sheet, EPS basic/diluted, shares outstanding. Filing-lag tracking. |
+| `0.4.0-phase3b` | Phase 3b | 8-pillar composite (`quality, value, growth, momentum, health, profitability, technical, risk`) + risk overlay annotations. 2 active vetoes (`altman_distress`, `sloan_accruals_top_decile`). NaN imputation = sector median; null pillars (`sentiment`, `ml`) redistributed pro-rata. |
+| `0.5.0-phase3c` | Phase 3c | **Fair-price ensemble (6 methods)**: Graham, P/E / P/B / EV-EBITDA multiples (4-tier peer walk + 5/95 winsorization), RIM (Penman 2013), DCF (2-stage, terminal-g ≤ WACC − 100 bp). Aggregation: median (all applicable) + max (excludes outliers > 5× / < 0.2× current). **Per-stock 1y price-history files** (`stocks/history/{TICKER}.json`, OHLCV column-major). **3rd veto** (`net_issuance_top_decile`, Pontiff-Woodgate 2008). **5 numerical guards**: stale-filing (120d soft / 180d hard), outlier 5×, terminal-g cap, sector exclusions, data-quality $10K/share ceiling (Defense #7, added mid-PR after a production spot-check surfaced upstream `shares_outstanding` corruption). **5+ annotate-only flags**: `goodwill_heavy`, `value_trap_risk`, `extreme_<method>_estimate` (×6 method slots — `<method>` is one of `graham`, `multiples_pe`, `multiples_pb`, `multiples_ev_ebitda`, `rim`, `dcf`; in practice 2–3 fire per stock), `stale_filing_soft`, `data_quality_input_corruption`. New schema fields: `StockSummary.{fair_price, max_fair_price, margin_of_safety_pct, valuation_warnings}`; `StockDetail.{fair_price (full ensemble dict), valuation_warnings, has_history, tangible_book_value}`; `RawMetrics.goodwill`; `Metadata.mos_trailing_ic_smoke`. **CI snapshot guard** (`frontend/lib/schema-snapshot.json`) makes Python ↔ TypeScript drift impossible to merge. Reason taxonomy: 21 stable identifiers. |
+| `0.6.0-phase3d` | Phase 3d | **Tier-2 event defenses + UI polish**: going-concern phrase scan over the most recent 10-K MD&A (`compute/scoring/going_concern.py`; Mayew-Sethuraman-Venkatachalam 2015 *TAR* + Loughran-McDonald financial dictionary CC BY 4.0; 14 curated phrases with `\b`-anchored regex). 8-K Item 4.02 "Non-Reliance" hard veto (`compute/scoring/eight_k_events.py`; Schroeder 2024 SSRN — ~50% of 4.02 filings precede formal restatement; 365-day lookback). 8-K Item 4.01 auditor-change soft annotate (same module; Reg S-K Item 304; 730-day lookback). **4th active veto** (`non_reliance_filing`). **Tier-2 orchestrator** (`compute/scoring/tier2.py`) shares one EDGAR fetch per ticker between the veto path and the display path. **10-K text cache** (`compute/ingest/filing_text.py`; 90-day TTL on disk). New schema fields: `StockDetail.tier2_events`; `Metadata.tier2_coverage_pct`. New UI: `Tier2EventCard` (severity-coded events with HARD VETO red / Annotate amber pills + filing links), `PillarRadarChart` (8-pillar polar radar), `FairPriceBarChart` (6-method horizontal bars + outlier graying). Reason taxonomy: 24 stable identifiers (was 21). |
+| **`0.6.0-phase3d` @ tag `v1.0.0`** (DONE 2026-05-14) | Phase 3e + audit #6 | **v1.0 ship.** No data-schema delta vs PR 3d — only additive optional fields (`StockDetail.beneish_m_score`, `StockDetail.dechow_f_score`). Git release tag is `v1.0.0`; metadata.version stays `0.6.0-phase3d`. **Tier-3 Beneish M-score** (PR #43, Beneish 1999 *FAJ* full 8-ratio, M > −2.22 → `beneish_high` ANNOTATE-only). **Tier-3 Dechow F-score** (PR #45, Dechow et al. 2011 *CAR* Model 1 with simplified RSST→TATA proxy per paper footnote 13, F > 2.45 → `dechow_high` ANNOTATE-only). **Honest Limitations README section** (PR #46). **Audit #6 deep-clean** (PRs #47-49 + #51 + #56 cache key v2): replaced 9 `_NORMALIZED_LATEST` flow items with `_TTM_FLOW_TAGS` + `_try_ttm_max_fresh` helper (catches NVDA-style stale concepts + AVB-style REIT subset patterns + WMT-style stale-DEI shares + 19 PE-NaN tickers); `pe_ratio` formula switched from single-period `eps_diluted` to `NI_TTM / shares` (universe median PE dropped **77.8 → 23.2** industry-correct); revenue / NI chains expanded for utilities (DUK `RegulatedAndUnregulatedOperatingRevenue`), banks (WFC/GS `RevenuesNetOfInterestExpense`), tech (CRWD Including-tax variant), BKNG (`NetIncomeLossAvailableToCommonStockholdersBasic`). **`non_reliance_filing` veto deferred** behind `_EIGHT_K_DEFENSES_ENABLED = False` — re-enable in Phase 4. **CI hardening**: workflow rebase-then-push commit step (PR #55) catches "main moved during compute" race. **Phase 4 UX trio + P1 audit backfill** all planning-only stubs at `.claude/skills/phase-4/<name>/PLAN.md`. **Production verification on commit `b5bc65f3` / workflow run #32**: 502 universe · 99.2% fair-price coverage · 1.0% going-concern FP rate · 3 data-quality edge cases (BRK-B / ERIE / NVR multi-class) · 646 offline tests + 17 @network. Reason taxonomy: 24 stable + 2 Tier-3 (`beneish_high`, `dechow_high`). |
+| `0.7.0-phase4g` | Phase 4g | **8-K Tier-2 event defenses re-enabled** (PR #79, merged 2026-05-15 on `c35c6d40`, closes [issue #14](https://github.com/dackclup/quantrank/issues/14)). Flipped `compute/scoring/tier2._EIGHT_K_DEFENSES_ENABLED = True` after the PR 3d workflow-timeout deferral (root cause cleared by PR #58 cache layers + PR 3d tenacity tightening). `non_reliance_filing` (Item 4.02 hard veto, 365d lookback, Schroeder 2024 SSRN — ~50% of 4.02 filings precede formal restatement) returns to the active layer as the **5th active veto**. `auditor_change` (Item 4.01 annotate, 730d lookback, Reg S-K Item 304, Cohen-Malloy-Nguyen 2020 type) joins the Tier-2 annotate surface. No data-schema-shape delta — only the feature-flag flip + reason-taxonomy expansion. |
+| `0.7.1-phase4g` | Phase 4g | **`price_change_1d_pct` additive field** (squash-merged via PR #80, commit `1509f707`). New optional `float \| None` field on `StockSummary` + `StockDetail` — day-over-day percent change from the prior trading-day close. Computed once in `compute/main.py:_fetch_prices_one` from the last two valid yfinance closes; null for newly-IPO'd tickers (only one close available). Lets the ranking-table mobile cards render a change pill without lazy-fetching 502 per-stock history JSONs. Per `phase-4/schema-versioning/PLAN.md`: "Add a new optional field (default = None) → patch". Production metadata.version stays `0.7.0-phase4g` until next weekly compute. |
+| `0.7.1-phase4g` (no schema delta) | Phase 4.5a-4.5d wave | **Earnings-manipulation defense cluster — sub-PRs 4.5a + 4.5b + 4.5c + 4.5d shipped 2026-05-16/17** (PRs #89/#90/#91 + #93 + #95 + #97). **No data-schema-shape delta** — all 9 new flag identifiers are strings appended to existing `risk_flags: list[str]` (active vetoes) + `valuation_warnings: list[str]` (annotates) arrays. Active vetoes **5 → 7**: + `beneish_manipulation_veto` (Beneish 1999, M > −1.78) + `dechow_manipulation_veto` (Dechow 2011, F > 3.0). Annotates added: `manipulation_triple_flag` (4.5a joint gate, 2 fired: SMCI · WAT), `restatement_history` (4.5b, 59 fired / 11.8% — Hennes-Leone-Miller 2008 *TAR*), `late_filing_notification` (4.5b, 2 fired: HAS · Q — Bartov-Lai-Yeung 2002 *JAR*), `rem_suspect` (4.5c, 16 fired / 3.2% — Roychowdhury 2006 *JAE* 3-proxy REM via per-sector OLS), `accruals_momentum_high` (4.5d, 50 fired / 10.0% — Sloan 1996 / Beneish 1999 Δ(TATA) > +0.05 over 3y), `loss_avoidance_pattern` (4.5d, 0 fired — Burgstahler-Dichev 1997 cohort thresholds too tight for S&P 500 large-cap universe, file as follow-up). Also closes [issue #7](https://github.com/dackclup/quantrank/issues/7) (Sloan over-firing on Financials: 21.3% → 11.7%, sector spread 7.7× → 1.4×). 2 new cache dirs (`compute/cache/edgar_amendments/` + `compute/cache/edgar_late_filings/`, 7d TTL each). Test suite **646 → 831 offline**. Reason taxonomy: 24 stable + 2 Tier-3 + 2 new vetoes + 6 new annotates = **34 stable identifiers**. |
+| **`0.10.20-phase4.6`** (issue #75 §3, merged 2026-06-14 as #477; layered on #479's `0.10.19-phase8pilot`) | IC-decay monitor production wiring | **Additive PATCH** per `schema-versioning/PLAN.md` ("new optional field default=None → patch"): new `Metadata.decay_report_url: str \| None` — URL of the IC-decay artifact (`/data/decay_report.json`, McLean-Pontiff 2016), `None` when skipped (`QR_SKIP_DECAY_MONITOR`) / degraded / legacy. Observability-only (Rule 18): the monitor NEVER vetoes / changes scores; `alert` suppressed until ≥12 monthly IC pts/pillar. `decay_report.json` is dataclass-emitted, NOT in the schema-snapshot triple (only `decay_report_url` is). Production `metadata.version` stays `0.10.18` until the next weekly compute. Defense layer UNCHANGED. |
+| **`0.10.18-phase4.6`** (issue #374 RATIFY-B, merged 2026-06-11 as #456) | Dual-class share-count fix — `shares_outstanding` reverts to company-total | **Additive PATCH**: new `RawMetrics.shares_outstanding_listed_class: float \| None` (the listed line's own per-class count). REVERSES PR #269's per-class override — `shares_outstanding` now holds the SEC companyfacts **COMPANY-TOTAL aggregate** across all classes (ASC 260, methodology-scientist RATIFY-B), so it is class-invariant and the CIK-keyed parquet cache (one file per CIK, shared by both tickers of a pair) **can no longer corrupt it** (#374 root cause closed structurally). Per-class value → the new field (checksum/display only, NO scoring consumer, populated cold-path-only). Fixes GOOGL's ~7% EPS/fair-price overstatement (EPS 29.46 → ~13.2 = Alphabet's filed figure; rank 42 → ~85; GOOG converges adjacent — both honest, artifact removal). NWS/NWSA/FOX/FOXA unchanged (aggregate counts were accidentally ASC-260-correct). Series-consistency self-heals (NSI + Dechow history already aggregate-basis → no spurious −0.80 issuance spike; invariant comments added). Tests +10 (`test_issue374_ratifyb.py` ×7 + 3 reversed-semantics repairs). Deploy: needs a cache-key bump / cold backfill to repopulate the 6 tickers (latent on warm crons until then). Spun off #455 (Phase 7.1 CIK-dedup). Defense layer UNCHANGED. |
+| **`0.10.19-phase8pilot`** (S&P 900 pilot PR 1, merged 2026-06-14 as #479) | Phase 8 | **Additive PATCH — observability-first (Rule 18)**: 4 nullable `Metadata` diagnostic fields for the S&P 900 universe-expansion pilot — `universe_cohort_sizes: dict[str,int] \| None`, `midcap_fundamentals_coverage_pct: float \| None`, `midcap_null_rate_pct: float \| None`, `midcap_cik_resolution_pct: float \| None`. Populated ONLY when `QR_UNIVERSE=sp900` (a diagnostic coverage probe over the 400 S&P 400 midcaps via `compute/ingest/universe.get_sp900_constituents` + `fetch_sp400_constituents` promoted from the scout); `None` on the default `sp500` cron. **NO ranked-output change** — `rankings.json` + `stocks/*.json` stay byte-identical (the probe never feeds `summaries`/the writer). Ships the diagnostic surface BEFORE midcaps are ranked (PR 3 wires that after ≥ 1 cron confirms midcap coverage; eligibility: in rankings day-1, AI-pick after 2 green crons). Production metadata.version stays `0.10.18-phase4.6` until the pilot cron runs. Defense layer UNCHANGED. |
+| **`0.10.21-phase8pilot`** (S&P 900 pilot PR 3a, merged 2026-06-15 as #482 `9ea26527`; layered on #479's `0.10.19-phase8pilot` + #75's `0.10.20-phase4.6`) | Phase 8 | **Additive PATCH — the integration slice**: `index_membership: str = "sp500"` added to `StockSummary` + `StockDetail` (default "sp500" so legacy/sp500-path rows deserialize under extra=forbid). Carries the `cohort` ("sp500"|"sp400") of each ranked name so the frontend (PR 4) can badge midcaps. Lands WITH the universe-load seam that ranks all ~903 names when `QR_UNIVERSE=sp900` — but the scheduled cron default stays `sp500` (gated; `compute-rankings.yml` untouched), so on the weekly cron `index_membership` is "sp500" for all 502 rows and the output is byte-identical. R6: `verify_membership_ledger.py` filters to the sp500 cohort. Backfill 500-only assertion keeps the AI-pick book 500-sourced. methodology-scientist RATIFY (defense freeze literature-sound at 900). Production metadata.version stays `0.10.20-phase4.6` until the gated cron flip. Defense layer UNCHANGED. |
+| **`0.10.22-phase8pilot`** (#487 OZK/PBF flip-blocker, merged 2026-06-15 `a0000f42`; layered on #482's `0.10.21-phase8pilot`) | Phase 8 / data-integrity | **Additive PATCH**: new `Metadata.fundamentals_unavailable_count: int \| None` — Rule-18 counter for the new `fundamentals_unavailable` **DIRECT veto**, which fires on `snap is None` (complete EDGAR ingest failure) → `cautious` + Top-5 suppression. methodology-scientist RATIFY-AS-VETO: FP rate is structurally zero (fires on input-absence, not a calibrated threshold) so annotate-before-veto (Rule 16) does not bind; DQIC (issue #18) is the governing direct-veto precedent; the `_data_quality_input_corruption(None)→False` contract is preserved (`test_D3` locks the null vs field-present partition). Defense layer **33 → 34** (8 active vetoes). Also Part A — PBF EDGAR-identity ingest fix: `_resolve_cik_for_midcap` sets the EDGAR identity before the live SEC ticker→CIK lookup for sp400 names absent from the bundled `company_tickers.parquet`. Exposed by the sp900 dispatch #103 (OZK + PBF ranked `lean_bullish` on null fundamentals). |
+| **`0.10.27-phase8pilot`** (#512 squash `78fd608423`, merged 2026-06-20) | Phase 8 / roadmap item 5 / 7a — Dividend signal | **Additive PATCH — observability-first (Rule 18)**: 3 new `StockDetail` fields (`dividend_yield_pct: float \| None` PERCENT ×100 from yfinance `dividendYield`; `pays_dividend: bool \| None` = `dividend_yield_pct > 0`; `payout_ratio: float \| None` 0-1 fraction) + 1 new `Metadata` field (`dividend_coverage_pct: float \| None` — Rule-18 coverage canary, `exchange_coverage_pct` #347 precedent). `compute/ingest/cross_source.py`: `_yf_info_fetch` 2-tuple → 4-tuple; new `fetch_yfinance_dividend(ticker)` pure cache-read off the warm `yfinance_info` cache (zero new network round-trips). `compute/main.py` Step-8 per-ticker dividend populate + post-loop `dividend_coverage_pct` aggregation. **Rankings/pillar scores/risk_flags/recommendation/vetoes byte-identical** — descriptive metadata, NOT a pillar/veto. **Defense layer UNCHANGED at 35 declared / 9 active vetoes.** `HeroAttributeTiles` "Dividend" UI tile is a SEPARATE follow-up gated on ≥ 1 cron confirming `dividend_coverage_pct` populates. +25 tests; schema triple lockstep passed. |
+| **`0.10.28-phase8pilot`** (#519 squash `5e49dca0a`, merged 2026-06-20; layered on #512's `0.10.27-phase8pilot`) | Phase 8 / S&P 1500 cutover Slice 2 | **Additive PATCH — observability-first (Rule 18)**: 3 new `Metadata` fields (all `\| None`): `smallcap_fundamentals_coverage_pct` / `smallcap_null_rate_pct` / `smallcap_cik_resolution_pct`. Wires the `sp1500` universe branch into `compute/main.py` + ships `_run_smallcap_coverage_probe` measuring sp600 coverage/null-rate/CIK-resolution BEFORE any ranked exposure; `universe_cohort_sizes` gains an `"sp600"` key under `QR_UNIVERSE=sp1500`; `Metadata.universe` emits `"SP1500"` (label `SP1500-probe`). **sp600 is PROBE-ONLY — filtered from the scored frame, NOT ranked** (`derive_index_memberships` guards sp600 from the russell1000 market-cap proxy). Cron STAYS sp900; sp1500 only under manual dispatch — no sp600 stock enters ranked output, rankings byte-identical. Also folded a WORKFLOW.md §8.6 Beneish Bonferroni sign-fix (−2.22→−2.50; stricter FWER cutoff moves UP toward 0) + **Slice 3 (Bonferroni shadow) DEFERRED** to the Slice-8 calibration. **Defense layer UNCHANGED at 35 (9 active vetoes)**. +21 tests. |
+| **`0.10.29-phase8pilot`** (#527 squash `2e45a33bf`, merged 2026-06-20; layered on #519's `0.10.28-phase8pilot`) | Phase 8 / S&P 1500 cutover Slice 4 | **Additive PATCH — annotate-before-veto (Rule 16) + observability-first (Rule 18)**: new `low_liquidity` **ANNOTATE** flag — fires when trailing-30d mean dollar volume < `ADV_FLOOR_USD` ($5M, `ADV_LOOKBACK_DAYS=30`; Amihud 2002 *J. Financial Markets* §2 illiquidity family). RANK-NEUTRAL: emitted into `valuation_warnings`, NOT `risk_flags` — no `cautious`, no Top-5 suppression, no fair-price null. New `StockDetail.average_dollar_volume: float \| None` + `Metadata.low_liquidity_annotate_count: int \| None` (Rule-18 counter). New pure `compute_average_dollar_volume(df, lookback_days)` in `compute/ingest/prices.py` (never raises, `None` on any failure); `compute/main.py` computes ADV in `_fetch_prices_one` (zero extra I/O — reuses the cached OHLCV frame). **Rankings/composite scores byte-identical**; **dormant (~0 fires) on sp900** (every S&P 900 name clears $5M ADV), lights up only on sp600. **Defense layer 35 → 36** (new annotate; 9 active vetoes UNCHANGED, 27 annotates/reserved). methodology-scientist RATIFY-SHADOW; veto promotion deferred pending ≥ 1 cron of firing-rate data + ratification. +20 tests; schema triple lockstep passed. |
+| **`0.10.30-phase8pilot`** (#564 squash `62dbf4f89`, merged 2026-06-22; layered on #527's `0.10.29-phase8pilot`) | Phase 8 / S&P 1500 cutover Slice 8 — Bonferroni multi-test shadow counter (issue #542) | **Additive PATCH — observability-first (Rule 18)**: 3 new `Metadata` fields (all `int \| None = None`): `bonferroni_shadow_live_fire_count` (M > −2.22; matches the `beneish_high` annotate count) · `bonferroni_shadow_provisional_fire_count` (M > −1.94; always ≤ live_fire_count) · `bonferroni_shadow_flip_count` (live-but-not-provisional — the false-positives a tighter threshold would suppress). New `compute/scoring/bonferroni_shadow.py` reads `beneish_m_scores`; `m = valid_count` (non-None M-scores; `α* = 0.05 / valid_count`, ZeroDivisionError-guarded) — NOT hardcoded 1500. The provisional threshold −1.94 is an ARBITRARY PLACEHOLDER between live −2.22 and soft-veto −1.78; re-derivation from the empirical sp1500 M-score SD DEFERRED post-v2.0. **SHADOW/OBSERVABILITY-ONLY — live composite scores, risk_flags, rankings, vetoes BYTE-IDENTICAL. Defense layer UNCHANGED at 36.** 20 new offline tests. methodology-scientist RATIFY-SHADOW; quantrank-reviewer PASS; schema-sentinel PASS. |
+| **`0.10.40-phase8pilot`** (#628 squash `eb20b005`, merged 2026-06-26; layered on #624's `0.10.39-phase8pilot`) | Legendary-fund program — Proposal E turnover/hysteresis + liquidity capacity tilt (FINAL slice) | **Additive PATCH — observability-first (Rule 18)**: 2 new `Metadata` fields (`hysteresis_turnover_reduction_mean_pp: float \| None` mean `turnover_reduction_pp` over backtest legs; H1 gate ≥ 15pp over ≥ 4 live rebalances · `low_liquidity_held_count: int \| None`). New pure functions in `compute/portfolio/weights.py`: `book_turnover(curr, prev)` (symmetric-diff name turnover) + `liquidity_capacity_tilt(base_weights, low_liq_tickers, *, haircut, cap)` (PRE-renorm haircut → renorm → iterative pin-redistribute re-cap reusing `inverse_vol_weights`). Per-rebalance `backtest_pit.json` SHADOW exports (`stateless_book` / `turnover_*_pct` / `liq_tilted_weights` / …); `meta.hysteresis_shadow` carries `exit=60` as a SHADOW probe only — **live band STAYS 65/55 UNCHANGED**. **DEFENSE-PRECEDENCE ASSERTION** (binding): no active-veto ticker may appear in EITHER `band_book` OR `stateless_book` (AssertionError surfaces, never silenced). **Live `band_weights`/NAV BYTE-IDENTICAL. SHADOW/OBSERVABILITY-ONLY. Defense layer UNCHANGED at 36.** Garleanu-Pedersen 2013 *JF* + Novy-Marx-Velikov 2016 *RFS* + Amihud 2002 *JFM*. |
+| **`0.10.41-phase8pilot`** (#631 squash `858bec01`, merged 2026-06-27; layered on #628's `0.10.40-phase8pilot`) | Option-B dividend pool-and-redeploy SHADOW NAV (issue #620) | **Additive PATCH — observability-first (Rule 18)**: 2 new canary `Metadata` fields (`div_pool_shadow_terminal_nav_delta_pct: float \| None` · `div_stream_coverage_pct: float \| None`) — the ONLY two in the triple; the A/B-diff (`meta.div_pool_nav_delta_pct` / `div_pool_turnover_cost_delta_bps` / `div_pool_active` / `div_pool_idle_cash_rate`) + the `nav.adaptive_div_pooled` series live on the `backtest_pit.json` ARTIFACT (C-2/E artifact-vs-triple split). Option B pools ex-date dividends as idle cash (0%, disclosed) between quarterly rebalances → redeploys into the next target basket; priced on RAW split-adjusted `Close` (avoids Adj-Close double-count) + a per-book cash bucket. `build_portfolio_nav` gains keyword-only `dividends`/`price_basis` (Option B active ONLY when `dividends is not None AND price_basis=="raw"`; `None`/`"adjusted"` ⇒ BYTE-IDENTICAL guard). `compute/ingest/prices.py` adds `actions=True` (appends `Dividends`/`Stock Splits` columns — OHLC byte-identical, scoring selects by name) + `fetch_dividends_panel` (`QR_SKIP_DIVIDENDS=1`, column-absent-graceful); called ONLY in the backfill, never in live scoring. Backfill-verify (agent-output-verifier TRUSTWORTHY): Option B −1.03% net vs Option-A instant-reinvest over ~10y, coverage 80.6%, Carino 4.7e-16; pre-merge-prod-sim ranking diff adjudicated DATA-DRIFT (cold re-fetch vs day-old baseline), not code. **Live `nav.adaptive`/headline/rankings BYTE-IDENTICAL. SHADOW/OBSERVABILITY-ONLY. Defense layer UNCHANGED at 36.** Headline flip = SEPARATE future PR + owner sign-off. +15 tests. GIPS 2020 + Dietz 1966 + Graham-Dodd. |
+| **`0.10.42-phase9pilot`** (#665 squash `ca3b1f06`, merged 2026-06-29; layered on #631's `0.10.41-phase8pilot`) | Phase 9.1 Broad Investable US universe coverage probe (Rule 18, obs-first) | **Additive MINOR — WRITE-ONLY/SHADOW on the sp1500 cron**: 6 new `Metadata` fields (`broad_universe_raw_count` / `_candidate_count` / `_screened_count` / `_price_fail_pct` / `_adv_fail_pct` / `_coverage_pct`). New `compute/ingest/broad_universe.py` fetches the "Broad Investable US" candidate pool from SEC `company_tickers.json`, applies exchange/name/ticker-format exclusions, then screens on price ≥ $5 / ADV ≥ $5M reusing the Step-1 `prices_by_ticker` dict (no extra yfinance calls); wired unconditionally into the weekday cron same-day by #667 (Phase 9.1b), NO further schema bump. HARD NAMING CONSTRAINT: NEVER "Russell 3000" anywhere in the repo. `QR_SKIP_BROAD_UNIVERSE=1` escape hatch; disk cache `compute/cache/broad_universe-v1.parquet`, 7-day TTL. **All 6 fields MUST NEVER be read by scoring/composite/pillar/veto/fair-price/`select_picks` on this probe path. Rankings/scores/flags BYTE-IDENTICAL. Defense layer UNCHANGED at 38.** |
+| **`0.10.43-phase9pilot`** (#652 squash `135bf9f7`, merged 2026-06-29; layered on #665's `0.10.42-phase9pilot`) | `restatement_history` manipulation-index weight demotion (issue #16) | **Additive PATCH — RANK-NEUTRAL**: 1 new shadow `Metadata.restatement_history_weight_demote_delta_count: int \| None`. `RESTATEMENT_HISTORY_WEIGHT` 5.0 → **0.0** in `manipulation_index.py` (over-fires 17.82% on SP1500 vs Hennes-Leone-Miller 2008 material-restatement prior of 1-3%); `RESTATEMENT_HIGH_CONFIDENCE_WEIGHT` 3.0 → **8.0** to PRESERVE the irregularity total (additive sum over `risk_flags ∪ valuation_warnings`, so confirmed-irregularity total stays 8.0, plain-restater term drops to 0.0). Flag RETAINED (still in `FLAG_WEIGHTS` at 0.0, still emitted, still in `flag_registry.py`) — **defense layer UNCHANGED at 38**. `StockSummary.rank` is the RAW pre-manipulation-index composite — only `composite_score_adjusted` + the `select_picks` exact-tie secondary key move; **live rankings BYTE-IDENTICAL**. `test_restatement_history_weight_demoted_to_zero` is the re-inflation ratchet. HLM 2008 anchor; methodology-scientist verdict = DEMOTE (not deprecate/rethreshold). |
+| **`0.10.44-phase9pilot`** (#684 squash `684e36ec`, merged 2026-07-02; layered on #652's `0.10.43-phase9pilot`) | `broad_investable_us` universe-floor scoping — ADV-floor decoupling + shadow floor-sweep (PR-1 of 2) | **Additive PATCH — SHADOW-ONLY (Rule 18)**: 6 new write-only `Metadata` fields (`broad_universe_survivors_at_5m_count` / `_at_10m_count` / `_at_15m_count` / `broad_universe_adr_suspect_count` / `broad_universe_survivor_fundamentals_coverage_pct` / `broad_universe_sector_unknown_pct`). New `BROAD_UNIVERSE_ADV_FLOOR_USD: float = 5_000_000.0` constant (== `ADV_FLOOR_USD` at launch) decouples a latent shared-constant defect between the RANKED-path investability screen and the sp1500 `low_liquidity` annotate floor (re-tuning one would have silently re-tuned the other). New pure `sweep_broad_universe_floors` + `_adv_survivors_at_floors` in `compute/ingest/broad_universe.py` (monotone-nested survivor counts at $5M/$10M/$15M). Design provenance: financial-engineer (floor-based boundary, Russell-2000 rejected) → literature-searcher (Fama-French 2008 *JF* 63(4) + Hou-Xue-Zhang 2020 *RFS* 33(5)) → methodology-scientist RATIFY-WITH-CONDITIONS (dollar level deferred to PR-2's empirical sweep + acceptance bands C1-C6 + owner sign-off). **No floor flipped. Rankings/scores/flags BYTE-IDENTICAL on every path. Defense layer UNCHANGED at 38.** +33 offline tests. |
+| **`0.10.39-phase8pilot`** (#624, merged 2026-06-26; layered on #617's `0.10.38-phase8pilot`) | Legendary-fund program — Proposal C-1 high-conviction gate counters | **Additive PATCH — PURELY ADDITIVE OBSERVABILITY (Rule 18)**: 3 new `Metadata` fields (`high_conviction_count: int \| None` · `high_conviction_ex_loss_chance_count: int \| None` · `high_conviction_below_floor: bool \| None`). The `gate="high_conviction"` is ALREADY the production selection driver in the backfill — these only MEASURE it. `_count_high_conviction(summaries)` pure helper (try/except → None); `high_conviction_ex_loss_chance_count` counts legs 1-4 only (leg 5 = loss_chance ≤ 45 OMITTED) — the marginal-bite denominator `bite = ex_loss_chance_count − hc_count` (by construction ≥ hc_count); `_passes_ex_loss_chance()` reuses `is_eligible` / `HIGH_CONVICTION_RECOMMENDATIONS` / `HIGH_CONVICTION_COMPOSITE_MIN` (no inlined literals); `high_conviction_below_floor` reads `eligible_high_conviction_count` per rebalance leg off `backtest_pit.json`. **Rankings BYTE-IDENTICAL. Defense layer UNCHANGED at 36.** Pre-registered gate-flip: hc_count ≥ 7 across all crons+legs AND marginal-bite resolves the loss-chance leg (issue #130). |
+| **`0.10.38-phase8pilot`** (#617, merged 2026-06-26; layered on #615's `0.10.37-phase8pilot`) | Legendary-fund program — Proposal C-2 MoS conviction tilt SHADOW | **Additive PATCH — observability-first (Rule 18)**: 1 new `Metadata` field (`mos_tilt_shadow_max_delta_pp: float \| None`) — the ONLY C-2 field in the Pydantic↔TS↔snapshot triple; all other C-2 fields (`rebalances[].mos_tilted_weights` / `mos_tilt_max_abs_weight_delta_pp` / `meta.mos_tilt_kappa/clip/active`) live on `backtest_pit.json` (free-form, NOT the triple — the definitive ARTIFACT-VS-TRIPLE split + precedent for C-1/E). `mos_conviction_tilt()` pure/no-I/O in `compute/portfolio/weights.py` (`m = clip(1 + 0.25·z(mos), [0.5, 1.5])`, iterative pin-and-redistribute re-cap reused); identity guards σ_mos=0 / all-None / 1-name → returns base_weights unchanged. **Live `band_weights`/NAV BYTE-IDENTICAL. SHADOW/Rule-18 only. Defense layer UNCHANGED at 36.** Graham-Dodd MoS doctrine + Stevens 1946 ratio-scale admissibility. |
+| **`0.10.37-phase8pilot`** (#615, merged 2026-06-26; layered on #607's `0.10.36-phase8pilot`) | Legendary-fund program — Proposal A shrinkage composite | **Additive PATCH — observability-first (Rule 18), IDENTITY-AT-LAUNCH**: 6 new `Metadata` fields (`shrinkage_lambda` · `shrinkage_lambda_applied` · `ic_weight_by_pillar` · `shrinkage_blended_weight_by_pillar` · `n_preliminary_pillars` · `shrinkage_weights_degenerate`). New `compute/scoring/shrinkage.py`: `w = λ·w₀ + (1−λ)·w_IC` with `SHRINKAGE_LAMBDA_PIN=1.0` + every pillar currently preliminary → `blended_w == PHASE3_EFFECTIVE_WEIGHTS` → `compute_composite` called with byte-identical weights. `shrinkage_blended_weight_by_pillar` is the byte-identity CANARY (MUST equal `PHASE3_EFFECTIVE_WEIGHTS` while pinned); `shrinkage_weights_degenerate=True` (insufficient IC history) is NORMAL at launch. #605 consolidation: `walk_ic_history()` does ONE git-walk feeding decay-monitor + half-life + shrinkage (try/except → degrade-to-empty). Pin-lift gate A3-i (n ≥ 24 months/active pillar, Timmermann 2006 §3) + A3-ii (OOS horse-race, 1/N prior if no gain). **Composite/rankings BYTE-IDENTICAL. SHADOW/Rule-18 only. Defense layer UNCHANGED at 36.** Timmermann 2006 + Grinold-Kahn 2000 + Ledoit-Wolf 2004 (as principle). |
+| **`0.10.36-phase8pilot`** (#607, merged 2026-06-26; layered on #604's `0.10.35-phase8pilot`) | Legendary-fund program — Proposal D market-regime diagnostic | **Additive PATCH — WRITE-ONLY/SHADOW (Rule 18)**: 2 new `Metadata` fields (`market_breadth_above_200dma_pct: float \| None` + `market_regime_state: str \| None` ∈ `"risk_on"`/`"neutral"`/`"risk_off"`). New `compute/scoring/regime.py::compute_market_regime` reads Step-1 `prices_by_ticker` (NO new data source) → % of universe above its 200-day SMA + a Tier-3 regime label; `REGIME_RISK_ON_THRESHOLD=60.0` / `REGIME_RISK_OFF_THRESHOLD=40.0` in `config.py`. **HARD CONSTRAINT**: these two fields MUST NEVER be read by scoring/composite/pillar/veto/fair-price/`select_picks`/weights (Welch-Goyal 2008 *RFS* 21(4) — equity-premium predictors fail OOS; breadth-as-tilt REJECTED as disguised market timing). **Rankings/scores/flags BYTE-IDENTICAL. Defense layer UNCHANGED at 36.** Seeds a future Phase-7 HMM only. |
+| **`0.10.35-phase8pilot`** (#604, merged 2026-06-26; layered on #601's `0.10.34-phase8pilot`) | Legendary-fund program — Proposal F IC half-life monitor (first slice) | **Additive PATCH — observability-first (Rule 18)**: 2 new `Metadata` fields (`pillar_ic_half_life_months: dict \| None` + `pillar_ic_decay_fit_model: str \| None`). Fits a decay model to the per-pillar monthly-IC panel (the same panel the #75 IC-decay monitor walks); SHADOW/OBSERVABILITY-ONLY — never vetoes/changes scores. Closed #605 via `walk_ic_history` (ONE git-walk feeds decay-monitor + half-life + shrinkage); feeds the deferred shrinkage composite (Proposal A). +17 tests. **Live rankings/scores BYTE-IDENTICAL. Defense layer UNCHANGED at 36.** McLean-Pontiff 2016 + Di Mascio 2022. |
+| **`0.10.34-phase8pilot`** (#601, merged 2026-06-26; layered on #588's `0.10.33-phase8pilot`) | Legendary-fund program — two-factor `value_trap_risk` gate LIVE flip | **VERSION-BUMP-ONLY — NO new field**: promotes the #588 two-factor `value_trap_risk` shadow counter's LSV 1994 second leg (trailing P/E below sector-peer median, layered on the Penman 2013 `ROE ≤ Ke` single-leg gate) from SHADOW to LIVE emission. The pre-existing `value_trap_risk_two_factor_shadow_count` Metadata field is retained as the canary; no schema-shape delta beyond the SCHEMA_VERSION bump. Annotate-only (`valuation_warnings`), rank-neutral. **Defense layer UNCHANGED at 36.** Penman 2013 + LSV 1994. |
+| **`0.10.33-phase8pilot`** (#588 squash `d3058434`, merged 2026-06-24; layered on #590's `0.10.32-phase8pilot`) | Phase 8 / valuation annotate recalibration — two-factor `value_trap_risk` LSV shadow counter (issue #586) | **Additive PATCH — observability-first (Rule 18)**: 1 new `Metadata` field (`value_trap_risk_two_factor_shadow_count: int \| None`). The LIVE `value_trap_risk` warning fires on the Penman 2013 single-leg `ROE ≤ Ke` condition; this shadow counter measures the universe-wide TWO-factor firing rate (LSV 1994 §3 second leg — trailing P/E below sector-peer median) WITHOUT changing live emission. Shadow gate fires iff (a) the live single-leg condition fires AND (b) `eps_ttm > 0` (P/E defined) AND (c) P/E < sector-peer median P/E; loss-makers (`eps_ttm ≤ 0`) are EXEMPT. **Live `valuation_warnings` BYTE-IDENTICAL — the old single-leg warning still emits on `ROE ≤ Ke` alone. SHADOW/Rule-18 only. Defense layer UNCHANGED at 36.** methodology-scientist RATIFY-WITH-AMENDMENT; +13 tests. |
+| **`0.10.32-phase8pilot`** (#590 squash `54cb5bcb`, merged 2026-06-24, issue #587) | Phase 8 / valuation annotate recalibration — `extreme_estimate_majority` low-applicability floor (RE-BASE-WITH-FLOOR) | **Additive PATCH — annotate-first (Rule 16) + observability-first (Rule 18)**: adds 2 new `config.py` constants (`EXTREME_MAJORITY_LOWAPP_MAX=3` / `EXTREME_MAJORITY_LOWAPP_MIN=2`) + 1 new `Metadata` field (`extreme_estimate_majority_lowapp_count: int \| None`). New `_extreme_majority_fires(n_extreme, n_applicable) -> bool` pure helper extracted from the ensemble firing site (directly pinnable by test-engineer). The low-applicability floor fires `extreme_estimate_majority` when `n_applicable ≤ 3 AND n_extreme ≥ 2 AND n_extreme > n_applicable − n_extreme` (strict majority), closing the S&P 1500 small-cap false-negative dead-zone (GFF MoS −1143.9% / SMTC −938.7% each had 2 of 3 applicable methods extreme — invisible to the 3-of-6 baseline). S&P 500 cohort (5-6 applicable methods) **byte-identical**. EnsembleResult gains `extreme_majority_lowapp: bool` per-ticker signal that drives the Rule-18 Metadata counter. Blast radius pre-measured on cron 8c89a5af0: **56 old-rule fires → 72 new-rule fires, 16-ticker delta** (GFF, SMTC, DD, NRG, LGIH, GEV, BILL, TTWO, HASI, HIMS, CRWD, MSGS, NABL, CHTR, COKE, EMBC). **Annotate-only — no composite change, no veto, no Top-5 suppression. Defense layer UNCHANGED at 36.** Replay validation 56/72/16 confirmed. |
+| **`0.10.31-phase8pilot`** (#565 squash `2c9dc1371`, merged 2026-06-22; layered on #564's `0.10.30-phase8pilot`) | Phase 8 / roadmap item 5 / 7b — Security-type (Type) HeroAttributeTile ingest PR-1 (issue #541) | **Additive PATCH — observability-first (Rule 18)**: 2 new schema fields — `StockDetail.security_type: str \| None` (label from yfinance `fast_info.quote_type` via `_QUOTE_TYPE_LABEL` map; unknown codes pass through verbatim) + `Metadata.security_type_coverage_pct: float \| None` (Rule-18 coverage canary). `compute/ingest/cross_source.py`: `_yf_fast_exchange` widened to a 2-tuple `(exchange_code, quote_type)`; new `fetch_yfinance_security_type(ticker)` pure cache-read off the warm `yfinance_info` cache (zero new round-trips). `compute/main.py` Step-8 populate + coverage aggregation; graceful try/except → `None` everywhere; ADR detection is `TODO(#541 PR-1b)`. **NO UI wiring — the "Type" tile stays 'Coming soon' until a UI PR-2 gated on ≥ 1 sp1500 cron confirming the canary.** Display-only — **rankings/scores/flags byte-identical**; **Defense layer UNCHANGED at 36**. +17 tests; schema triple lockstep passed. |
+| **`0.10.26-phase8pilot`** (#501 squash `72ee8667d`, merged 2026-06-19) | Phase 8 / cross-source data-integrity | **Additive PATCH — observability-first (Rule 18)**: 4 new `Metadata` fields (all `\| None`, default `None`): `cross_source_corruption_correct_candidate_count` / `_veto_candidate_count` / `_ratio_disagreement_count` / `_inferred_ratio_by_ticker`. New `grade_cross_source_corruption()` pure function + `CorruptionGradeResult` dataclass (NO_FIRE / CORRECT_CANDIDATE / VETO_CANDIDATE) + `compute_cross_source_corruption_shadow()` aggregator in `compute/scoring/risk_overlay.py`. `DELTA_CORRUPTION_THRESHOLD=0.50` (Ince-Porter 2006) + `INTEGER_RATIO_TOLERANCE=0.10` in `config.py`. Dual-ratio corroboration: both `mc_ratio` AND `share_ratio` must round to the same integer for CORRECT_CANDIDATE (COKE gold fixture → VETO_CANDIDATE + ratio_disagreement=True; BKNG → NO_FIRE; CVNA → CORRECT_CANDIDATE inferred_ratio=5; KLAC → NO_FIRE). **Rankings byte-identical (MUTATES NOTHING)**. **Defense layer UNCHANGED at 35 (9 active vetoes)**. PR-2 veto/correction wiring gated on yfinance `.splits` corroboration + methodology re-anchor Q3 2026-08-19. methodology-scientist RATIFIED-WITH-CONDITIONS; 2094 tests. |
+| **`0.10.25-phase8pilot`** (#499 squash `816cda0ea`, merged 2026-06-18) | Phase 8 / corporate-action data-integrity | **Additive PATCH** (Rule 18 + Rule 9 audit): `RawMetrics.shares_outstanding_pre_split_raw: float \| None` (pre-correction EDGAR value, audit only) + 3 `Metadata.*` counters (`post_split_share_lag_count` / `post_split_correction_applied_count` / `post_split_veto_count`; `count == applied + veto`). New **`post_split_share_lag`** Tier-1 annotate (CORRECT EDGAR share-count lag after a split ≤100d/≥2×/±10% → corrects `shares_outstanding` at `main.py` Step 3b BEFORE DQIC) + **`post_split_share_lag_unreconciled`** Tier-2 direct veto (mismatch → `cautious` + null `fair_price`, `_CAUTIOUS_FORCING_RISK`). methodology-scientist RATIFIED HYBRID (FP ~0, ruling IS the gate). New `compute/ingest/splits.py` yfinance `.splits` fetcher (`POST_SPLIT_WINDOW_DAYS=100` / `MIN_RATIO=2.0` / `RATIO_TOLERANCE=0.10`). **Defense layer 34 → 35** (9 active vetoes). Folded-in leg-3 override: `main.py` Step 3b passes the direct yfinance `sharesOutstanding` (`fetch_yfinance_shares_outstanding`, cache-read off the existing market_cap `.info` round-trip) so leg-3 compares share counts directly (cache-timing-robust; KLAC reliably Tier-1). LIVE RANKING CHANGE next cron: KLAC P/E 6.68→~66.8, rank-2 de-inflates (CVNA/COKE similar). |
+| **`0.10.24-phase8pilot`** (#496/PR-A, 2026-06-18 — merged) | Phase 8 / #177 valuation | **Additive PATCH — observability-first (Rule 18)**: shadow `FairPriceEnsemble.median_trimmed: float \| None` + `methods_excluded_from_median: list[str]` (two-regime trim: minority-extreme → median of non-extreme subset; majority-collapse <2 survivors → null); new `Metadata.median_trim_delta_count: int \| None` (universe count of tickers whose MoS sign would flip under the trim). methodology-scientist RATIFIED-WITH-CONDITIONS (Issue #177 follow-up; frozen pre-registration). **Live `median`/`mos_pct` byte-identical** — trim does NOT feed `mos_pct`; behavioral flip is a separate PR gated on ≥1 cron + data-scientist V55.1-gauntlet. 33 tickers (3.8%) would flip MoS sign on the 2026-06-18 blast-radius run (FFIV −27.6%→+15.8%; flippers structure-driven across sectors). Defense layer UNCHANGED at 34. |
+| **`0.10.23-phase8pilot`** (#493, 2026-06-16) | Phase 8 | **Additive PATCH**: `index_memberships: list[str]` on `StockSummary` + `StockDetail` (default `[]` via `default_factory=list`, deserializes pre-0.10.23 JSON under `extra="forbid"`). Carries primary cohort ("sp500"\|"sp400") PLUS "dow30"/"ndx" for Dow 30 / NASDAQ-100 overlap members. `index_membership` (singular) UNCHANGED — MidcapChip + verify_membership_ledger.py depend on it. `universe.py` adds `fetch_dow30_constituents`/`fetch_ndx_constituents` (Wikipedia, 7-day cache, graceful-degradation) + `derive_index_memberships`. Frontend: `RankingView.tsx` DJI/NDX data-driven tabs. **#494** (2026-06-17, same `0.10.23-phase8pilot` — NO schema bump) adds the Russell 1000 (RUI) tab via market-cap proxy (`"russell1000"` appended to the existing list iff `market_cap > 0`; every S&P 900 name qualifies by construction); RUT/RUA stay SOON. Ledger UNTOUCHED. Defense 34 UNCHANGED. |
+| **`0.10.17-phase4.6`** (issue #441 close-out merged 2026-06-10) | Phase 4 technical pillar — MAD REMOVAL + dead `macd_hist` slot deletion | **REMOVAL PATCH**: the 3 `Metadata.mad_*` diagnostics deleted — the pre-registered acceptance gate FAILED on the first real cron (2026-06-10, `1d12b097`): `mad_mom12_corr` 0.834 / `mad_mom3_corr` 0.807 ≫ the \|ρ\| < 0.30 line at 99.6% coverage → decisive momentum echo (MAD 21/200 ≈ the `mom_12_1` window mechanically; artifacts all bias ρ downward; ~20 SE → one cron decision-grade). `methodology-scientist` RATIFY-REMOVE: no literature contradiction (AKS 2021 / HZZ 2016 = CONDITIONAL incremental alpha; a fixed-weight linear pillar can't harvest the orthogonal residual — wiring would double-count momentum past its 0.10 weight). Also deletes the dead `macd_hist` slot in `pillars.py` (float-vs-dict check → always-NaN → skipna-dropped; the technical pillar was already a de-facto 4-metric mean, now honestly so: rsi_dist50 / adx / bb_pctb / mfi). `technical.macd_signal` itself stays. Δcomposite = 0 expected (simulate-proven; Rule-7 coverage-denominator 3-of-5 → 2-of-4 edge noted, Δrank = 0 since all 4 live metrics share one OHLCV frame). 15 MAD tests removed; evidence preserved in PHASE_STATUS_INFLIGHT.md + the issue #441 close-out. NO replacement 5th input without a fresh pre-registration. Defense layer UNCHANGED. |
+| **`0.10.16-phase4.6`** (PR #447 merged 2026-06-10) | Phase 4 technical pillar — MAD factor diagnostics | **PATCH bump** for 3 additive `Metadata.mad_*` fields: `mad_coverage_pct` (% of the pillar-stage universe with finite `technical.mad_scalefree`; denominator = `len(pillar_df.index)` per the `alpha158_coverage_pct` precedent) · `mad_mom12_corr` · `mad_mom3_corr` (cross-sectional Spearman ρ of MAD vs the momentum pillar inputs `mom_12_1` / `mom_3_1`, rank-then-Pearson because pandas ≥ 2.2 delegates `method="spearman"` to scipy which is not a dep; < 3 finite pairs or zero variance → `None`, JSON never carries NaN). **Observability-only (Rule 18)** — the #442 construct stays UNWIRED; `pillars.py` zero-diff (dead `macd_hist`=50 inert) → Δcomposite = 0. Whole diagnostic block graceful-degradation try/except → all 3 fields `None` + one warning. Feeds the PR-2 wiring gate after ≥ 1 real cron: BOTH \|ρ\| < 0.30 AND coverage ≥ 90% (either ρ ≥ 0.30 = momentum echo → REMOVE per issue #441), simulate Top-5/`entered_top5` diff (Rule 16) at wiring time. Tests 1589 → 1602 (+13). Defense layer UNCHANGED. |
+| **`0.10.15-phase4.6`** (PR #426 in flight, 2026-06-06) | Phase 4j.1 — Qlib Alpha158 observability surface | **PATCH bump** for 9 additive `Metadata.alpha158_*` fields: `alpha158_features_used` · `alpha158_excluded_features` · `alpha158_features_ic_12m` · `alpha158_features_missing_from_compute` · `alpha158_features_dropped_no_long_short` · `alpha158_gate_diagnostics` (reuses the existing `OsapGateDiagnostic` model) · `alpha158_coverage_pct` · `alpha158_survivorship_bias_corrected` · `alpha158_wall_clock_seconds`. First Phase-4 factor-INTEGRATION PR: a feature→decile-spread long-short-return adapter (`compute/features/alpha158_replicate.py`, Grinold-Kahn 2000 Ch.6 Fundamental-Law construction) feeds the 158 Alpha158 features through the existing Phase-4h PBO/DSR gate (`osap_validation.gate_osap_signals`, reused verbatim, `n_trials=158`); accounting equation `158 == missing + dropped + used + excluded` closed + Hypothesis-property-tested. **Observability-only (Rule 18)** — blends NOTHING, `composite_score` byte-identical (Δscore = 0); the rank-influencing blend + the `\|φ\| < 0.30` orthogonality gate are deferred to 4j.2. Live feature source (Qlib `.bin` BYO `dump_bin`) deferred — `_acquire_alpha158_inputs` raises until the bin cache lands → graceful degradation nulls every field (methodology-scientist pre-ratified `used=0`/all-None on the early crons). Defense layer UNCHANGED. |
+| **`0.10.14-phase4.6`** (PR #416 merged, Phase 7.0 PR-1) | Phase 7.0 — benchmark index export | **PATCH bump** for 1 additive field `Metadata.benchmark_coverage_pct: float \| None` — Rule-18 observability for the benchmark index export (SPY/QQQ/DIA/IWM → `portfolio/benchmarks.json`) backing the AI-pick portfolio backtest NAV comparison. **DISPLAY / backtest-only** — no ranking/scoring/veto impact. Defense layer UNCHANGED. (SKILL.md row gap-filled retroactively in PR #426 — the original 0.10.14 bump shipped without it.) |
+| **`0.10.13-phase4.6`** (listing-metadata canary, 2026-06-02 post-cron audit) | Country-coverage canary + CBOE `BTS` fix | **PATCH bump** for 1 additive field: `Metadata.country_coverage_pct: float \| None`. The 0.10.12 design assumed `country` tracked `exchange` 1:1 ("no separate counter needed"); the post-cron stock-detail audit DISPROVED that — `exchange_name` passes an unknown code through verbatim (counts as covered) while `country_for_exchange` resolves only known US codes, so the two DIVERGE on a raw passthrough code. CBOE's `BTS` venue code (Cboe Global Markets self-lists on Cboe BZX; `BTS` ≠ the already-mapped `BATS`) showed `exchange_coverage_pct = 100%` / country = 99.8% (CBOE country null). `country_coverage_pct` is the strict-resolution canary `exchange_coverage_pct` structurally cannot be; `main.py` logs a divergence WARNING when country < exchange. Paired in the same PR with the `BTS → Cboe BZX` entry in `cross_source._EXCHANGE_NAME_BY_CODE` (fixes BOTH CBOE's exchange chip + country flag, since `_US_EXCHANGE_CODES` derives from the dict keys). The `_exchange_coverage_pct` helper generalized to `_coverage_pct` (shared by both metrics). **DISPLAY-ONLY** — no ranking/scoring/veto impact. Defense layer UNCHANGED. |
+| **`0.10.12-phase4.6`** (PR-A1, listing metadata) | Country + exchange ingest (PR-A of the hero listing-chips work) | **MINOR bump** for 3 additive fields: `StockDetail.exchange: str \| None` + `StockDetail.country: str \| None` + `Metadata.exchange_coverage_pct: float \| None`. `exchange` = display name mapped from yfinance `fast_info.exchange` code (NMS→NASDAQ, NYQ→NYSE, … via `cross_source.exchange_name`); `country` = derived from the exchange ("US" for the whole S&P 500 universe, via `cross_source.country_for_exchange`); both `\| None` when the code didn't resolve. `exchange_coverage_pct` = Rule-18 observability (% of universe with a non-null exchange). Ingest rides the existing `cross_source.py` `yfinance_info/<ticker>.json` cache (one Ticker round-trip, exchange merged alongside `market_cap`; QR_SKIP_CROSS_SOURCE honored). **DISPLAY-ONLY** — no ranking/scoring/veto impact; the hero country/exchange chips (which replace the sector+industry chips, removing them from the #1 row) land in **PR-B** after ≥ 1 cron confirms coverage (observability-before-wiring). main.py wiring (populate the fields + compute coverage) was PR-A2 (merged as PR #349). Defense layer UNCHANGED. |
+| **`0.10.11-phase4.6`** (PR #303 merged 2026-05-29 `847c21b`) | Phase 4.5e PR 6 — Form-4 10b5-1 negation guard | **PATCH bump** for new `Metadata.form4_negation_guard_downgrade_count: int \| None` field. Counts True → False downgrades applied by the post-detector 10b5-1 negation guard during Form-4 cache build (residual footgun #1 from PR 4-eq). 11-token bidirectional ±5-word-token regex (`terminated` / `cancelled` / `canceled` / `expired` / `rescinded` / `discontinued` / `no` / `not in effect` / `previously` / `former` / `without`) wraps `edgar.ownership.core.detect_10b5_1_plan` and downgrades True → False on negation match. Pre-PR-4-eq Mode B verdict (2026-05-23) pre-approved the hardening; PR 6 = pure engineering. Expected delta firing-rate `+5% to +10% relative` on `insider_sell_cluster` per Cohen 2008 §III + Jagolinzer 2009 §3.2 (absolute << 1%; most 10b5-1 disclosures are affirmative). Null semantics mirror `form4_wall_clock_seconds`: None when `FORM4_FETCH_SKIP=1` OR outer try/except fired. Gates Q3 2026-08-19 cohort-acceptance check (issue #130) for `INSIDER_SELL_CLUSTER_WEIGHT` 5.0 → 7.0 promotion alongside `form4_rule10b5_one_excluded_count`. ZERO scoring change; defense layer 33 declared boolean flags UNCHANGED (PR hardens existing input filter; no new flag). |
+| **`0.10.10-phase4.6`** (PR #300 merged 2026-05-28 `5fa9a443`) | Issue #67 follow-up — per-sector `value_trap_risk` delta instrumentation | **PATCH bump** for new `Metadata.value_trap_risk_delta_by_sector: dict[str, int] \| None` field per methodology-scientist Mode B Q2 verdict (deferred from PR #294). Keyed by GICS sector name; values are `without_sector_coe[sector] - with_sector_coe[sector]` — positive = sector dropped flags after `USE_SECTOR_COE = True` flip (Damodaran 2019 Ch. 8.4 predicts Utilities / Real Estate / Consumer Staples positive; Information Technology / Energy negative). Computed every cron regardless of `USE_SECTOR_COE` so Q3 2026-08-19 cohort audit has visible per-sector shape. Tests 1367 → 1369 (+2 schema-contract). ZERO scoring change; field nullable per Rule 18. |
+| **`0.10.9-phase4.6`** (PR #297 merged 2026-05-28 `ecb60e64`) | Issue #287 PR A — durable timeout + per-loop wall-clocks | **PATCH bump** for 4 new `Metadata.*_wall_clock_seconds: float \| None` fields (`tier2`, `form4`, `osap`, `cross_source`). Paired with `.github/workflows/compute-rankings.yml` `timeout-minutes: 150 → 195` + cache-restore canary step (10 cache dirs, ~30s) that surfaces cache eviction before any SEC fetch begins. 4 distinct defensive patterns: Tier-2 outer try/except wraps ThreadPoolExecutor (None on interpreter failure); Form-4 start INSIDE the `else:` branch (None when `FORM4_FETCH_SKIP=1` per Issue #287 PR B gate); OSAP start before try (None in except; QR_SKIP_OSAP still populates a small float because it bypasses freshness gate only); Step 8 always populated. Wall-clock fields semantically distinct from `fundamentals_latency_p95_seconds` — those measure per-ticker p95 (tenacity-cascade detector); these measure total loop duration (budget-overrun + cache-eviction detector). Empirically validated on cron Run #71 (`368dccd9`, 2026-05-28 08:44 UTC): all 4 fields populated correctly, total ~8.2 min instrumented under 195m ceiling. Companion PR #298 cache-v5 bump closes the silent-failure gap surfaced by this PR's Rule 18 instrumentation (PR #292 Branch 3 fix never fired due to warm-cache replay short-circuit). |
+| **`0.10.8-phase4.6`** (PR #292 merged 2026-05-28 `e9aaab31`) | Issue #288 — GOOG/GOOGL XBRL concept-name omission fix | **PATCH bump** for new Rule 18 disambiguator `Metadata.multi_class_per_class_attempt_count`. PR #269 (`5bf38c12`) per-class XBRL override never fired in production since landing — `_fetch_shares_from_per_filing_xbrl` queried only 2 of the 3 needed XBRL concepts (`us-gaap:CommonStockSharesOutstanding` was the missing one; Alphabet files per-class share counts under this concept). Fix adds the missing concept to the tuple; counter disambiguates "branch never reached" (attempt=0) vs "XBRL returned None" (attempt>0, override=0). GOOG/GOOGL display `market_cap` corrected from ~$4.66T/$4.71T to ~$2.09T/~$2.59T per class on cron Run #72+ (cache-v5 bump per PR #298 forces fresh fetch); composite/rankings UNAFFECTED. Annotate-only safety net (`multi_class_aggregate_shares_suspected`) continues to fire. 4 new regression tests authored by `test-engineer`. |
+| **`0.10.7-phase4.6` @ tag `v1.4.0-phase4.6`** (PR #283 release 2026-05-27 `a820caee`) | Phase 4.6 honest re-validation harness | **MINOR bump** for Phase 4.6 additive `Metadata` fields landing across PRs #274-#282 (universe-provenance + survivorship-bias historical S&P 500 membership per Hou-Xue-Zhang 2020 RFS + ranking history time-series loader via git-archive + forward-return loader from gitignored price cache + per-pillar Spearman IC orchestrator via rank-then-Pearson, no scipy dep + manipulation-index distribution shift report). `scripts/generate_honest_baseline.py` CLI added with McLean-Pontiff 2016 32%-decay banner pinned in 5-phrase mandatory disclaimer. ZERO scoring / Top-5 / composite delta — all additive observability + offline-validation modules. |
+| **`0.10.6-phase4.5e`** (PR #269 merged 2026-05-26 `5bf38c12`) | Issue #261 PR-B — per-class XBRL extraction | **Structural fix for GOOG/GOOGL `$4.6T` overcount.** New `config.MULTI_CLASS_OVERCOUNT_ALLOWLIST: dict[str,str]` mapping ticker → exact XBRL class-member string (`GOOGL → "us-gaap:CommonClassAMember"`, `GOOG → "goog:CapitalClassCMember"` ← **filer-specific namespace gotcha** per edgar-debugger probe). `_fetch_shares_from_per_filing_xbrl` extended with `target_class_member` parameter; new elif branch in `_build_snapshot` fires when ticker is on allowlist + primary is plausible aggregate-shape. 2 new `Metadata` fields: `multi_class_per_class_override_count` (expected ~2 = GOOG + GOOGL) + `multi_class_mc_reconcile_failure_count` (Rule-18 defensive). PATCH — additive. ZERO behavior change for 500 non-allowlist tickers. |
+| **`0.10.5-phase4.5e`** (PR #264 merged 2026-05-26 `d9c62292`) | Issue #261 PR-A — multi-class CIK-collision annotate | **New `multi_class_aggregate_shares_suspected` annotate** + Rule 18 `Metadata.multi_class_aggregate_shares_suspected_count: int \| None`. Fires when two or more tickers share the same CIK AND each ticker's market_cap > 10% of universe-median (`MARKET_CAP_FLOOR_RATIO = 0.10`). Annotate-only; composite rank unchanged. Defense layer 32 → 33 declared. Expected steady-state firing ≈ 6 (GOOG / GOOGL / NWS / NWSA / FOX / FOXA). PATCH — additive `Metadata` field only. Companion PR #265 renamed Site-2 DQIC emission to `valuation_output_anomalous` without schema delta. |
+| **`0.10.4-phase4.5e`** (PR #257 merged 2026-05-24) | Issue #248 PR2b — multi-class dimensional override | **Per-filing XBRL dimensional override** for known multi-class issuers (V / NWS / NWSA / FOX / FOXA / BRK-B / STZ allowlist via `config.MULTI_CLASS_SHARE_ALLOWLIST`). When `companyfacts` returns a plausible primary `shares_outstanding` but the ticker is on the allowlist, peek per-filing XBRL; if the dimensional sum across all classes exceeds primary, the summed value is the truth (Damodaran 2019 Ch. 16). Rule 18: `Metadata.shares_fallback_dimensional_override_count: int \| None`. PATCH — additive observability field. |
+| **`0.10.3-phase4.5e`** (PR #256 merged 2026-05-24) | Issue #246 PR2a — cross-source observability | **Cross-source disagreement observability surface.** 4 new optional `Metadata` fields land simultaneously: `cross_source_disagreement_count`, `cross_source_delta_histogram` (9-bucket universe-wide distribution), plus `shares_fallback_triggered_count` + `shares_fallback_too_low_count` (separates ERIE-class too-low path from STZ-class None path, retrofit for PR #253). Plus 1 new optional `StockSummary.cross_source_delta: float \| None`. PATCH — all additive, nullable on legacy snapshots. Gates the PR2b severe-threshold decision with empirical 1-cron data. |
+| **`0.10.2-phase4.5e`** (PR #224 merged 2026-05-23) | Phase 4.5e PR 4-eq — 10b5-1 filter | **10b5-1 contamination filter** on `_is_opportunistic_sell` (Jagolinzer 2009 §3.2 — 40-60% FP reduction). Accessed via footnote-text pattern scan (`detect_10b5_1_plan` regex). `footnotes` added to `_NON_DERIVATIVE_TX_REQUIRED_ATTRS` + `_OWNERSHIP_REQUIRED_ATTRS` + new `_FOOTNOTES_REQUIRED_ATTRS`. Rule 18: `Metadata.form4_rule10b5_one_excluded_count: int \| None`. PATCH — additive. Tests 1144 → 1160+. Defense emitted flags UNCHANGED at 32 (filter is signal-quality, not new flag). |
+| **`0.10.1-phase4.5e`** (PR #222 merged 2026-05-23) | Phase 4.5e PR 3 — insider-cluster annotates | **Two new annotate-only flags**: `insider_sell_cluster` (≥ 3 distinct insiders, opportunistic `{S,D}` codes, 30d rolling, CMP 2012) + `c_suite_unusual_sell` (≥ 2 CEO/CFO/President insiders, same window, JMZ 2003). Reserved weights downgraded from `RESERVED` constants to active `FLAG_WEIGHTS` entries (5.0 + 3.0 delta). Rule 18: `Metadata.insider_sell_cluster_firing_count` + `c_suite_unusual_sell_firing_count`. PATCH — additive `Metadata` fields only. Defense layer 30 → 32. Tests 1115 → 1144. |
+| **`0.10.0-phase4.5e`** (PR #205 merged 2026-05-22) | Phase 4.5e PR 2 — Form-4 observability | **MINOR bump** (multiple additive fields land simultaneously per semver convention). 7 new `Metadata` fields: `form4_enabled` · `form4_coverage_pct` · `form4_fetch_latency_p50_seconds` · `form4_fetch_latency_p95_seconds` · `form4_universe_insider_count_median` · `form4_tickers_with_recent_activity` · `form4_fetch_failures`. 1 new `StockDetail` field: `form4_diagnostics`. New verify-helper Section K. ZERO scoring impact; `_FORM4_FLAGS_ENABLED` stays False. Supersedes the 0.9.8 PATCH after rebase. |
+| **`0.9.8-phase4h.8`** (PR #204 merged 2026-05-22) | Issue #67 — sector-adjusted CoE | **GICS-keyed Damodaran sector-CoE dict** (11 sectors) behind `config.USE_SECTOR_COE = False` gate. Rule 18: `Metadata.sector_coe_enabled` + `value_trap_risk_count_without_sector_coe` + `value_trap_risk_count_with_sector_coe`. PATCH. Tests +35. Backward-compatible — all new fields optional, flag OFF by default. |
+| **`0.9.7-phase4h.7`** (PR #183 merged 2026-05-21) | Issue #177 — `extreme_estimate_majority` | **New `extreme_estimate_majority` annotate** + Rule 18 `Metadata.extreme_estimate_majority_count: int \| None`. Fires when ≥ `EXTREME_MAJORITY_THRESHOLD = 3` of 6 valuation methods emit `extreme_*_estimate` — Huber 1981 §1.4 breakdown-point rationale. Annotate-only pending ≥ 1 cron firing-rate data. PATCH. Defense layer 29 → 30. Tests 1049 → 1059. |
+| **`0.9.6-phase4h.6`** (PR #181 merged 2026-05-21) | Issue #176 — `share_count_extraction_missing` | **New `share_count_extraction_missing` annotate** + Rule 18 `Metadata.share_count_extraction_missing_count: int \| None`. Fires when `shares_outstanding is None AND revenue > 0 AND total_assets > 0`. PATCH. Defense layer 28 → 29. Tests 1031 → 1040. PR #182 (same day) adds per-filing XBRL fallback recovery — no schema change. |
+| **`0.9.5-phase4h.5`** (PR #180 merged 2026-05-21) | Phase 4b — `loss_avoidance_pattern_size_invariant` | **New `loss_avoidance_pattern_size_invariant` annotate** + Rule 18 `Metadata.loss_avoidance_size_invariant_firing_count: int \| None`. Fires when `NI / TotalAssets ∈ [0, 0.005]` for 3+ consecutive fiscal years — Roychowdhury 2006 *JAE* Table 1 §5.2 suspect-firm cutoff. PATCH. Defense layer 27 → 28 emitted boolean flags. Tests 1024 → 1031. Backward-compatible — additive field, no consumer migration. |
+| **`0.9.4-phase4h.4`** (PR #161 merged 2026-05-20) | Epic #150 Phase 2.1 | **`valuation_methods_applicable` schema surfacing.** PATCH bump per "additive optional field" convention. 1 new optional field on `StockDetail` (and nested in `fair_price` dict): `valuation_methods_applicable: int` — counted as the positive-framed inverse of `extreme_*_estimate` warnings emitted in `compute/valuation/ensemble.py`. Surfaces the method-applicability signal explicitly at the schema-snapshot level so downstream filtering / audits can use it without deriving from the warning list. Additive only — no consumer migration; `loss_chance.py` and `FairPriceBarChart.tsx` keep reading `extreme_*_estimate` for back-compat. Defense layer headline 27 (PR #154 reconcile). |
+| **`0.9.3-phase4h.3`** (PR #160 merged 2026-05-20) | Epic #150 Phase 1.6 | **Explicit `tier2_enabled: bool` field on `Metadata`.** PATCH bump. Sourced from `compute/scoring/tier2._EIGHT_K_DEFENSES_ENABLED` at writer time; verify-helper Section B now branches on the explicit flag instead of inferring from `tier2_coverage_pct > 5%`, with legacy-snapshot fallback. Closes the last open AC item carried forward from issue #117 (PR #149 deferred) and issue #155. **No new veto, no rank change** — observability schema clean-up only. Defense layer unchanged at 17 declared / 27 emitted (per PR #154 reconcile). |
+| **`0.9.2-phase4h.2`** (PR #124 merged 2026-05-19) | Phase 4h.2 Part 2 | **Multi-port OSAP adapter + accounting-balance diagnostic surface** (issue #116). PATCH bump per the "additive optional field" convention. 1 new optional `Metadata` field: `osap_signals_dropped_no_long_short: list[str] \| None` — closes the 100-signal accounting equation (`missing + dropped_no_LS + gated + used == 100`). Root-cause fix: `compute_long_short_returns` rewritten with per-signal `min(port)` / `max(port)` inference instead of hardcoded `port=01/10`, recovering ~56 quintile / tercile signals that 0.9.0–0.9.1 silently dropped. **No new veto, no rank change** — Top-5 still ranks raw `composite_score` per Rule 16. Defense layer stays at **17**. DSR sign-inversion investigation (100% `low_dsr` rejection) deferred to Phase 4h.2 Part 3 follow-up. |
+| **`0.9.1-phase4h.2`** (PR #118 merged 2026-05-19) | Phase 4h.2 Part 1 | **Observability follow-up to Phase 4h** (issue #116). PATCH bump per `phase-4/schema-versioning/PLAN.md` ("Add a new optional field (default = None) → patch"). 2 new optional `Metadata` fields land: `osap_signals_missing_from_dataset: list[str] \| None` (surfaces the silent-drop bug — 78/100 manifest signals missing from dataset surface in the first 0.9.0-phase4h production run) + `osap_gate_diagnostics: dict[str, OsapGateDiagnostic] \| None` where the new `OsapGateDiagnostic` Pydantic model carries `pbo`/`dsr`/`sharpe`/`rejection_reason` (all nullable per the "all 4 fields explicit `= None` defaults" lock). Set-diff helper lives at `compute/features/osap_replicate.py::signals_in_dataframe` (mirrors `coverage_by_signal` shape one function above — pure helper, no I/O). Wired into `compute/main.py` inside the existing OSAP try/except so graceful degradation continues to set every osap_* field to `None` on fetch failure. **No new veto, no rank change** — observability-only; Top-5 still ranks raw `composite_score` per Rule 16. Defense layer unchanged at **17**. Part 2 (threshold calibration + manifest reconciliation) deferred until ≥1 week of production diagnostic data accumulates. Test suite **911 → 924 offline** (Part 1 adds 13 across 3 commits: 7 schema round-trip/backward-compat + 4 helper + 2 gate-diagnostic round-trip). Reason taxonomy unchanged at 34 stable identifiers. |
+| **`0.9.0-phase4h`** (PR #112 merged 2026-05-19) | Phase 4h | **OSAP signal replication + PBO/DSR hard gate + Path-b composite × OSAP blend** (5-commit cluster on branch `claude/resume-quantrank-phase-4.5-Zh0pO`: 06bdac76 schema-foundation, b79983f6 osap_replicate proxy + 100-signal manifest, a6760d91 osap_blend Path-b, df4d9bd2 osap_validation PBO/DSR gate + rolling-12m-IC, [TBD] compute/main.py wiring + @network e2e). **Minor bump** — 6 new optional fields land simultaneously: `StockDetail.osap_signals: dict[str, float] \| None` + `StockDetail.osap_blended_score: float \| None`; `Metadata.osap_signals_used: list[str] \| None`, `Metadata.osap_excluded_signals: list[str] \| None`, `Metadata.osap_signals_ic_12m: dict[str, float] \| None`, `Metadata.osap_signals_coverage_pct: dict[str, float] \| None`. **OSAP blend stays OUTSIDE `compute_composite()`** — `PHASE3_WEIGHTS` sum-to-1.0 invariant (`compute/scoring/composite.py:43-45`) intact; Path-b formula `blended = (1 - weight) × composite_score + weight × osap_signal_aggregate`, default `weight=0.5` locked at `osap-integration/PLAN.md:168-170`. **Hard gate** = PBO ≤ 0.5 AND DSR > 0 via PR #60's `factor_passes_gates`; rolling-12m Spearman IC is observability-only (full walk-forward CV deferred to Phase 5 per `defense-infrastructure/PLAN.md:270`). **No new veto** (Top-5 still ranks raw `composite_score` per Rule 16; `osap_blended_score` is informational); defense layer stays at **17**. **Universe-gap policy** — tickers with no OSAP coverage pass `composite_score` through unchanged (no impute, distinct from pillar `neutralize_missing=True`). **NaN policy in PBO cohort** — zero-fill (not mean-fill, not dropna) preserves Bailey 2014 `n_trials = cohort_size` multiple-testing correction; sparse signals naturally lose on DSR (low Sharpe → DSR rejection). **OSAP failure is observability-only** — wrapped in try/except in `compute/main.py` so live-fetch / package failure NEVER blocks weekly production; all 6 new fields degrade to `None`. Test suite **856 → 906 offline + 18 → 19 `@network`** (commits 2-5 added 50 tests; e2e network test added in commit 5). Reason taxonomy unchanged at 34 stable identifiers. Tag `v1.1.0-phase4` (or `v1.3.0` for the 4.5e+4h combined release) deferred until 4i/4j/4k also merge. |
+| **`0.8.0-phase4.5f`** | Phase 4.5f | **Manipulation Composite + soft composite penalty + UI** (PR #100 merged 2026-05-17 on commit `b1588b2a`; production verified on commit `e57f09cb`, run #51, warm-cache 5m14s). **Minor bump** because 5 new optional fields land simultaneously + new UI surface ships + tag `v1.2.0-phase4.5` coordinates with the data-version bump (semver coupling). Additive optional fields: `StockSummary.manipulation_index: float \| None`, `StockSummary.composite_score_adjusted: float \| None`, `StockDetail.manipulation_index`, `StockDetail.composite_score_adjusted`, `StockDetail.manipulation_components: dict[str, bool] \| None`. **`manipulation_index`** is a 0-100 rollup over the 4.5a-d flag set via a per-flag additive weight table in `compute/scoring/manipulation_index.py::FLAG_WEIGHTS` (active vetoes 15-20 pts · joint-gate 10 · annotates 5-8 · Tier-3 soft 3); clipped to `[0, 100]`. **`composite_score_adjusted`** applies the soft penalty `composite − 0.5 × (index / 100) × 20` (max 10-pt deduction at index = 100); the original `composite_score` field is preserved untouched per Rule 9 audit trail. **Rank source stays the raw composite per Rule 16** — the adjusted value is informational only, surfaced on the new detail-page `ManipulationRiskCard` (3-band outlined-light: emerald LOW / amber MODERATE / rose HIGH) with the in-line qualifier "Composite penalty: −X.XX pts (informational; rank uses raw composite)". Production: 158/502 (31.5%) fire the card (HIGH 2: SMCI=84 · WAT=64; MODERATE 60; LOW 96). **Phase 4.5e reserved-slot weights declared** (`INSIDER_SELL_CLUSTER_WEIGHT_RESERVED = 10`, `C_SUITE_UNUSUAL_SELL_WEIGHT_RESERVED = 5`) — the 4.5e PR uncomments 2 entries in `FLAG_WEIGHTS`, no calibration cascade. Test suite **831 → 856 offline**. Reason taxonomy: 34 stable identifiers (unchanged — `manipulation_index` is a derivation, not a new flag). Tag **`v1.2.0-phase4.5`** ready to cut. |
+
+> Phase 4+ schemas are tracked in [`WORKFLOW.md`](WORKFLOW.md) "Defense
+> Roadmap" until shipped. The table above documents shipped schemas
+> only — the roadmap doc is the single source of truth for unshipped
+> work and avoids drift between two places.
+
+### `public/data/metadata.json`
+```json
+{
+  "version": "1.0.0",
+  "last_update_utc": "2026-05-11T22:00:00Z",
+  "next_update_utc": "2026-05-18T22:00:00Z",
+  "universe": "SP500",
+  "universe_size": 503,
+  "compute_run_id": "abc123def",
+  "git_commit": "...",
+  "phase": 3,
+  "roadmap": "Option B"
+}
+```
+
+### `public/data/rankings.json` (summary)
+```json
+[
+  {
+    "rank": 1,
+    "ticker": "AAPL",
+    "name": "Apple Inc.",
+    "sector": "Information Technology",
+    "composite_score": 87.4,
+    "current_price": 220.15,
+    "fair_price": 245.30,
+    "max_fair_price": 285.00,
+    "margin_of_safety_pct": 10.3,
+    "pillar_scores": {
+      "quality": 92, "value": 65, "growth": 78, "momentum": 84,
+      "health": 95, "sentiment": 70, "ml": 80, "risk": 88,
+      "technical": 75, "profitability": 90
+    },
+    "confidence_interval_95": [78.2, 92.1]
+  }
+]
+```
+
+### `public/data/stocks/{TICKER}.json` (full detail)
+*(Same structure as before with additions for Phase 4+ research features. See WORKFLOW.md for full detail.)*
+
+---
+
+## Core Behavior Rules
+
+### Rule 1: Always reference the knowledge documents
+Before implementing any analysis technique:
+- Phase 0-3: Read `stock_ranking_knowledge.md`
+- Phase 4+: Read `RESEARCH_FINDINGS.md` for stretch additions
+- Use formulas AS WRITTEN. Never reinvent without justification.
+
+### Rule 2: Phase discipline
+Work in **phases per `WORKFLOW.md`**. Do not skip ahead. Each phase produces a working deliverable. **Phase 4 starts only after v1.0 ships.**
+
+### Rule 3: GitHub-Actions-first development
+The user develops on mobile (no local Python/Node), so all testing/running happens in GitHub Actions / Kaggle / Modal. CI must catch errors before merge. Use `workflow_dispatch` for ad-hoc runs. Logs are primary debugging tool.
+
+### Rule 4: Free-tier first + license verification
+Every API/library must respect free-tier limits AND have compatible license:
+- Verify OSS license before integration (especially mlfinlab AGPL)
+- Cache aggressively to `compute/cache/` (gitignored)
+- Implement `tenacity` retry with exponential backoff
+- Phase 4+: Verify current data availability before integration (sources change)
+
+### Rule 5: Point-in-time data discipline
+**Look-ahead bias kills backtests.** Every fundamental MUST use `filing_date`, not `period_end`. 13F is lagged 45 days. Form 4 uses `transactionDate`. SEC EDGAR exposes both — always use the filing date. **Phase 4+ OSAP/JKP signals are pre-built with proper PIT discipline; verify any reconstructions match.**
+
+### Rule 6: Sector-relative for fundamentals
+Quality, Value, Growth, Profitability — **always rank within GICS sector**, never globally. Use absolute ranking only for Risk and Momentum. **Always exclude financials/utilities from Magic Formula and asset-turnover metrics.**
+
+### Rule 7: Missing data → sector median
+- `<50%` of pillar's metrics available → set pillar to neutral (50) and flag.
+- Single metric NaN → impute as **sector median** (NEVER global median).
+- Never propagate NaN; record imputed fields in `data_quality.imputed_metrics`.
+
+### Rule 8: Test golden values
+For every fundamental metric, write a unit test against a **known-correct value** for at least 1 ticker. **Phase 4+: Validate library outputs against published paper results within 5% tolerance.**
+
+### Rule 9: JSON schema is sacred
+The `frontend/` consumes JSON with strict expectations. **Never break the schema mid-development.** Bump version per phase per Schema versions table above.
+
+### Rule 10: No paid data, no real-money, no live trading
+This app is for **research and educational ranking only**. README and frontend MUST display this disclaimer. Never integrate live trading APIs.
+
+### Rule 11: Trademark caution
+Never use "Jitta" anywhere. The project name is **QuantRank**.
+
+### Rule 12: Atomic JSON writes
+Always write to a `.tmp` file then `os.rename()` to final path. Never write partial JSON.
+
+### Rule 13: Fallback discipline (Option B specific)
+Per-phase fallback triggers documented in WORKFLOW.md. If hit:
+- Log decision in PHASE_STATUS.md
+- Revert that phase to Option A
+- Continue with subsequent phases on Option B
+- Do not silently abandon research additions; document why
+
+### Rule 14: Decay monitoring (Option B specific)
+For research-backed factors (Phase 4+):
+- Track rolling 24-month IC per signal
+- Alert when slope < 0 with t < -2
+- McLean-Pontiff suggests 35% post-publication decay; budget for it
+- Re-validate quarterly against published paper t-stats
+
+### Rule 15: Performance ceiling honesty
+Never claim alpha > 5% net without:
+- 10+ years walk-forward validation
+- Embargoed/purged CV
+- Deflated Sharpe < 0.5
+- PBO < 50%
+- Out-of-sample period including 2020 + 2022 regime stress
+
+### Rule 16: Defense layer is annotate-and-veto-Top-N (NEW 2026-05-09)
+
+Risk overlays and fraud-detection signals **never modify the composite
+score**. They operate in three modes only:
+
+1. **VETO** — exclude flagged stock from `entered_top5` badge (composite
+   rank unchanged). **7 active at Phase 4.5a (2026-05-16)**: Altman Z″
+   distress (`altman_distress`), Sloan accruals top decile within sector
+   (`sloan_accruals_top_decile`, sector-relative since PR #89), Net
+   Stock Issuance top decile (Pontiff-Woodgate 2008,
+   `net_issuance_top_decile`), `data_quality_input_corruption` (promoted
+   PR #33), `non_reliance_filing` (re-enabled PR #79, 8-K Item 4.02,
+   Schroeder 2024 SSRN — 365d lookback), `beneish_manipulation_veto`
+   (Beneish 1999, M > −1.78 PPV-crossover, PR #90),
+   `dechow_manipulation_veto` (Dechow et al. 2011, F > 3.0 4× baseline,
+   PR #91).
+2. **GUARD** — return null + flag (e.g., null fair_price for stale
+   filings). 5 numerical guards at v1.0.
+3. **ANNOTATE** — warning only, no score change. 8+ flags at v1.0 +
+   `recommendation` (PR 4d) + `loss_chance_pct` (PR 4e) — both
+   pure derivations from existing fields, no new ingest.
+
+**Why never scoring inputs**: empirical evidence (Beneish-Vorst 2021;
+McLean-Pontiff 2016) shows fraud-detection FP rates ≥30% in broad market
+and anomaly returns decay 58% cumulative. Penalizing the score
+introduces more error than it removes.
+
+**Defense freeze post-v2.0**: Do NOT add new defenses unless an existing
+defense's IC has decayed > 50% for 6+ months AND the new addition has
+academic evidence of incremental IC > 0.01. Marginal AAER capture < 5%
+beyond 4 fraud signals (Beneish-Vorst 2021). **Rotate, don't stack.**
+
+Full defense schedule and bibliography in
+`docs/RESEARCH_FINDINGS.md` §"Defense Playbook".
+
+### Rule 17: Frontend design system + threshold-symbolic tests (NEW 2026-05-15)
+
+Two pattern locks landed during PRs 4d / 4e and apply to every Phase
+4+ UI / scoring contribution:
+
+1. **Outlined-light chip family, with paired `dark:` variants** — every
+   new pill / badge / chip (sector, score-tier, MoS bucket, recommendation,
+   loss-chance) uses the **Pattern B** outlined-light style codified in
+   `.claude/skills/frontend-design-system/SKILL.md` Rule 2. Solid-bg
+   chips are an anti-pattern. **Ship a paired `dark:` variant** on every
+   colored surface — since Phase 3b the site runs class-strategy dark mode
+   (`darkMode: 'class'` + a `next-themes` toggle), so `dark:` activates on
+   the `.dark` class (an explicit user choice), NOT bare system
+   `prefers-color-scheme`; a light-only surface is now the bug
+   (near-invisible on the dark band). (The pre-Phase-3b "no `dark:`" rule —
+   PR #70's invisible-label regression on a force-light + `darkMode: 'media'`
+   page — is retired; see `frontend-design-system` SKILL.md Rule 4 for the
+   pairing table + full history.) Trigger the design-system skill before any
+   new UI.
+
+2. **Tests reference thresholds symbolically, not by literal value** —
+   pure-function scorers like `derive_recommendation` and
+   `derive_loss_chance` expose their thresholds as module-level
+   constants (`BULLISH_COMPOSITE_MIN`, `BULLISH_MOS_MIN_PCT`, etc.).
+   Tests **must** import the constants and assert against
+   `constant ± 1.0` style boundaries — never against hard-coded
+   numbers. This insulates the test suite from threshold tuning: when
+   the constant moves, tests stay green if the function still respects
+   the constant. PR 4d's calibration revision (composite 70 → 60, MoS
+   20 → -10 after the S&P 500 distribution simulation surfaced 0%
+   Strong Buy and 54% Sell) broke 5 hard-coded tests and was the
+   forcing function for this rule.
+
+### Rule 18: Observability-before-wiring (NEW 2026-05-20)
+
+Every integration PR that consumes a NEW external data source ships
+the diagnostic `Metadata` surface BEFORE the production logic uses
+the data. The diagnostic exposes WHICH inputs were dropped and WHY
+at each filter / gate / NaN-strip point; production wiring lands
+≥ 1 cron later, after the accounting equation
+`len(input_universe) == sum(len(diagnostic_buckets))` is verified
+on real data. The Phase 4h → 4h.2 retrofit (PRs #112 → #118 → #124)
+is the forcing precedent: a 30-minute additional Phase 4h scope
+would have saved the ~10-hour 2-PR debugging cycle. Detail +
+mandatory checklist in `WORKFLOW.md` §Observability-Before-Wiring
+Pattern.
+
+---
+
+## When the user asks for...
+
+### "Build the project from scratch"
+1. Read `WORKFLOW.md` Phase 0.
+2. Confirm: project name = QuantRank, repo = public, Vercel deploy.
+3. Execute Phase 0 tasks. Update `PHASE_STATUS.md` at end.
+
+### "Add a new metric (Phase 0-3)"
+1. Search `stock_ranking_knowledge.md` for the technique.
+2. Identify pillar (per Section 21 / Quick Reference A).
+3. Add function to `compute/features/<pillar>.py` with golden-value test.
+4. Update pillar aggregation in `compute/scoring/pillars.py`.
+5. Add field to `raw_metrics` in `compute/output/schemas.py`.
+6. Update TypeScript types in `frontend/lib/types.ts`.
+7. Run CI to verify.
+
+### "Add a research-backed feature (Phase 4+)"
+1. Read `RESEARCH_FINDINGS.md` for the technique.
+2. Verify license compatibility (especially AGPL libraries).
+3. Verify current data source availability (re-check URLs).
+4. Add module to appropriate `compute/` directory.
+5. Validate output against published paper results (5% tolerance).
+6. If validation fails → trigger fallback to Option A for that phase.
+7. Document in PHASE_STATUS.md.
+
+### "Add a new data source"
+1. Check Section 5 of knowledge doc — already covered?
+2. Phase 4+: Check RESEARCH_FINDINGS.md data sources.
+3. New file in `compute/ingest/<source>.py` matching existing pattern.
+4. Add API key (if needed) to GitHub Actions secrets.
+5. Document rate limits and license in module docstring.
+
+### "Improve accuracy"
+1. Manage expectations per Section 28 (realistic = 2-4% Option A, 3-7% Option B).
+2. Check current phase. Don't add Phase 6 features in Phase 4.
+3. Don't add LSTM before LightGBM works.
+4. **Phase 4+**: Prioritize OSAP/JKP factor library over DIY signals.
+5. Always validate via IC, IR, PBO before claiming improvement.
+
+### "The site is broken / shows old data"
+1. Check `PHASE_STATUS.md` for current phase.
+2. Check latest GitHub Actions run — failed?
+3. Check `public/data/metadata.json` — what's `last_update_utc`?
+4. Check Vercel deployment logs.
+5. Recovery: trigger `manual-trigger.yml` workflow.
+
+### "Deploy to production"
+1. **One-time setup** (Phase 0):
+   - Push repo to GitHub (public).
+   - Connect repo to Vercel (auto-detects Next.js).
+   - Set Vercel build settings: root = `frontend/`, output = `out/`.
+2. **Trigger first compute**: GitHub Actions → `compute-rankings.yml` → Run workflow.
+3. **Verify**: After ~10 min, JSON appears, Vercel rebuilds, site goes live.
+
+### "Set up Phase 5+ heavy compute"
+1. Connect Kaggle account (free) → generate API token.
+2. Add `KAGGLE_USERNAME`, `KAGGLE_KEY` to GitHub secrets.
+3. Connect Modal account (free $30/mo credits).
+4. Add `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` to GitHub secrets.
+5. Set up workflow to trigger Kaggle from GH Action via `kaggle kernels push`.
+6. Outputs: Kaggle Dataset → re-pull into repo via API.
+
+---
+
+## Anti-Patterns to Refuse
+
+| Anti-pattern | Why bad | Correct approach |
+|---|---|---|
+| Adding FastAPI/Flask backend | Architecture is static (Option D) | Output JSON from GitHub Actions |
+| Adding PostgreSQL/SQLite | No runtime DB by design | Files in `public/data/` |
+| Calling APIs from frontend | Defeats static-site purpose, costs money | Pre-compute, read JSON at build |
+| Hardcoding API keys | Repo is public! | GitHub Actions secrets |
+| Using `period_end` for backtest | Look-ahead bias | Use `filing_date` from EDGAR |
+| Global z-score across financials + tech | Sector-distorting | Sector-relative percentile rank |
+| Imputing NaN with 0 | Biases scores wildly | Sector median (Rule 7) |
+| LSTM before LightGBM works | Overengineering | Tree-based first |
+| Daily refresh in GitHub Actions | Wastes free minutes | Weekly only |
+| Skipping golden-value tests | yfinance changes silently | Mandatory per metric |
+| Claiming >7% alpha | Almost certainly overfit | Run PBO, deflated Sharpe |
+| Live trading endpoints | Out of scope, regulatory risk | Read-only ranking display only |
+| Partial JSON writes | Breaks frontend | Atomic write via temp file |
+| Using "Jitta" name | Trademark | "QuantRank" |
+| Skipping research additions in Phase 4+ without fallback log | Loses Option B value | Document fallback in PHASE_STATUS |
+| AGPL libs without license check | Legal risk | Verify before integration |
+| Reddit/StockTwits for megacap | No documented alpha at S&P 500 scale | Skip, focus on insider Form 4 |
+| Russell 2000 microcaps in Phase 8 | Free data quality collapses | Stop at S&P 1500 |
+| LSTM/TFT instead of PatchTST | Outdated SOTA | Use PatchTST/iTransformer |
+| Larger LLMs (>13B) for sentiment | Disproportionate cost | FinBERT or Llama-3 8B max |
+
+---
+
+## Communication Style
+
+The user develops on mobile and may not be a quant expert.
+- **Formulas (Phase 0-3)**: link to section in `stock_ranking_knowledge.md`.
+- **Research additions (Phase 4+)**: link to section in `RESEARCH_FINDINGS.md` + paper citation.
+- **Realistic expectations**: cite Section 28 + RESEARCH_FINDINGS caveats.
+- **Mobile constraints**: prefer GitHub Actions/Kaggle/Modal runs over local debugging.
+- **Iteration**: each GH Actions run takes 3-30 min depending on phase; budget time.
+- **Phase status**: always say "we are in Phase X; next deliverable is Y; fallback to Option A is Z if blocker hits."
+- **Honesty**: acknowledge when training-time familiarity may be stale; recommend re-verification.
+
+When user is excited about a new technique: "great — let's add it after Phase X stabilizes. Read RESEARCH_FINDINGS.md to see if it's already in the Option B roadmap."
+
+---
+
+## End State Definition
+
+### v1.0 (Phase 3 complete)
+- [ ] Public GitHub repo `quantrank` exists
+- [ ] Weekly GitHub Actions cron runs successfully
+- [ ] S&P 500 universe ingested with ≥10 years of data
+- [ ] All 8 pillars computed for every stock
+- [ ] Composite StockRank (0-100) per stock
+- [ ] Fair Price ensemble (Median + Max) per stock
+- [ ] JSON files in `public/data/` valid against schema
+- [ ] Vercel-deployed Next.js site shows ranking table + detail page
+- [ ] README has disclaimer + architecture diagram + methodology link
+- [ ] Mobile responsive, Lighthouse >85
+- [ ] Tag `v1.0` on GitHub
+
+### v2.0 (Phase 8 complete) — MAXIMUM FREE TIER
+- [ ] All v1.0 criteria
+- [ ] OSAP + JKP + Qlib factor libraries integrated (Phase 4)
+- [ ] IPCA latent factors (Phase 4)
+- [ ] LightGBM + Triple-Barrier + Meta-Labeling + Conformal (Phase 5)
+- [ ] Whisper + 8-K events + Lazy Prices sentiment (Phase 6)
+- [ ] Student-t HMM + TDA + NCO (Phase 7)
+- [ ] S&P 1500 universe (Phase 8)
+- [ ] Backtest report with PBO < 50%, Deflated Sharpe documented
+- [ ] Tag `v2.0` on GitHub
+- [ ] Honest performance: 3-7% net alpha vs SPY (with wide CI)
+
+After v2.0: Maintenance mode. No further phase additions unless empirically validated alpha gain.

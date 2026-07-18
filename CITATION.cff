@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this corpus in academic work, please cite it as below."
+title: "Agent Skills Corpus: a reproducible multi-platform dataset of public SKILL.md Agent Skills"
+abstract: >-
+  A reproducible, boundary-defined corpus of 55,698 unique public Agent Skills
+  (SKILL.md files with YAML frontmatter containing name + description), harvested
+  across GitHub, GitLab and Gitee at a fixed 2026-07-18 snapshot. Each skill carries
+  platform, repository, path, stars, license, creation/update time, sibling-file
+  listing, a two-axis classification (functional category + agent platform), and
+  full text (redistributed only where the source repository has a clear open-source
+  or Creative-Commons license). Duplicates are collapsed by SHA-256 of the SKILL.md
+  content, keeping the earliest source.
+type: dataset
+version: "1.0.0"
+date-released: 2026-07-18
+license: CC0-1.0
+repository-code: "https://github.com/lawrence3699/agent-skills-corpus"
+keywords:
+  - agent skills
+  - SKILL.md
+  - LLM agents
+  - Claude
+  - Codex
+  - prompt engineering
+  - software mining
+  - dataset
+authors:
+  # Edit this to your name / ORCID before citing.
+  - name: "agent-skills-corpus contributors"

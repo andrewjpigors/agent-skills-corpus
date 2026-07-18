@@ -1,0 +1,1473 @@
+---
+name: daily-news
+description: This skill should be used when the user asks to "run daily news", "publish today's news", "draft today's vatt-ghern roundup", "do the daily-news routine", invokes `/vatt-ghern:daily-news`, or asks Claude to author tech-news posts for the vatt-ghern blog. The skill produces one daily-roundup HTML (10 items) plus up to three daily-deep-story HTML posts under `src/posts/YYYY/MM/DD/`, runs anti-duplication checks (exact source-URL/news_id against the full archive, fuzzy title similarity against the past 7 days), and opens a PR to `main`. Always use this skill (instead of authoring news posts ad-hoc) so output stays consistent with the archetype rules, design system, and dedup conventions.
+version: 0.1.0
+---
+
+# daily-news
+
+Curate today's tech news for the vatt-ghern blog and publish it as bespoke
+HTML posts. Adopt a senior-tech-lead persona, fetch from a priority source
+list, score and de-duplicate (exact source URL / news_id against the full
+archive, fuzzy title similarity against the past 7 days), write one roundup
+and up to three deep-stories, and open a pull request for human review.
+
+## When this skill runs
+
+Three invocation paths converge here:
+
+- **Daily** — `/vatt-ghern:daily-news` (defined in
+  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`). Executes the full
+  9-step workflow below.
+- **Weekly rollup** — `/vatt-ghern:weekly` (Monday morning). Skips
+  Steps 2–6; reads past 7 days via
+  `scripts/load-past-roundups.mjs --days=7`; computes week-over-week
+  delta via `scripts/decisions/weekly-delta.mjs --end=YYYY-MM-DD`;
+  authors one `weekly.html` using the `weekly-rollup` archetype.
+- **Monthly rollup** — `/vatt-ghern:monthly` (first of month). Same
+  pattern as weekly but `--days=<28..31>` and `monthly-rollup` archetype.
+- **Routine fallback**: Claude Routines invoking the repo may load this
+  SKILL.md directly when the slash command is unavailable. The routine
+  inspects its own schedule to decide daily vs weekly vs monthly.
+
+For weekly/monthly invocations, read the rollup archetype reference
+(`references/archetypes/weekly-rollup.md` or
+`references/archetypes/monthly-rollup.md`) — it spells out which
+workflow steps to skip and what the output looks like.
+
+Do not author daily news posts without this skill. Ad-hoc posts drift from
+the archetype rules and break the dedup invariants that future days depend
+on.
+
+## Required reading before authoring
+
+Read these references before producing output. They are the single source of
+truth — do not re-derive their contents:
+
+- **`references/persona.md`** — Voice (measured, curious, materially-rooted),
+  five priority domains, what earns inclusion vs. what doesn't, punctuation
+  rules (`：` not `:`; `——` not `—`).
+- **`references/zh-tw-prose.md`** — 中文 prose 規則（AI 套話、黑話、
+  翻譯腔、節奏、台灣用語）。鐵律：去 AI 味靠刪與改寫，不得捏造細節。
+- **`references/sources.md`** — Tier-1 through Tier-5 source list with
+  priority order. HackerNoon is the primary signal.
+- **`references/archetypes.md`** — Required HTML structure for roundup and
+  deep-story, sidecar JSON schema, content rules, scoring rubric.
+- **`references/anti-duplication.md`** — Dedup rules: exact source-URL /
+  news_id against the full archive, fuzzy title similarity against the past
+  7 days, and how to handle near-duplicates.
+- **`references/design-system.md`** — Color tokens, font stacks, component
+  classes, read-tracking attribute conventions, SVG patterns.
+- **`references/widget-isolation.md`** — CSS / ID / JS scoping contract for
+  inline SVG widgets.
+
+## Workflow — nine steps
+
+Execute in order. Do not skip steps. If a step fails, report the failure
+mode rather than silently producing partial output.
+
+### Step 1: Load context
+
+Run the load-context script and parse its JSON output:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/load-context.mjs
+```
+
+Returns: `today` (YYYY-MM-DD, UTC+8), `past_news_ids`, `past_urls`,
+`past_roundup_titles`, `past_deep_titles`. Keep this blob — it is the
+anti-duplication ground truth for steps 3, 4, and 5.
+
+### Step 2: Fetch sources
+
+Run the dispatcher to pull every registered source:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/fetch-all.mjs
+```
+
+It reads `src/_data/sources.yml`, calls the right fetcher per `type`
+(arxiv, hf, sitemap, lobsters_json, html_index), updates
+`src/_data/web-state.json` for sitemap sources, and prints a summary.
+
+For `html_index` records the script returns them in `deferred[]` —
+those still need Claude's `WebFetch` tool for LLM summarisation. Walk
+each deferred record in tier order and ask:
+
+> "List the top 8 items from this page that look like original
+> engineering blog posts (not job listings, marketing pages, or product
+> launches without technical content). For each, give me title, canonical
+> link, and a 1-2 sentence summary of the substance."
+
+Merge the WebFetch results with the dispatcher's `candidates[]` array,
+de-duplicate by canonical URL across sources, aim for ~50–100 candidates
+total. If fewer than 5 sources succeed (concrete + deferred combined),
+fail-fast: report which sources failed and abort without writing files.
+
+**Sitemap candidates need a title-resolution pass.** Records from
+`sitemap` sources carry `title: <url>` because a `sitemap.xml` has no
+human title. Before scoring, batch-WebFetch each sitemap candidate
+URL (skip if it scores < 5 on the rubric without fetching). Replace
+`title` with the page's `<title>` or `<h1>`; if WebFetch returns a
+listing/index page rather than an article, drop the candidate.
+
+The full source catalogue and per-source rationale lives in
+`src/_data/sources.yml`. The narrative in `references/sources.md`
+documents tier philosophy.
+
+### Step 3: Score and filter
+
+For each candidate, assign a domain (ai / systems / infra / web / backend)
+and a subjective score 0–8 covering the rubric's three subjective axes
+(`teaches non-obvious` + `actionable` + `substantial original`). The
+mechanical +2 domain-coverage bonus is added by the score module below.
+
+Drop candidates that:
+
+- Have a canonical URL already in `past_urls` (full archive — a source
+  covered once stays a duplicate forever)
+- Have a title whose Jaccard char-bigram similarity > 0.85 against any
+  `past_roundup_titles` (recent 7-day window; compute this manually — the
+  formal check runs in step 8 via `check-dup.mjs`)
+- Violate the "what does NOT earn a place" rules in `persona.md`
+
+**Advisory check**: write the surviving candidates (each carrying
+`subjective_score: 0-8`, `domain`, `url`, `title`, `source_id`,
+`source_tier`) as a JSON array and pipe through the score module to add
+the objective `+2 domain coverage bonus` mechanically:
+
+```bash
+cat candidates.json | node skills/daily-news/scripts/decisions/score.mjs > scored.json
+```
+
+The module adds `coverage_bonus` and `score` fields. You MAY override the
+final `score` if you see a rubric mismatch (e.g., the +2 bonus pushed a
+marginal item into the deep-story tier). Record overrides in PR body
+under `### Advisory overrides`.
+
+### Step 4: Pick today's items (domain coverage)
+
+Aim: all 5 priority domains represented (ai / systems / infra / web /
+backend). Hard floor: ≥4 distinct domains. Per-domain cap: ≤6 items.
+
+**Selection algorithm**:
+
+1. Sort all candidates by score, descending.
+2. Take top items in score order until 10 selected.
+3. If fewer than 4 domains represented in the selected 10:
+   - For each uncovered domain, find the highest-score candidate in
+     that domain
+   - SWAP it in for the lowest-score selected item from an
+     over-represented domain
+   - Repeat until ≥4 domains met
+4. If any domain has >6 items in the selected list (over the cap):
+   - Drop the lowest-score items in that domain until count is 6
+   - If those drops bring total below 10, swap in the highest-score
+     candidates from under-represented domains until 10 or until no
+     candidates remain
+5. If exhaustive search shows no qualifying candidate for ≥2 domains
+   (genuine sparse day), accept fewer items rather than padding with
+   garbage. Log skipped domains in the PR body under "Domains skipped
+   today".
+
+Assign final `news_id` values as `YYYY-MM-DD-NN` (zero-padded) in
+ranked order.
+
+**Advisory check**: pipe scored candidates through the cover-domains
+module:
+
+```bash
+cat scored.json | node skills/daily-news/scripts/decisions/cover-domains.mjs > selected.json
+```
+
+The module returns `{ selected, skipped_domains, capped_domains }` with
+each selected item carrying a `rank_nn` field (`"01"`..`"10"`). Wrap with
+the date prefix to produce `news_id` values (`2026-05-19-01`, etc.). You
+MAY override the selection (e.g., swap a marginal pick for a higher-
+impact candidate the algorithm dropped). Record overrides in PR body
+under `### Advisory overrides`.
+
+**PR body must list**:
+- Domain distribution (e.g., "AI · 3 · SYSTEMS · 3 · INFRA · 2 ·
+  WEB · 1 · BACKEND · 1")
+- Any domain skipped (with reason: no qualifying candidates / all
+  candidates failed dedup / etc.)
+- Any domain that hit the cap and had candidates dropped (e.g.,
+  "8 qualifying items in AI today, top 6 selected")
+
+### Step 5.0: Cluster candidates across sources
+
+Before deciding which candidates earn a deep-story, cluster them so the
+same story spotted on multiple sources gets one combined brief rather
+than competing briefs. Pipe the merged `candidates[]` (Step 2's
+dispatcher + WebFetch results) through the clustering helper:
+
+```bash
+cat candidates.json | node skills/daily-news/scripts/decisions/cluster.mjs > clusters.json
+# (npm run sources:cluster still works via the cluster-candidates.mjs shim)
+```
+
+Or in-process:
+
+```js
+import { clusterCandidates } from "./skills/daily-news/scripts/decisions/cluster.mjs";
+const clusters = clusterCandidates(candidates);
+```
+
+Each cluster has shape:
+
+```js
+{ primary: { ... }, variants: [ { ... }, ... ] }
+```
+
+Two candidates cluster when their canonical URLs match (modulo
+`utm_*`, hash, trailing slash) OR their title token-Jaccard ≥ 0.6.
+Clustering is transitive (union-find). `primary` is the highest-tier
+variant in the cluster (lowest `source_tier` number; ties broken by
+longest summary then lowest `source_id`). Singletons (candidates that
+didn't cluster with anything) still appear, with
+`primary === variants[0]`.
+
+Use these clusters as the unit of decision in the rest of Step 5: one
+deep-story per cluster, not per candidate. A cluster's score = its
+`primary`'s score; do not aggregate scores across variants.
+
+When a deep-story is written from a multi-variant cluster, the
+sidecar's `sources[]` array must list every variant's canonical URL,
+not just the primary. That is the data-layer signature of
+cross-source synthesis — the post visibly draws from multiple upstream
+signals.
+
+### Step 5: Pick deep-story candidates + choose archetype
+
+For each **cluster** whose `primary` scored ≥8 from Step 4, decide:
+
+**a. Worth a deep-story?**
+
+YES if all of:
+- Source has drillable depth (long-form blog, paper, RFC, design doc,
+  postmortem, repo with substantial README/docs)
+- Topic genuinely benefits from 600-1200 lines of treatment
+- Not duplicate-similar to a past `past_deep_titles` entry (Jaccard
+  bigram similarity ≤ 0.70)
+
+**b. If yes, which archetype fits?**
+
+Decision tree:
+
+| Signal | Pick |
+|---|---|
+| Time-ordered story of an event | `narrative` |
+| Structural exposition of a new design / algorithm / protocol | `technical-deep-dive` |
+| "Why is this happening?" puzzle with hypotheses | `investigation` |
+| Two or more options to choose between | `comparison` |
+| Reader may not know what X even is, concept needs explained | `explainer` |
+| None fit cleanly, or fits multiple awkwardly, or hybrid | `freeform` |
+
+**IMPORTANT**: Archetypes are SUGGESTIONS. When in doubt — or when
+forcing a structured archetype would worsen the prose — pick
+`freeform`. A forced fit produces worse content than free shape.
+
+**Advisory check**: for each ≥8 cluster, extract the 6 archetype signals
+(`time_ordered`, `structural_exposition`, `puzzle_with_hypotheses`,
+`multiple_options`, `concept_unknown`, `hybrid_or_unclear` — all booleans
+based on what the source URL reads like) and pipe through the archetype
+module:
+
+```bash
+echo '{"signals":{"time_ordered":true,"structural_exposition":false,"puzzle_with_hypotheses":false,"multiple_options":false,"concept_unknown":false,"hybrid_or_unclear":false}}' \
+  | node skills/daily-news/scripts/decisions/pick-archetype.mjs
+```
+
+The module returns `{ archetype, matched_signal }`. You MAY override
+(e.g., module said `narrative` but the post is structural exposition with
+a timeline framing, so `technical-deep-dive` fits better). Record
+overrides in PR body under `### Advisory overrides`.
+
+**Phrasing freedom**: archetype reference files describe the *arc*
+(e.g., setup → mechanism → consequence for narrative), not the exact
+H2 text. Name each H2 after the actual topic — generic phrasing
+(`what happened` / `why it matters` / `so what`) makes every post in
+an archetype feel like the same post. The test suite checks H2
+*counts*, not strings. Closer labels are also free; pick one that
+fits the post's voice.
+
+**c. Selection constraints — default is N = 3**:
+
+The deep-story count default is **N = 3**. Aim for 3 every run unless a
+named structural constraint blocks it. The constraints when writing 3:
+
+- All 3 must score ≥ 8
+- ≥ 2 distinct domains required if writing 3 (≥ 1 if writing 2)
+- ≥ 2 distinct archetypes required if writing 3 (avoid "3 narratives
+  in a row"); `freeform` counts as its own archetype for diversity
+- If genuine candidate scarcity makes domain + archetype diversity
+  unsatisfiable at N = 3, fall back to N = 2 or N = 1. Do not force a
+  3rd pick that violates the diversity rule.
+
+**Trimming N below 3 is ONLY legitimate when one of these structural
+reasons applies**:
+
+1. Fewer than 3 clusters scored ≥ 8 in Step 5.0 (record cluster
+   scores in PR body)
+2. Cannot find 3 clusters satisfying ≥ 2 domain + ≥ 2 archetype
+   diversity (record the domain × archetype matrix in PR body)
+3. Step 5d URL dedup dropped a pick AND replacement pool is exhausted
+   (record refill attempt in PR body)
+4. Step 7.5 blocking exhausted on a draft after 5 retries (Step 7.5c)
+5. Step 8.5 blocking exhausted on a draft after 5 iterations
+6. Step 7.6 fact-check: a high-load unverifiable claim unresolved
+   after 3 fix rounds (Step 7.6c)
+
+**"Budget / wallclock / dispatch cost" is NEVER a Step 5 reason to
+trim.** Steps 7.5 and 8.5 have their own runtime trim mechanisms
+(documented in "No skip clause exists" paragraphs). Those clauses
+authorize trimming when *runtime evidence* shows the gate cannot fit
+— they do NOT authorize preemptive trimming in Step 5 on imagined
+cost. If you find yourself reasoning "Step 7.5 will be expensive with
+3 posts so I'll do 2", STOP — that reasoning is the anti-pattern this
+clause forbids.
+
+**PR #35 (2026-05-23)** shipped 2 deep stories on a self-declared
+"dispatch budget" rationalization. Step 5 had 9 qualifying ≥ 8 clusters
+and domain + archetype diversity was trivially achievable for N = 3.
+A third deep story (weirdgloop AI scrapers, web/narrative) was added
+in the same PR after the user caught the trim in review. The PR body
+now requires an explicit "Deep-story count justification" section
+when N_final < 3, and `check-quality-gate-evidence.mjs` enforces it
+mechanically.
+
+**d. Pre-dispatch URL dedup (added 2026-05-21 after PR #30)**:
+
+Before finalising the deep-story picks for Step 7a, run the URL-dedup
+helper to catch any pick whose canonical URL already appears anywhere in
+the archive (`past_urls` from Step 1 spans the full history, not just 7
+days). This must happen *here*, not at Step 8 — otherwise a sub-agent will
+write an entire deep-story (DONE) only to have it dropped during the
+formal `check-dup.mjs` run, leaving an empty deep-story slot with no
+refill path.
+
+```bash
+echo '{"candidates":[{"news_id":"...","url":"...","title":"...",...}, ...],
+       "past_urls":[ ...from load-context.mjs... ]}' \
+  | node skills/daily-news/scripts/decisions/dedup-urls.mjs
+```
+
+The module returns `{ kept, dropped }`. Any candidate in `dropped`:
+
+1. Is NOT dispatched in Step 7b.
+2. MUST be replaced by the next-best deep-story candidate from Step 5b
+   that satisfies the same constraints (≥8 score, domain + archetype
+   diversity). If no qualifying replacement exists, reduce N by 1 and
+   note `Domains skipped today` accordingly. Do NOT leave deep-story
+   N silently below target without refilling first.
+3. The `roundup` separately must also drop or swap that URL — handle
+   the roundup-side dedup before writing roundup HTML in Step 6.
+
+Record any dedup-driven swap or refill in PR body under
+`### Advisory overrides`. Example: "`deep[01] = GitHub eBPF` dropped on
+URL collision with 2026-05-16 roundup; refilled with cluster #07 (Slack
+HTTP/3, score 8, infra domain)".
+
+**Invariant**: `N_deep_dispatched_in_step_7b == N_deep_final_in_PR`. If
+not, the routine has a bug in this step. Recording a "dropped, not
+refilled" deep-story in the PR body is acceptable ONLY when Step 5d
+truthfully reports `replacement_pool_exhausted: true` — never as a
+silent N reduction.
+
+After picking each archetype, read the corresponding detail file for the
+structure rules to follow when writing:
+
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-narrative.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-technical-deep-dive.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-investigation.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-comparison.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-explainer.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-freeform.md`
+
+### Step 6: Write roundup HTML + sidecar
+
+Read the archetype skeleton at
+`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-roundup.html` for structure
+reference. Author the full HTML following
+`references/archetypes.md` § "Roundup spec".
+
+Write to `src/posts/YYYY/MM/DD/roundup.html` plus matching
+`.11tydata.json` sidecar.
+
+**Required structural attributes** (the test suite checks them):
+
+- Each item card has `id="item-NN"` (zero-padded), corresponding to
+  the score-order `news_id`
+- Each item card has `data-vg-readkey-item="{{page.url}}#item-NN"`
+- Each item card wraps its `<h2>` + `<p class="vg-card-lede">` +
+  `<p class="vg-card-meta">` content in a `<div class="vg-card-roundup-body">`
+- Progress span has `data-vg-progress-of` and `data-vg-progress-total`
+
+**Required emit order** (NOT score order):
+
+Items render grouped by domain in this fixed order:
+`ai → systems → infra → web → backend`. Within each domain, sort
+by score descending. Each non-empty domain emits exactly ONE section
+label header at the top of its group (with `<span class="vg-roundup-section-count">N 篇</span>`).
+Empty domains emit no section.
+
+**Lede length**: 2-3 Chinese sentences. First = what happened, second =
+why an engineer cares, optional third = a concrete number / quote /
+consequence. Lint allows up to 4 `。` periods (covers 2-3 sentences
+plus inline references like `ClickHouse 25.11.`).
+
+**Lede typography**: render as `<p class="vg-card-lede">` — CSS handles
+the rest (Spectral 400 normal at `--fs-sm`). Do not add inline
+`style=""` or italic markup.
+
+**Hero lede chrome label**: the hero `<p class="vg-roundup-lede">` MUST
+begin with an inline `<span class="vg-roundup-lede-label">TODAY'S THREAD</span>`
+prefix (uppercase English, no trailing colon) followed by a space and
+the CJK summary sentence. Do NOT prefix the CJK summary with
+"今日主旋律：" — the English label has replaced that role.
+
+**Do NOT hardcode read-state buttons in HTML**. The read-tracker
+(`src/static/read-tracker.js`) injects all of these at page load:
+
+- `↶ unread` button inside each `.vg-card-roundup-body`
+- `✓ mark read` button (with separator) appended into each `.vg-card-meta`
+- `mark all read` link appended next to the progress span
+
+Emit only source link, optional deep link, optional tag chip in the meta
+row. The button surface is owned by JS so it can evolve without
+re-emitting historical roundup HTML.
+
+### Step 7a: Prepare deep-story briefs
+
+For each cluster picked in Step 5 (≤3 briefs total), construct a
+deep-story brief following the contract in
+`references/deep-story-brief.md`. Each brief is fully self-contained
+— it knows its cluster, its archetype, its output path, and all the
+reference files it needs.
+
+Each brief carries these fields:
+
+- `news_id` — the YYYY-MM-DD-NN from the roundup
+- `primary_url` and `variant_urls[]` — every variant from the cluster
+- `title`, `domain`, `archetype` — set in Step 5
+- `summary` — 2-3 sentences telling the sub-agent what to cover
+- `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
+- `sidecar_path` — same path with `.11tydata.json`
+- `ledger_path` — same path with `.ledger.json` (the reading ledger
+  the author builds while fetching sources; see
+  `references/fact-check.md`)
+- `related_roundup` — `/YYYY/MM/DD/roundup/`
+- `recent_widgets` — a flat list of the `widget_templates` used by the last
+  ~5 deep-stories, PLUS the hero each of today's *other* deep-stories is
+  planning. Collect the recent part by reading the `widget_templates` field
+  of the most recent `deep-*.11tydata.json` sidecars (newest first, ~5 posts);
+  add today's sibling heroes so the ≤3 concurrent stories don't all pick the
+  same hero. This list lets each sub-agent rotate its widget choices (brief
+  step 9 + cookbook INDEX § Hero rotation). It exists to stop the site shipping
+  the same hero and the same `tab-switcher` + `matter-of-fact-table` combo every
+  day. If you can't cheaply gather it, pass an empty list — the sub-agent still
+  applies the cookbook's rotation guidance, just without cross-post awareness.
+
+Briefs must be finalised before any dispatch in Step 7b — the parent
+agent is the only place that knows the cluster→archetype mapping and
+the dedup state. Each sub-agent sees only its own brief.
+
+The sidecar contract is unchanged:
+
+- `archetype` is `"daily-deep-story"`
+- `deep_archetype` is the value picked in Step 5
+- `sources[]` MUST include every variant_url, not just the primary
+  (cross-source synthesis contract from Step 5.0)
+
+### Step 7b: Dispatch parallel deep-story sub-agents
+
+Issue all ≤3 dispatches in ONE response (single message containing
+multiple `Agent` tool blocks). Each dispatch uses
+`subagent_type: general-purpose` with **`model: "sonnet"` required** —
+author writing is a design-grade judgment task (archetype selection,
+H2 structuring, opener/closer crafting, material density), not
+mechanical pattern-matching. Default sub-agent model selection
+(cheap) is wrong here. If Sonnet is not available at dispatch time,
+report BLOCKED rather than fall back to a cheaper model — the routine
+should produce no PR rather than a PR of unknown calibration. The
+brief from Step 7a is passed as the prompt — see
+`references/deep-story-brief.md` for the exact markdown template
+each sub-agent receives.
+
+Sub-agents run concurrently; the parent waits for all to return before
+proceeding to Step 7c.
+
+Each sub-agent is constrained per the brief:
+
+- Tools allowed: WebFetch, Read, Write only.
+- No nested `Agent` dispatch, no Bash, no Edit on other days' posts,
+  no git operations.
+- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`
+  + ONE reading ledger to `ledger_path` (built while reading, per
+  `references/fact-check.md` § The authoring discipline), reports
+  back with `{status, char_count, archetype, archetype_deviations,
+  note_count, spine_points}`.
+
+If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
+
+- `DONE_WITH_CONCERNS` with a documented deviation → accept and
+  proceed; note the deviation in the PR body.
+- `BLOCKED` → re-dispatch that one brief with additional context, or
+  drop the deep-story (reducing N to N-1). Do NOT skip QA — the
+  routine remains correct with fewer deep-stories.
+
+### Step 7c: Verify deep-story outputs
+
+After all sub-agents return:
+
+1. Read each output HTML + sidecar + ledger back to confirm the files exist and
+   the sidecar + ledger parse as JSON.
+2. Verify per-file invariants the sub-agent was told to honour:
+   - Prose ≥ 4000 CJK chars in `.vg-post-body` (widget code inside
+     `<script>`, `<style>`, `<svg>`, `<canvas>` excluded) — same floor
+     `archetype-check.mjs` enforces mechanically in Step 8. A floor,
+     not a target (tier-3 §11: density > length).
+   - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
+   - ≥ 3 widgets total (count of elements with `class="vg-w-*"`).
+   - ≥ 1 widget is interactive (contains `<script>` OR `<input>`
+     OR `<canvas>` OR `animation-timeline: scroll()` in inline CSS).
+   - Universal contract from `deep-freeform.md` applies to all archetypes.
+   - Body matches the picked archetype's H2 *count range* (phrasing free).
+   - Sidecar contains `widget_count`, `widget_questions`,
+     `widget_templates` arrays; lengths agree.
+   - Ledger contains a 5-7 point `spine`, non-empty `notes[]`, and a
+     `perspective` set per source (`claims` may be empty — the
+     Step 7.6 checker fills it).
+3. **Count-conservation invariant** (added 2026-05-21 after PR #30):
+   `N_deep_dispatched_in_step_7b == N_deep_written_files`. If a
+   sub-agent BLOCKED or its output got dropped, refer to Step 5d's
+   refill loop — do NOT silently let N drop. The PR body must
+   explicitly account for every dispatched brief (DONE,
+   DONE_WITH_CONCERNS, BLOCKED, or refilled-after-drop).
+4. **BA-slider pane invariant** (added 2026-05-21 after PR #30): if
+   any deep-story contains a before/after slider widget
+   (`.vg-w-ba-*`), inspect both `.before` and `.after` panes via
+   Playwright DevTools and confirm both contain visible, sensical
+   content at the default 50/50 position. The PR #30 Rust BA widget
+   inverted DOM order + clip-path; the right pane was authored
+   correctly but never painted. Spot-check via:
+
+   ```js
+   document.querySelectorAll('.vg-w-ba-* .before, .vg-w-ba-* .after')
+     .forEach(el => console.log({ cls: el.className, h: el.scrollHeight, text: el.textContent.slice(0,60) }));
+   ```
+
+   Both panes must report nonzero `scrollHeight` and non-empty
+   `textContent`. See `widget-cookbook/tier-2-snippets/before-after-slider.md`
+   for the canonical pattern.
+5. **Banned widget templates invariant** (added 2026-05-21 after PR #30):
+   the deep-story sidecar's `widget_templates` array MUST NOT include
+   any of the banned ids. Current ban list:
+   - `scroll-driven-explanation` (sticky figure leaves viewport
+     before stages change; fragile observer margins; mobile sticky
+     covers the prose)
+   - `css-scroll-timeline` (same scroll-position fragility, no
+     reliable fallback)
+
+   If a sub-agent returned a deep-story whose sidecar references a
+   banned id, REJECT the output and re-dispatch the brief with an
+   explicit instruction to pick a non-banned alternative
+   (typically `tab-switcher-pure-css` for staged narratives, or
+   `annotated-diagram-walkthrough` for architecture exposition).
+   The canonical reference implementation is the Meta migration
+   tabs widget `vg-w-tabs-meta-ingest-migration` in
+   `src/posts/2026/05/21/deep-meta-data-ingestion-migration.html`.
+6. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
+   `html-validate`, `link-check`) is the formal validation. Step 7c is
+   the first-pass sanity check before that.
+7. Read the sub-agent's `preflight` block. Each deep-story sub-agent
+   runs a mechanical self-audit (deep-story-brief Step 11.8) and reports
+   `em_dash_check`, `widget_count_match`, `placeholder_check`, and
+   `cjk_char_count_ok`. If a sub-agent reports `status: DONE` while any
+   preflight item is FAIL, that is contradictory — treat the story as
+   BLOCKED and re-dispatch it (the per-story re-dispatch path already
+   used for partial failures). The pre-flight front-loads mechanical
+   contract violations that Step 8 CI would otherwise catch on a
+   round-trip; it is NOT a substitute for the Step 7.5 judgment review.
+
+PR body must list:
+
+- One line per deep-story: news_id, archetype, slug, char count,
+  archetype-deviations (if any).
+- "Parallel dispatch summary": which N briefs were dispatched, how
+  many returned DONE / DONE_WITH_CONCERNS / BLOCKED, and any
+  re-dispatches needed.
+- Explicit `N_deep_dispatched == N_deep_final` reconciliation. Any
+  drop must point at a Step 5d refill attempt (success or "pool
+  exhausted").
+
+### Step 7.5: Content quality gate
+
+After Step 7c verifies structure, run the content-quality reviewer pass on
+the roundup + each deep-story. This is the only step that judges
+whether the prose is actually good — Step 8 catches HTML / dedup /
+archetype-count failures, Step 8.5 catches visual issues, but neither
+looks at story arc, hook strength, or whether H2s are template-shaped.
+
+**Wallclock is NOT capped** in this step. Quality trumps speed.
+
+**No skip clause exists.** If wall-clock or Opus-budget anxiety makes
+the full dual-reviewer pass feel expensive, the only legal response is
+to **drop deep-stories (N → N-1) so the remaining gate fits**, never
+skip the gate to ship more posts. PR #32 (2026-05-22) shipped 3 deep
+stories with a self-declared "deviation: 7.5 skipped because parallel
+dispatch already consumed multiple Opus batches" — this is exactly the
+pattern this clause forbids. The cost arithmetic the routine performed
+("8 more Opus dispatches with retry potential") is irrelevant: if you
+cannot afford 8 reviewer dispatches, you cannot afford 3 deep stories
+in this run. Trim to 2 or 1.
+
+**Scope clarification (added 2026-05-23 after PR #35)**: this clause
+authorizes trimming N when *runtime evidence* shows the gate cannot
+fit — e.g. a reviewer crashed and won't re-dispatch, a per-post retry
+loop legitimately exhausts, or an inter-post reviewer keeps failing.
+It does NOT authorize **Step 5 preemptive trimming** on imagined
+cost. The "if you cannot afford 8 reviewer dispatches" sentence above
+is a post-hoc rule that kicks in when you have evidence the budget
+won't hold; it is not an invitation to do the math in Step 5 and
+trim N preemptively. If you cite "Step 7.5 will be expensive" in
+Step 5b, you've inverted the clause — see Step 5c's "Trimming N
+below 3 is ONLY legitimate when…" list for the legal Step 5
+reasons.
+
+Step 7c sub-agent self-checks (the author reading the archetype
+reference + persona before drafting) are **not a substitute** for
+Step 7.5 — author self-check is biased and shallow by construction;
+the whole point of dispatching an independent Opus reviewer is to get
+a judgment the author cannot give itself. Wording like "the Step 7c
+sub-agent self-checks plus the Step 8 mechanical checks serve as the
+quality gate for this run" is a rationalization, not a substitution
+argument; reject it in your own routine output. (The deep-story Step
+11.8 pre-flight is a different thing: it checks MECHANICAL contract
+compliance — em-dash, widget count, placeholders, length — which is
+countable, not a judgment. It is orthogonal to this clause and does not
+claim to replace the Step 7.5 quality review.)
+
+#### Step 7.5a: Dispatch dual reviewers (parallel)
+
+For each post produced in Steps 6 + 7 (1 roundup + N deep-stories,
+max 3), dispatch **2 independent reviewer sub-agents** with
+`subagent_type: general-purpose` and **`model: "opus"` required**.
+Reviewer quality judgment (Axis 2 structural coherence, Axis 4 depth
+vs. paraphrase, Axis 6 anti-template) is a design-grade task. Running
+reviewer on the same model family as author also produces LLM-judging-LLM
+bias — using Opus widens the judgment-power gap now that author defaults
+to Sonnet. If Opus is unavailable at dispatch time, report BLOCKED rather
+than fall back. Each reviewer's brief follows the template in
+`${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/content-reviewer-brief.md`
+with the per-post values substituted.
+
+Total batch size: 2 × (1 + N) reviewer sub-agents, all dispatched in
+ONE response (single message with multiple `Agent` tool blocks).
+
+Each reviewer:
+- Tools: Read only
+- Reads: post HTML + sidecar + rubric file + archetype reference (if
+  deep-story) + persona file + ledger spine (deep-story only)
+- Does NOT read: other posts, exemplars, other reviewer's output
+- Emits: ONE JSON object per the rubric's "Reviewer output format"
+  schema
+
+#### Step 7.5b: Consolidate dual-reviewer findings
+
+For each post, parent receives 2 reviewer outputs. For each axis:
+- `consensus_score = min(reviewer_A.score, reviewer_B.score)` (lower
+  = stricter gate)
+- `disagreement = |reviewer_A.score - reviewer_B.score|`
+
+If `disagreement >= 2` on any axis, record for PR body:
+`<output_path> Axis <name>: reviewer-A=<A>, reviewer-B=<B>`.
+
+Derive per-post `overall` from consensus scores using the rubric's
+band semantics:
+- Any consensus axis <= 3 → BLOCKING
+- Otherwise any consensus axis 4-6 → IMPORTANT
+- Otherwise any consensus axis 7-8 → PASS-with-notes
+- All consensus >= 9 → PASS
+
+#### Step 7.5c: Per-post retry loop
+
+For each post with `overall` BLOCKING or IMPORTANT, construct a retry
+brief for the author sub-agent. The retry brief is the post's
+original brief (from Step 7a — held by parent) PLUS:
+
+- The current `output_path` (existing draft is the starting point)
+- The reviewer findings: each weak axis, its consensus score, both
+  reviewers' justifications
+- Explicit instruction on the target level (axis must reach >= 7 to
+  exit BLOCKING; >= 7 to exit IMPORTANT)
+- Permission to keep widgets unchanged unless reviewer findings cite
+  widget content (most prose findings should not touch widgets)
+- For Axis 8 (zh-TW prose) findings: the retry must obey
+  zh-tw-prose.md §1 — fix by deletion and rewriting only. Inventing
+  numbers, scenes, or quotes to "add texture" is fabrication and
+  forbidden; every concrete detail must come from the source material.
+
+Parent dispatches retry author sub-agents in parallel (one per post
+needing retry) — **same `model: "sonnet"` requirement as Step 7b**.
+After all retries return, re-dispatch the dual reviewers (Step 7.5a,
+also Opus) for each retried post; consolidate again (Step 7.5b).
+
+Iteration budget per post:
+- **BLOCKING**: up to 5 retry rounds. If still BLOCKING after 5 →
+  drop this post (N → N-1). Log to PR body under
+  `## Step 7.5 Blocking drops`.
+- **IMPORTANT**: up to 3 retry rounds. If still IMPORTANT after 3 →
+  accept the current draft, log to PR body under
+  `## Content Quality Concerns`.
+- **PASS-with-notes / PASS**: no retry; logged for transparency only.
+
+If a reviewer emits malformed JSON: re-dispatch that reviewer up to 2
+extra times. If still malformed, treat as a vote of BLOCKING on that
+post (drop the post).
+
+If the roundup itself reaches BLOCKING and exhausts retries: this is
+a routine failure. Do NOT open PR. Report BLOCKED status with the
+roundup's blocking axes.
+
+#### Step 7.5d: Inter-post diversity check (only when N_final >= 2)
+
+After all per-post retries settle, count the number of deep-stories
+still in the batch (`N_final`). If `N_final >= 2`, dispatch ONE
+inter-post reviewer sub-agent (**`model: "opus"` required**, same
+rationale as Step 7.5a) with the inter-post brief variant from
+`content-reviewer-brief.md`. It scores Axis 7 only.
+
+If `batch_score < 7`:
+1. Identify `most_similar_post` from the reviewer output.
+2. Construct a retry brief: original brief + "find another angle"
+   instruction + the inter-post reviewer's justification on what
+   makes this post too-similar-to-others.
+3. Dispatch one retry author sub-agent for that post (Opus, per
+   Step 7b).
+4. Re-dispatch the inter-post reviewer (Opus, per above).
+5. Up to 2 inter-post retry rounds. If still `batch_score < 7`
+   after round 2, accept and log to
+   `## Inter-post diversity concerns`.
+
+`N_final = 1` → skip Step 7.5d entirely.
+
+#### Step 7.5e: Collate findings for PR body
+
+Parent now has, for each surviving post:
+- Final per-axis consensus scores
+- Final overall status
+- Retry rounds run
+- Reviewer disagreement notes (if any axis disagreed by >= 2)
+
+And, if N_final >= 2:
+- Final batch_score
+- Inter-post retries run
+
+These populate the PR body sections defined in Step 9's template
+(see Step 9 prose).
+
+#### Failure modes for Step 7.5
+
+| Scenario | Handling |
+|---|---|
+| One reviewer emits malformed JSON | Re-dispatch that reviewer (up to 2 retries). Still malformed → treat as BLOCKING vote on that post. |
+| Both reviewers crash on one post | Treat as BLOCKING for that post. Drop the post if it's a deep-story; abort routine if it's the roundup. |
+| All N deep-stories blocking-drop | Routine continues with roundup-only PR; PR title says "(0 deep stories)" and PR body documents the drops. |
+| Roundup blocking-drops | BLOCKED — do NOT open PR. Report status with roundup's blocking axes. |
+| Reviewer dispatch returns no output (network / tool failure) | Re-dispatch that reviewer once. Still nothing → treat as BLOCKING vote. |
+
+### Step 7.6: Fact-check gate (trace + authenticity)
+
+After Step 7.5 settles (prose is final modulo fact fixes), verify the
+posts against their reading ledgers, and the ledgers against the
+world. Authors built the ledgers while reading (Step 7b); this step
+proves the post only asserts what the notes contain (trace) and that
+the notes' quotes are real (authenticity). The standard lives in
+`references/fact-check.md`; the checker contract in
+`references/fact-check-brief.md`. Ledgers are committed next to the
+posts (`<slug>.ledger.json`) — they are PR-review evidence and the
+site's re-verification record.
+
+**No skip clause exists.** Same enforcement rule as Steps 7.5/8.5:
+if wall-clock or budget is tight, drop deep-stories (N → N-1) so the
+remaining gate fits — never ship unverified claims to ship more
+posts. `check-quality-gate-evidence.mjs` fails when ledgers are
+missing; `check-claim-ledger.mjs` fails when they are incomplete or
+unresolved.
+
+#### Step 7.6a: Dispatch fact-check sub-agents (parallel)
+
+For each post (1 roundup + N deep-stories), dispatch **1 checker
+sub-agent** with `subagent_type: general-purpose` and **`model:
+"opus"` required** (hedge-strength and source-independence judgment
+is design-grade; if Opus is unavailable, report BLOCKED rather than
+fall back). All ≤4 dispatches in ONE response. Each checker (tools:
+Read + WebFetch only):
+
+- **Trace pass** — extracts load-bearing claims from the post and
+  binds each to ledger notes (`note_ids`); unbound + unmarked =
+  trace failure.
+- **Authenticity pass** — re-fetches every ledger source; verifies
+  each used note's `quote` is really in the source at the recorded
+  `hedge` strength; judges independence (echo ≠ corroboration) and
+  timeliness; fills any `archive_url` the author left null.
+- For the roundup: creates `roundup.ledger.json` (claims-only — no
+  notes/spine), ≥1 claim per item lede verified against the item's
+  source URL.
+- Emits the completed ledger JSON; the parent writes it back to
+  `ledger_path`.
+
+#### Step 7.6b: Apply the action matrix
+
+Parent walks the returned claims: every claim whose `action` ≠
+`none` needs a fix per the fact-check.md action matrix (high-load
+`unverifiable` → correct from source or delete; unmarked `inferred`
+→ mark as inference or delete; `hedge_delta: inflated` → restore the
+note's hedging strength; high-load `pending` → alternate source or
+visible hedged attribution).
+
+#### Step 7.6c: Fix loop
+
+For each post with actionable claims, dispatch one retry author
+sub-agent (Opus, per Step 7b) whose brief contains the claim list,
+each claim's verdict + evidence + bound notes, and the **fix
+discipline**: deletion, hedging, marking-as-inference, or correcting
+to what the note's quote actually says ONLY — a fix may not
+introduce facts, numbers, or quotes absent from the ledger
+(zh-tw-prose.md §1). Trace failures may also be fixed by ADDING a
+note — but only with a verbatim quote from a re-fetched source.
+After fixes, re-dispatch the checker with the re-check variant brief
+(fixed claims only); parent merges verdicts and updates each claim's
+`resolution`, bumping `checker_rounds`.
+
+Iteration budget: up to **3 rounds** per post. A high-load
+`unverifiable` claim that survives 3 rounds drops the post
+(N → N-1), logged under `## Step 7.6 Fact-check drops`; if that post
+is the roundup, the routine is BLOCKED — do NOT open PR. Fixes here
+are deletions/hedges/corrections, narrow by construction — they do
+not re-trigger Step 7.5.
+
+#### Step 7.6d: Mechanical validation
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+```
+
+Validates every committed ledger: schema + enums, spine 5-7, one
+perspective set per source, notes integrity (verbatim quote, hedge,
+interpretation separation), trace binding (`note_ids` non-empty or
+verdict `inferred`), coverage arithmetic, claim floors (deep ≥
+min(10, candidates); roundup ≥ item count), and resolution rules (no
+surviving high-load `unverifiable`, no `pending-fix`,
+`accepted-with-flag` only for medium/low-load `pending`). Exit 1 =
+the discipline is not done; the fix is to finish it, never to edit
+ledger fields to pass.
+
+#### Failure modes for Step 7.6
+
+| Scenario | Handling |
+|---|---|
+| Author sub-agent returns post but no ledger (or unparseable) | Treat as BLOCKED for that post in Step 7c — re-dispatch the brief; the ledger is not optional output. |
+| Checker emits malformed JSON | Re-dispatch that checker (up to 2 retries). Still malformed → treat the post as unverified: drop it (deep-story) or BLOCK (roundup). |
+| All ledger sources unreachable on re-fetch | Every claim is `pending`. High-load pendings need alternate sources or hedged attribution; if the post's core claims can't be supported, drop the post. |
+| Archive (web.archive.org) fails or times out | Non-blocking. `archive_url: null`, move on — the gate warns but does not fail. |
+| High-load `unverifiable` survives 3 fix rounds | Drop the post (N → N-1); roundup → BLOCKED, no PR. |
+
+### Step 8: Self-check (mechanical)
+
+Run the validation scripts:
+
+```bash
+# Dedup check (catches anything missed in step 3)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-dup.mjs src/posts/YYYY/MM/DD/
+
+# zh-TW prose check (zh-CN terms + AI-boilerplate phrases; flag terms listed for judgment)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-zh-prose.mjs src/posts/YYYY/MM/DD/
+
+# Schema/structure check
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/publish.mjs src/posts/YYYY/MM/DD/
+
+# HTML validity + archetype + link check
+npx @11ty/eleventy
+npx html-validate "_site/**/*.html"
+node ${CLAUDE_PLUGIN_ROOT}/tests/archetype-check.mjs _site/
+node ${CLAUDE_PLUGIN_ROOT}/tests/link-check.mjs
+
+# Fact-check ledger validation (re-run of Step 7.6d — cheap, keep it in
+# the battery so a post-7.6 edit can't silently invalidate a ledger)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+
+# Quality-gate evidence: enforces that Steps 7.5, 7.6, and 8.5 actually ran
+# (reviewer JSON + fact-check ledgers + screenshot artifacts present on
+# disk). Exits 1 if any post lacks evidence. Run this AFTER Steps 7.5, 7.6,
+# and 8.5 have completed and BEFORE the commit / PR step.
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
+```
+
+If any step fails: fix the underlying content, re-run. Do not commit while
+checks fail.
+
+`check-quality-gate-evidence.mjs` failing means the routine skipped a
+quality pass. The fix is **never** "delete the gate" or "stub the
+artifacts"; the fix is to actually run Step 7.5 / 7.6 / 8.5, or to drop
+deep stories until what remains fits the budget the routine can pay.
+
+### Step 8.5: Visual self-review (Playwright + multimodal)
+
+Mechanical checks (Step 8) catch broken HTML and missing structure; they
+do NOT catch visual regressions like SVG widgets invisible in dark mode,
+text overflow, layout collapse, or unreadable contrast. Step 8.5 closes
+that gap by having Claude open each rendered page in Playwright, take a
+screenshot, and look at it.
+
+**No skip clause exists.** Same enforcement rule as Step 7.5: if
+wall-clock is tight, drop deep-stories (N → N-1) so the audit fits,
+never skip the audit to ship more posts. PR #32 (2026-05-22) declared
+the visual audit as "(Minor) deferred" with the rationale "the
+mechanical semantic invariants cover the highest-risk visual failures"
+— this is false. The mechanical scripts cover SVG legibility floor +
+text overflow only; they do not catch grid-track conflicts, breakout
+overflow, dark-mode contrast, viewport-scroll regressions, or any
+class of layout bug that is visible at a glance in a screenshot but
+invisible to per-element DOM measurement. The 2026-05-22 C# widget
+shipped with desktop SVG squeezed to 409 px in a 1.3fr-1fr grid (vs
+intended 960 px full-width) — the post-merge screenshot revealed it
+in one second; the routine's mechanical PASS hid it completely.
+
+If you find yourself thinking "I already ran the mechanical scripts so
+the visual pass is lower priority" — that is the rationalization this
+clause forbids. **Mechanical and visual passes are not substitutes
+for each other**; they catch disjoint failure modes by construction.
+
+**Scope clarification (added 2026-05-23 after PR #35)**: same scope
+rule as Step 7.5. This clause authorizes trimming N when *runtime
+evidence* shows a Blocking visual issue genuinely can't be fixed in 5
+iterations. It does NOT authorize Step 5 preemptive trimming on
+"Step 8.5 will be expensive with N posts" reasoning. Step 5c's
+"Trimming N below 3 is ONLY legitimate when…" list is the only
+authorization for sub-3 in Step 5.
+
+**Setup**:
+
+```bash
+npm run dev > /tmp/vg-dev-selfreview.log 2>&1 &
+sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+# ^ expect 200; otherwise tear down and BLOCK
+```
+
+**For each published post** (roundup + each deep-story):
+
+1. Navigate Playwright to `http://localhost:8080/YYYY/MM/DD/<slug>/`
+2. Initial viewport screenshot in light mode (default)
+3. Switch to dark via **both** `localStorage` AND `data-theme` attribute —
+   the site reads `localStorage` only on page load and then applies
+   `data-theme` to `<html>`, so post-load `localStorage` change alone does
+   nothing. Use:
+   ```js
+   localStorage.setItem("vg-theme", "dark");
+   document.documentElement.setAttribute("data-theme", "dark");
+   ```
+   Then take initial viewport screenshot.
+4. For widgets below the fold (deep-stories often have widgets 800–1500px
+   down): use `document.querySelector('.vg-w-...').scrollIntoView()` then
+   screenshot the **viewport**, not the element. Element-level screenshots
+   (`target=` in playwright) are unreliable when multiple `<figure>` or
+   `<svg>` elements exist on the page (strict-mode selector violation).
+5. **Mobile audit — every deep-story, every widget** (added 2026-05-20
+   after PR #23/#24/#25 surfaced widespread mobile issues):
+
+   a. Resize browser to **375×812** (iPhone SE / small phone).
+
+   b. For each deep-story, navigate to the post URL.
+
+   c. For each widget inside `.vg-post-body figure[class*="vg-w-"]`:
+      - `widget.scrollIntoView({ block: 'center' })`
+      - Wait ~300ms for any sticky / IntersectionObserver to settle.
+      - Take a viewport screenshot.
+      - **Look at the screenshot**. Check:
+        - Is every SVG label / axis / chart annotation readable?
+          (Wide-aspect viewBox ≥4:1 widgets crush at 375px to ~80px
+          tall — labels collide. See tier-3 §12.1.D-pre for fix
+          patterns.)
+        - Are tap targets ≥ 32px? (range thumbs, buttons, divider
+          handles, SVG clickable rects.)
+        - Does the widget overflow horizontally? (any `bb.right > 400`)
+        - For scroll-driven widgets: does the sticky figure stay
+          visible below the site header (not hidden behind chrome)?
+          Site header is `position: sticky; top: 0; z-index: 50` ~100px
+          tall — sticky widget figures must use `top: var(--vg-header-h)`
+          per tier-3 §12.1.B.
+
+   d. Also scroll past each scroll-driven widget's stages and verify
+      the active stage class actually changes as the reader scrolls
+      (IntersectionObserver mobile rootMargin per §12.1.E).
+
+   e. **Semantic invariants — mechanical** (added 2026-05-21 after PR #30):
+      run the two semantic-invariant scripts against every published
+      page. These catch classes of failure that visual screenshot
+      review systematically misses (because screenshots are
+      downsampled and human reviewers pattern-match on "looks roughly
+      right" rather than measuring).
+
+      **(i) SVG legibility floor**: smallest text inside every
+      `vg-w-*` SVG must render at ≥ 11 effective px on a 375 viewport.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/measure-svg-legibility.mjs \
+        http://localhost:8080/YYYY/MM/DD/<roundup-slug>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-legibility.json
+      # exit 1 = at least one figure below the 11 px hard floor
+      ```
+
+      The script emits one JSON line per figure on stderr and an
+      aggregate verdict on stdout. PASS = ≥ 11 effective px (target);
+      SOFT-PASS = 10.0–11.0 (acceptable for deliberate calibration);
+      FAIL = < 10 px. Fix by adding or bumping `data-svg-scroll="<min-px>"`
+      on the `<figure>` per `references/design-system.md` § Mobile
+      legibility floor. Treat any FAIL as a Blocking-tier issue.
+
+      **(ii) SVG text overflow**: no `<text>` inside a `vg-w-*` figure
+      may extend more than 2 SVG units past the right edge of the
+      `<rect>` that semantically contains it.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-text-overflow.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-overflow.json
+      # exit 1 = at least one text overflows its owning rect
+      ```
+
+      Fix per `widget-cookbook/tier-3-principles.md` §12.1.D-bis:
+      shorten the label, drop font-size (within legibility floor),
+      move outside the rect, or split into stacked `<text>` lines.
+
+      **(iii) Desktop grid + `data-svg-scroll` mutual exclusion** (added
+      after the 2026-05-22 C# unsafe widget shipped a 1.3fr-1fr grid
+      with `data-svg-scroll="720"`; on a ~880 px desktop figure the
+      left track is only ~497 px, so the 720 px-min SVG overflowed and
+      triggered an unintended horizontal scrollbar). The
+      `data-svg-scroll="N"` rule sets `min-width: N px` on every
+      descendant `<svg>` — that floor is measured against the
+      containing grid track, not the figure. If the figure is itself a
+      multi-column grid on desktop, the SVG can't fit and either spills
+      or forces the figure's `overflow-x: auto` open. The
+      `widget-cookbook/anti-examples.md` "Two-column grid + scroll"
+      pattern documents the rule verbally; this script enforces it
+      mechanically.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-grid-svgscroll-conflict.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-grid-scroll.json
+      # exit 1 = at least one figure combines desktop multi-column
+      # grid with data-svg-scroll
+      ```
+
+      Fix by either (a) dropping `data-svg-scroll` if the SVG is
+      readable in the desktop track at its natural width, or (b)
+      collapsing the desktop grid to a single column so the SVG spans
+      the full figure. Treat as Blocking.
+
+      **(iv) SVG text-vs-text collision** (added 2026-06-15): no two
+      `<text>` inside the same `vg-w-*` SVG may overlap by more than 1
+      AND 3 viewBox user-units (horizontal AND vertical). Overlap is
+      measured with `getBBox()` in the SVG's own viewBox space, so the
+      threshold is viewport-independent. The 3-unit vertical floor
+      tolerates a deliberate two-line description at the same cx (normal
+      line spacing). This catches the smear that legibility and overflow
+      scripts miss — two `text-anchor="middle"` labels placed at
+      hand-picked cx closer than they are wide.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-text-collision.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-collision.json
+      # exit 1 = at least one text-vs-text collision.
+      # stdout JSON carries figures_inspected; a "WARNING: inspected 0
+      # figures" on stderr means the page never loaded — not a real PASS.
+      ```
+
+      Fix by spreading anchors across the viewBox, staggering one label
+      above/below the axis with a leader line, or end-anchoring a single
+      colliding label. Treat as Blocking.
+
+      **(v) Drag-handle coordinate target** (added 2026-06-15): a widget
+      that does `getScreenCTM` coordinate math must NOT grab its svg with
+      a bare `querySelector('svg')` when its figure holds more than one
+      `<svg>` (e.g. an affordance-icon svg as the first svg). The bare
+      query grabs the wrong svg and the drag handle lands off the cursor.
+      Disambiguate by selecting a class-qualified svg
+      (`querySelector('svg.vg-w-<name>-main')`, or any `svg.<class>`).
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-coordinate-target.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-coordinate.json
+      # exit 1 = a coord-transform widget with >1 svg uses a bare svg query
+      ```
+
+      Fix by giving the main svg a class and selecting it explicitly.
+      Treat as Blocking.
+
+      **(vi) Static widget scan** (added 2026-06-15): runs on the post
+      *source* files (no browser). Flags `vg-w-table-*` figures rendered
+      as `<pre>` instead of a real `<table>`, and SVG `role=button`
+      widgets with `data-target` rects but no bridge script. The dead-
+      button check is file-level — a clean result proves at least one
+      `getAttribute('data-target')` bridge exists in the file, not that
+      every SVG-button widget is individually wired.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-widget-static.mjs \
+        src/posts/YYYY/MM/DD/ \
+        > /tmp/vg-widget-static.json
+      # exit 1 = at least one fake-table or dead-svg-button finding
+      ```
+
+      Fix the fake table by rebuilding it as a real `<table>`; fix the
+      dead button by adding the radio-bridge script. Treat as Blocking.
+
+   f. **Touch-tier audit — true touch emulation** (added 2026-06-12,
+      static-tier spec): the 375px *resize* in (a)–(c) does NOT trigger
+      the touch CSS (`hover: none / pointer: coarse` is capability
+      detection, not width).
+
+      Open a NEW device-emulated browser context for this step — do
+      NOT reuse the resized desktop window:
+
+      ```js
+      const { chromium, devices } = require("@playwright/test");
+      const browser = await chromium.launch();
+      const ctx = await browser.newContext({ ...devices["iPhone 13"] });
+      const page = await ctx.newPage();
+      ```
+
+      Per deep-story: navigate, then scrollIntoView + screenshot every
+      `.vg-post-body figure[class*="vg-w-"]`, every `.vg-mobile-card`,
+      and the `.vg-mobile-notice`. LOOK at the screenshots and check
+      per tier:
+      - `keep`: figure visible; NO control remnants（slider、checkbox、
+        radio、button 全藏乾淨，無空白破洞）; text passes the box-test
+        (no text-vs-text / text-vs-box overlap, nothing clipped).
+      - `static`: all `keep` checks, PLUS — figure 有 `data-svg-scroll`
+        且可橫向滑到最右端；預設狀態讀得懂——verdict/annotation 文字是
+        有意義的預設值，不是空白或 placeholder。
+      - `swap`: card shows title + summary, NO per-card desktop hint;
+        top notice appears exactly once.
+
+   g. Record findings for the post in the issue list (see severity
+      tiering below).
+
+6. **Roundup mobile check**: navigate to roundup at 375px, screenshot
+   the donut + top 3 item cards. Verify section labels render,
+   read-tracker buttons inject correctly, no horizontal scroll.
+
+**Look at each screenshot. Classify any issues by severity**:
+
+| Tier | Examples | Loop behavior |
+|---|---|---|
+| **Blocking** | Element overlap obscuring text; text cut off mid-character; SVG widget completely invisible (white-on-white in light mode, dark-on-dark in dark mode); page renders blank or with browser console errors; layout collapse where one column eats another | Fix the underlying CSS/HTML; rebuild; re-screenshot; re-classify. Up to **5 iterations**. If still blocking after 5 → stop and report BLOCKED status (do NOT open PR). |
+| **Important** | Awkward but readable spacing; SVG renders but legend overflows; sticky header overlaps card title on scroll; CJK wrap breaking a code identifier ugly | Fix in current iteration. Up to **3 iterations**. If still present after 3 → note in PR body under `## Visual Concerns` and continue to PR. |
+| **Minor** | Drop cap baseline 2-3px off; tag chip vertical alignment imperfect; line-height slightly tight | Record only. Note in PR body, do NOT iterate. |
+
+**When retrofitting / fixing existing posts (not just authoring new ones)**:
+the Step 8.5 audit MUST be re-run on every post that was modified. This
+applies to bulk widget retrofits, prose trims, density refactors, mobile
+fixes — any change that touches a post's HTML. Mechanical checks alone
+(Step 8) are insufficient because they do not look at the rendered page.
+
+PRs #23/#24/#25 each surfaced issues that would have been caught by a
+proper Step 8.5 audit but weren't because retrofits skipped Step 8.5:
+- Wide viewBox widgets crushed on mobile
+- Sticky figure hidden behind site header
+- Range thumbs untappable
+
+Rule: if you modify N posts, you run Step 8.5 on N posts. No exceptions.
+
+**Iteration budget rationale**: 5 blocking-tier iterations covers real-world
+fix cycles (a wrong CSS selector → rebuild → re-screenshot → still wrong →
+another CSS attempt → success usually fits in 2-3 rounds; 5 is the hard
+ceiling so the routine doesn't infinite-loop on an unfixable case). 3
+important-tier iterations keeps quality bar without spending all run-time
+on polish. Minor issues never iterate — they belong in human review.
+
+**Inter-iteration discipline**: each fix must be a deliberate, named change
+("changed `.vg-card-roundup` grid columns from 3rem 1fr to 4rem 1fr to fix
+overlap of #NN numeral with title at narrow viewports"). Do NOT change
+multiple unrelated things in one iteration — if fix doesn't work, you won't
+know which change was wrong.
+
+**Tear down**:
+
+```bash
+kill $(lsof -ti:8080) 2>/dev/null
+```
+
+**Record findings**: keep a list of any Important + Minor issues to write
+into the PR body. Blocking issues should be all-fixed before reaching
+Step 9 (or the run should have BLOCKED out).
+
+### Step 9: Open PR
+
+```bash
+git checkout -b daily/YYYY-MM-DD
+git add src/posts/YYYY/MM/DD/
+git commit -m "daily: YYYY-MM-DD news (1 roundup + N deep stories)"
+git push -u origin daily/YYYY-MM-DD
+gh pr create --base main --title "daily: YYYY-MM-DD news (1 roundup + N deep stories)" --body "<see body template below>"
+```
+
+**PR body template** — include all sections:
+
+```markdown
+## 今日 10 則 (roundup)
+
+01. {{title}} — {{source_url}}
+02. ...
+...
+
+## 深入文章 (deep-stories)
+
+### {{deep_title_1}}
+
+Lede: {{deep_lede_1}}
+
+### {{deep_title_2}}
+
+Lede: {{deep_lede_2}}
+
+## 跳過 (dup with last 7 days)
+
+- {{skipped_url}} — title similarity 0.91 vs "{{past_title}}"
+- (none) if no skips
+
+## Domain distribution
+
+AI · 3 · SYSTEMS · 3 · INFRA · 2 · WEB · 1 · BACKEND · 1
+
+## Domains skipped today
+
+- (none) — or list each: e.g., "WEB: no qualifying candidates"
+
+## Domains capped (≤6 rule)
+
+- (none) — or list e.g., "AI: 8 qualifying, top 6 selected"
+
+## 來源使用
+
+- HackerNoon: 18 candidates → 4 selected
+- Hacker News: 12 candidates → 2 selected
+- Cloudflare blog: 5 candidates → 1 selected
+- ...
+- Failed: (none) or list of failed-fetch sources
+
+## Step 8.5 Visual Audit Evidence (REQUIRED — no "deferred" allowed)
+
+This section MUST list, for every published post, the screenshot
+artifacts produced in Step 8.5. Empty or "skipped" or "deferred" is an
+INVALID PR — the publish gate (`check-quality-gate-evidence.mjs`) will
+fail if the screenshot directory is empty.
+
+For each post:
+- `<output_path>` — desktop (1280×900) and mobile (375×812), light + dark,
+  plus one viewport screenshot per widget. Format:
+  ```
+  /2026/MM/DD/<slug>/
+    desktop-light.png · desktop-dark.png
+    mobile-light.png · mobile-dark.png
+    widget-<vg-w-name>-desktop.png · widget-<vg-w-name>-mobile.png  (× N widgets)
+  ```
+  Screenshots live under `/tmp/vg-audit-YYYY-MM-DD/<slug>/`. Full
+  path list goes here; do not summarize.
+
+### Visual issues found (and fixed during the audit)
+
+- (none) — or list each issue with affected page URL + screenshot path +
+  what was fixed. Example:
+- `/2026/05/22/deep-csharp-memory-safety-net11/` (desktop 1280): the
+  `.vg-w-annotated-csharp-unsafe-contracts` widget rendered SVG at
+  409 px in a 1.3fr-1fr grid track instead of full-width.
+  Fix: replaced desktop grid with `display: flex; flex-direction: column`
+  so the wide-aspect SVG spans the figure and the detail panel sits
+  beneath it. Re-screenshot in
+  `/tmp/vg-audit-2026-05-22/deep-csharp-memory-safety-net11/widget-annotated-csharp-unsafe-contracts-desktop.png`
+  confirms 960 px SVG, no horizontal scroll. Blocking-tier; 1 iteration.
+
+### Visual issues accepted (Important/Minor — NOT skipped)
+
+Issues here mean the visual audit DID run, found something, AND a
+decision was made to ship anyway with the issue documented. This is
+different from skipping the audit. List with severity + screenshot
+path + rationale for accepting.
+
+- (none) — or list each.
+
+## Step 7.5 Content Quality Review (REQUIRED — no "skipped" allowed)
+
+This section MUST contain dual-reviewer per-axis scores for every
+post. Empty or "skipped" or "deviation declared" is an INVALID PR —
+the publish gate (`check-quality-gate-evidence.mjs`) will fail if the
+reviewer JSON artifacts under `/tmp/vg-quality-YYYY-MM-DD/` are
+missing.
+
+Wall-clock or Opus-budget pressure is NOT a valid reason to omit this
+section. If the routine cannot afford full reviewer dispatches for N
+deep-stories, the routine MUST drop deep-stories until N fits the
+budget, per Step 7.5 "No skip clause exists" paragraph. Shipping more
+posts at lower quality-assurance is forbidden.
+
+For each post (roundup + deep-stories):
+- `<output_path>` — final status: PASS / PASS-with-notes / IMPORTANT-accepted / BLOCKED-dropped
+  - Axis 1 (Hook): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
+  - Axis 2 (Structural, <archetype>): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
+  - Axis 3 (Material): <consensus-score> (A=<a>, B=<b>)
+  - Axis 4 (Depth): <consensus-score> (A=<a>, B=<b>)
+  - Axis 5 (Relevance, <dimension>): <consensus-score> (A=<a>, B=<b>)
+  - Axis 6 (Anti-template): <consensus-score> (A=<a>, B=<b>)
+  - Axis 8 (zh-TW prose): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
+  - (Axis 7 inter-post diversity: see § Inter-post diversity concerns below)
+  - Reviewer JSON artifacts: `/tmp/vg-quality-YYYY-MM-DD/<slug>-reviewer-A.json`, `<slug>-reviewer-B.json`
+  - Retry rounds: <N>
+
+## Step 7.5 Blocking drops
+
+- (none) — or list: `<output_path>` (archetype), blocking axes, final scores, attempted retries
+
+## Content Quality Concerns
+
+- (none) — or list each post with axes still 4-6 after retry budget exhausted
+
+## Reviewer disagreements
+
+- (none) — or list: `<output_path>` Axis <name>: reviewer-A=<A>, reviewer-B=<B>. Human reviewer should look closely.
+
+## Inter-post diversity concerns
+
+- (none) — or batch_score=<N>, attempted retries=<M>, final state notes.
+
+## Step 7.6 Fact-check (REQUIRED — no "skipped" allowed)
+
+This section MUST contain per-post ledger summaries. Empty or
+"skipped" is an INVALID PR — `check-quality-gate-evidence.mjs` fails
+when ledgers are missing and `check-claim-ledger.mjs` fails when they
+are unresolved.
+
+For each post (roundup + deep-stories):
+- `<output_path>` — claims checked: <N> (of <M> candidates; <K> dropped low-load)
+  - trace: <N-bound> bound to notes · <N-inferred> marked inferred · <N-trace-failures> trace failures fixed
+  - verdicts: 已核實 <n1> · 待核實 <n2> · 推斷 <n3> · 不可核實 <n4>
+  - fixes applied: <list each — corrected / hedged / marked-inferred / deleted, with claim id + one-line what>
+  - accepted-with-flag: <list each pending medium/low-load claim the human should eyeball, with its source>
+  - unarchived sources: <list each archive_url: null, or (none)>
+  - Ledger: `src/posts/YYYY/MM/DD/<slug>.ledger.json` (committed — review the diff)
+  - Checker rounds: <N>
+
+## Step 7.6 Fact-check drops
+
+- (none) — or list: `<output_path>`, the claim(s) that could not be
+  corrected or deleted in 3 rounds, and the verdict evidence.
+
+## Deep-story archetypes used today
+
+- {{deep_title_1}} — `narrative`
+- {{deep_title_2}} — `technical-deep-dive`
+- {{deep_title_3}} — `freeform` (hybrid topic, no structured archetype fit cleanly)
+
+## Deep-story count justification (REQUIRED when N_final < 3)
+
+The default deep-story count is N = 3. If N_final < 3, this section
+MUST contain exactly one of the named structural reasons below.
+`check-quality-gate-evidence.mjs` enforces this mechanically: a sub-3
+run with no listed reason (or with a "budget/wallclock/dispatch cost"
+reason) fails the publish gate.
+
+- Target: N = 3
+- Actual: N = <number>
+- Reason (only if Actual < Target; pick exactly one):
+  - `<3 score-qualifying clusters: <list cluster IDs + their scores>`
+  - `domain/archetype diversity unsatisfiable: <enumerate combinations tried>`
+  - `Step 5d URL collision with refill pool exhausted: <details>`
+  - `Step 7.5 BLOCKING retry exhausted on <slug> after 5 rounds`
+  - `Step 8.5 Blocking visual issue unfixable after 5 iterations on <slug>`
+  - `Step 7.6 fact-check: high-load unverifiable claim unresolved after 3 rounds on <slug>`
+
+"Budget" / "wallclock" / "dispatch cost" / "Opus quota" is NOT a
+valid Step 5 reason — see SKILL.md Step 5c. If you wrote one of those
+phrases here, the routine has a bug in Step 5 and you should re-pick
+deep stories at N = 3.
+
+## Advisory overrides
+
+Records every place where Claude overrode a `scripts/decisions/*.mjs`
+module's output. Empty section = pure advisory consensus.
+
+- (none) — or list each:
+  - `score(2026-05-19-04)`: module said 9, kept 7. Reason: paraphrase, not
+    original.
+  - `cover-domains`: module dropped `2026-05-19-09` (backend, score 7); kept
+    in selection. Reason: novel architectural pattern worth higher signal.
+  - `archetype(deep-foo)`: 選了 `freeform` 而非 `narrative`,
+    因為該題目沒有清晰時間線,強套 setup→mechanism→consequence 會讓 prose
+    變成「凡是事件都套同一個 H2 序列」的模板感。
+
+## Preview
+
+Cloudflare Pages will post a preview URL once build completes. Please review
+visual rendering (light + dark mode) before merging.
+```
+
+Do not merge. Wait for human review.
+
+## Failure modes — explicit handling
+
+| Scenario | Handling |
+|---|---|
+| Some sources fetch-fail | Skip them; log in PR body; require ≥5 successes overall |
+| Fewer than 10 candidates pass scoring | Write actual N ("今日 7 則"); don't pad |
+| Fewer than 3 deep-story candidates pass | Write 2 or 1; don't force |
+| All sources fail | Fail-fast: no PR, no commit; report status |
+| Dup filter excludes everything in a domain | Note in PR body; pick from other domains |
+| html-validate fails | Self-fix one round; if still failing, open PR but flag `⚠ HTML validation failed` in title |
+| Step 8.5 visual: blocking issue still present after 5 iterations | Stop. Do NOT open PR. Report BLOCKED status with the offending screenshot path so a human can inspect. |
+| Step 8.5 visual: important issue still present after 3 iterations | Continue to Step 9. Write the issue into `## Visual Concerns` so reviewer knows. |
+| Step 8.5 visual: dev server fails to start | BLOCKED — likely a build break; cannot self-review without a live server. |
+| Step 7.5 content: all reviewer instances crash on one post | BLOCKED for that post. Drop that post if it's a deep-story; abort routine if it's the roundup. |
+| Step 7.5 content: post fails 5 BLOCKING retries | Drop the post (N → N-1). Log to PR body. Routine continues. |
+| Step 7.5 content: roundup fails 5 BLOCKING retries | Abort routine. Do NOT open PR. Report BLOCKED status. |
+| Step 7.5 content: inter-post diversity fails 2 retries | Accept and log to PR body. Routine continues. |
+| Step 7.6 fact-check: checker crashes or emits malformed JSON after retries | Treat the post as unverified: drop it if it's a deep-story; abort routine if it's the roundup. |
+| Step 7.6 fact-check: high-load unverifiable claim survives 3 fix rounds | Drop the post (N → N-1); log to PR body. Roundup → abort routine, do NOT open PR. |
+
+## Output expectations summary
+
+A successful run produces:
+
+- 1 × `roundup.html` + `roundup.11tydata.json` + `roundup.ledger.json`
+  (claims-only, written by the Step 7.6 checker) in `src/posts/YYYY/MM/DD/`
+- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` + matching
+  `.ledger.json` (the committed reading ledger; count may be reduced
+  from intended N by Step 7.5 / 7.6 drops)
+- One git branch `daily/YYYY-MM-DD` pushed to origin
+- One PR open against `main` with the body template above filled in,
+  including the five Step 7.5 content-quality sections and the two
+  Step 7.6 fact-check sections
+
+## Why this is split across multiple references
+
+`SKILL.md` stays lean (workflow only) so it loads fast when the skill
+triggers. Detailed rules (persona, sources, archetype HTML structures, dedup
+math, design tokens, widget contract) live in `references/` files that load
+on-demand when authoring decisions actually need them. This is the
+"progressive disclosure" pattern: ~150 words always visible, ~1500 words
+visible when skill activates, ~5000 words loadable as needed.
+
+If a reference contradicts this SKILL.md, the reference wins for content
+decisions (it is the detailed spec); SKILL.md wins for workflow ordering.

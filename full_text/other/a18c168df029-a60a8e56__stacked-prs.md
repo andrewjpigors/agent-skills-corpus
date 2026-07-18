@@ -1,0 +1,1157 @@
+---
+name: stacked-prs
+description: >-
+  Manages stacked branches and pull requests. Use when working with dependent
+  PRs, chained branches, rebasing a branch stack, syncing or submitting
+  multiple related PRs, or managing PR base targets. Triggers on "create a
+  stack", "stack PRs", "stacked branches", "push to stack", "dependent PRs",
+  "chained branches", "rebase my stack", "sync stack", "submit stack",
+  "land stack", "import stack", "split branch", "fold branch".
+argument-hint: "[init|create|insert|split|fold|move|sync|restack|submit|status|checkout|serve|pr|land|import|clean|archive]"
+allowed-tools: >-
+  Bash(git *), Bash(gh *),
+  Bash(${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs *),
+  Read, Grep, Glob, TodoWrite
+effort: high
+---
+
+# Stacked PRs
+
+Manage stacked branches and pull requests using git config metadata, Deno helper
+scripts, and gh CLI.
+
+**Arguments provided**: $ARGUMENTS
+
+**Requires:** git 2.38+ (for `--update-refs`), gh CLI
+
+## Quick Start
+
+1. Create your first branch and commit as usual
+2. `/stacked-prs init` to register it as a stack
+3. `/stacked-prs create` to add child branches
+4. `/stacked-prs submit` to create PRs with correct bases and nav comments
+5. `/stacked-prs sync` after rebasing or pulling main
+6. `/stacked-prs land` after the bottom PR merges
+
+## Building Review-Ready Stacks
+
+Stacked PRs are reviewed and merged one branch at a time, from the bottom up.
+When each PR lands, GitHub runs CI against `main` at that moment. Every branch
+must therefore be independently correct: it must compile, pass all tests, and
+satisfy any linting/coverage gates on its own, without code that only exists in
+an upstack branch.
+
+### The independent-branch rule
+
+Before creating or submitting any branch, confirm it meets both conditions:
+
+1. **Independently buildable.** The code at the tip of this branch would pass CI
+   if rebased onto `main` right now, without any upstack branches included.
+2. **Scope-complete.** The branch contains every change required for its stated
+   purpose. Never leave a feature in a broken or partial state with "will be
+   fixed in the next PR" as the plan.
+
+The stack enforces this naturally: as PRs land from the bottom up, each PR's CI
+run does not include any upstack code. A branch that only works because of code
+in an upstack sibling will block the stack.
+
+### How to draw branch boundaries
+
+Good split points:
+
+- **Preparatory refactors below, new behavior above.** Rename, extract, or
+  reorganize in a lower branch so the upper branch's diff is clean and focused.
+- **Types or interfaces below, implementations above.** Defining types in a
+  lower branch and building against them in a higher branch is a clean, testable
+  separation.
+- **Tests belong with the code they test.** Never split a feature and its tests
+  across branches. A branch that adds code but omits its tests may fail a
+  coverage gate when it lands.
+- **Feature flags as a boundary tool.** When a feature cannot be split cleanly,
+  introduce a flag in a lower branch (gating the new behavior off), implement
+  the feature in middle branches, and remove the flag in the top branch. Every
+  branch is green because the new code is always behind the flag until the final
+  PR flips it on.
+
+Anti-patterns to avoid:
+
+- Leaving failing behavior in a lower branch that a higher branch will "fix
+  later". That lower PR will fail CI when it lands.
+- Splitting setup and teardown of a single concept across non-adjacent branches.
+- Writing a branch that only passes tests because of uncommitted work in the
+  working tree.
+
+### Verifying CI health before submitting
+
+Before running `/stacked-prs submit`, verify each branch is clean at its own
+tip. The reliable method is a temporary worktree per branch:
+
+```bash
+# Verify branch A on its own:
+git worktree add /tmp/check-A <branch-A>
+cd /tmp/check-A && <your CI command>
+git worktree remove /tmp/check-A
+
+# Verify branch B (includes A's commits implicitly since B is stacked on A):
+git worktree add /tmp/check-B <branch-B>
+cd /tmp/check-B && <your CI command>
+git worktree remove /tmp/check-B
+```
+
+If any branch fails, fix it before submitting. A stack with a broken lower
+branch blocks every upstack PR from landing.
+
+**When helping a user author branches**, proactively flag when proposed changes
+would leave a branch in a state that cannot pass CI independently, and suggest
+how to restructure the split.
+
+### Commit hygiene within a branch
+
+Reviewers read commits one at a time. Within a branch:
+
+- Keep each commit focused on one logical change.
+- Write commit messages that explain _why_, not just _what_.
+- Squash exploratory, fixup, or WIP commits with `git rebase -i` before
+  submitting.
+
+Stacks limit diff size at the PR level; commits tell the story of _how_ each PR
+makes its change.
+
+### Branch descriptions
+
+Git's native `branch.<name>.description` key (markdown, written with
+`git branch --edit-description <branch>` or
+`git config branch.<name>.description "..."`) is the source of truth for the
+branch's PR body. `submit` uses it verbatim as the body when creating the PR and
+overwrites the body of the existing open PR whenever the two drift, so edits
+made directly on GitHub do not survive the next submit.
+
+Treat the description as a living document:
+
+- Write it when the branch is created and update it in the same session as any
+  change that alters the branch's purpose or scope.
+- Follow the target repository's PR template and conventions; the description
+  ships as the PR body unchanged.
+- Branches without a description fall back to gh's `--fill` behavior (body from
+  commit messages) and their PR bodies are never touched by submit.
+
+Setting a description is a plain metadata config write and needs no confirmation
+gate.
+
+## Sub-commands
+
+If no argument is provided, assess the current context (branch, dirty state,
+stack membership) and suggest the most appropriate action.
+
+### `init`
+
+Start a new stack from the current branch. Backed by `cli.ts init`.
+
+1. Run
+   `cli.ts init --dry-run [--stack-name <name>] [--merge-strategy
+   merge|squash]`
+   to compute the plan (the CLI guards against running on the base branch,
+   against a branch already in a stack, and against a stack-name collision).
+2. **Present plan:** stack name, merge strategy, base branch, and the exact
+   config writes.
+3. **Wait for confirmation.**
+4. Run `cli.ts init --force [...same flags]` to apply. `--force` skips the CLI's
+   own TTY prompt since confirmation is already gated above.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs init \
+  [--branch <name>] [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--base-branch <name>] [--force] [--dry-run] [--json]
+```
+
+### `import`
+
+Discover and register an existing chain of branches/PRs as a stack. Backed by
+`cli.ts import`, which wraps `import-discover` with a config-write step.
+
+1. Run
+   `cli.ts import --dry-run [--stack-name <name>] [--merge-strategy
+   merge|squash]`
+   to compute the plan (calls `import-discover` under the hood and guards
+   against already-in-stack branches + stack-name collisions).
+2. **Present plan:** every discovered branch and its parent, the chosen stack
+   name and merge strategy, plus any PR-base-mismatch warnings surfaced by the
+   discoverer.
+3. **Wait for confirmation.**
+4. Run `cli.ts import --force [...same flags]` to apply.
+5. Offer to run `submit` to add nav comments to the now-imported PRs.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs import \
+  [--branch <name>] [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--owner <owner> --repo <repo>] \
+  [--force] [--dry-run] [--json]
+```
+
+### `create`
+
+Create a new branch in the stack off the current branch. Backed by
+`cli.ts create <branch>`.
+
+**Before invoking**, apply the independent-branch rule from "Building
+Review-Ready Stacks": confirm the new branch's intended scope is self-contained
+and would not leave the current (parent) branch in a CI-failing state. If the
+user's plan would violate the rule, flag it and suggest a better split.
+
+**After creating**, offer to set the branch's description
+(`git config branch.<name>.description "..."`). It becomes the PR body on submit
+(see "Branch descriptions"), so writing it at creation time keeps the eventual
+PR ready from the first submit.
+
+1. Run `cli.ts create <branch> --dry-run [flags]` to compute the plan. The
+   output lists the resolved case (child / auto-init / auto-init-worktree) and
+   the literal git commands that will run.
+2. **Present plan:** show the user the case, resolved parent / stack name /
+   merge strategy / worktree path (if any), and the exact commands the execution
+   step will run.
+3. **Wait for confirmation.**
+4. Run `cli.ts create <branch> --force [flags]` to apply. `--force` skips the
+   CLI's own TTY prompt since confirmation is already gated above.
+
+The CLI resolves the create case automatically:
+
+- **Child branch**: when the current branch is already in a stack.
+- **Auto-init from base**: when the current branch is the repo's default branch.
+  A new stack is registered (default name: the new branch name; default merge
+  strategy: `squash`, overridable via
+  `git config stack.default-merge-strategy`).
+- **Auto-init + worktree**: same as auto-init, but the new branch lives in a
+  worktree at `<dir>/<branch>` and the current repo stays on the base branch.
+  Only valid from the base branch.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs create <branch> \
+  [-m <message>] [--create-worktree <dir>] \
+  [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--force] [--dry-run] [--json]
+```
+
+### `insert`
+
+Insert a new branch between a branch and its parent. Backed by
+`cli.ts
+insert <new-branch> --child <selected>`.
+
+1. Run `cli.ts status --stack-name=<name> --json` to display the tree and help
+   the user pick the child to insert before.
+2. Run `cli.ts insert <new-branch> --child <selected> --dry-run` to compute the
+   plan (branch created off the child's current parent; child reparented under
+   the new branch).
+3. **Present plan** and **wait for confirmation.**
+4. Run `cli.ts insert <new-branch> --child <selected> --force` to apply.
+5. If the user has staged changes they want on the new branch, offer to commit
+   them (the CLI itself just creates the branch).
+6. Suggest `restack --upstack-from=<new-branch>` once commits exist.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs insert <branch> \
+  [--stack-name <name>] [--child <name>] [--force] [--dry-run] [--json]
+```
+
+### `split`
+
+Split a branch's content into two branches. Backed by `cli.ts split`, which
+supports two modes via `--by-commit <sha>` or `--by-file <paths>`.
+
+#### `--by-commit`
+
+Original branch keeps earlier commits; new branch above gets later commits.
+
+1. Run `cli.ts status --stack-name=<name> --json` and
+   `git log --oneline <parent>..<current-branch>` to help the user pick the last
+   SHA to keep on the original branch.
+2. Run
+   `cli.ts split --branch <current> --new-branch <upper> --by-commit
+   <sha> --dry-run`
+   (the CLI guards against single-commit branches, branch-name collisions, and
+   splits at the tip).
+3. **Present plan:** kept SHAs, moved SHAs, reparented children (original's
+   children will be reparented to the new upper branch).
+4. **Wait for confirmation.**
+5. Run `cli.ts split ... --force` to apply.
+6. Suggest `restack --upstack-from=<new-branch>` if the original had children.
+
+#### `--by-file`
+
+Extract files into a new branch inserted **below** the original. This is
+inherently lossy with commit history — the CLI collapses the extracted portion
+into a single commit on the new lower branch, and the remainder into a single
+commit on the original.
+
+1. Run `git diff --name-only <parent>..<current>` to help the user choose the
+   file list.
+2. Run
+   `cli.ts split --branch <current> --new-branch <lower> --by-file
+   <f1,f2,...> --extract-message <msg> --remainder-message <msg> --dry-run`.
+3. **Present plan:** extracted files, remainder files, parent/child rewiring.
+4. **Wait for confirmation.**
+5. Run `cli.ts split ... --force`.
+6. Suggest `restack --upstack-from=<original-branch>` if the original had
+   children.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs split \
+  [--stack-name <name>] [--branch <name>] --new-branch <name> \
+  (--by-commit <sha> | --by-file <f1,f2,...>) \
+  [--extract-message <msg>] [--remainder-message <msg>] \
+  [--force] [--dry-run] [--json]
+```
+
+### `fold`
+
+Merge a branch into its parent. Inverse of split. Backed by `cli.ts fold`.
+
+1. Decide the strategy: `ff` (preserve commits) or `squash` (collapse into a
+   single commit on the parent).
+2. Run `cli.ts fold --branch <current> --strategy <ff|squash> --dry-run` (the
+   CLI guards against folding the only branch, folding a root whose parent is
+   the base branch, and against ff when the branch has diverged from its
+   parent).
+3. **Present plan:** parent, children to reparent, strategy, and the exact
+   merge/commit/config/branch-delete commands.
+4. **Wait for confirmation.**
+5. Run `cli.ts fold ... --force` to apply. The CLI runs the merge, reparents
+   children, removes the folded branch's stack metadata, and deletes the branch.
+6. Suggest `restack --upstack-from=<parent>` if children were reparented.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs fold \
+  [--stack-name <name>] [--branch <name>] [--strategy ff|squash] \
+  [--message <msg>] [--force] [--dry-run] [--json]
+```
+
+### `move`
+
+Detach a branch and reattach it as a child of a different parent. Backed by
+`cli.ts move`.
+
+1. Run `cli.ts status --stack-name=<name> --json` and help the user pick the
+   branch to move and its new parent.
+2. Run `cli.ts move --branch <branch> --new-parent <parent> --dry-run` (the CLI
+   guards against no-ops, cycle creation, and non-stack new parents).
+3. **Present plan:** the moved branch's old and new parent, any children being
+   reparented back to the old parent, and the `git rebase --onto` call.
+4. **Wait for confirmation.**
+5. Run `cli.ts move ... --force` to apply. On conflict the CLI stops and reports
+   `recovery.resolve` / `resume` / `abort` commands (same shape as `restack` /
+   `sync`).
+6. Suggest `restack --upstack-from=<moved-branch>` for descendants.
+
+Full invocation:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs move \
+  [--stack-name <name>] [--branch <name>] --new-parent <name> \
+  [--force] [--dry-run] [--json]
+```
+
+### `sync`
+
+Bring every stack in the repo back in line with origin. Mirrors `gt sync`:
+applies to **every** stack, not just the one containing the current branch. In
+one pass the CLI:
+
+- Fetches every base branch referenced by any stack (for example, `main`).
+- Fast-forwards each local base branch when safe, warning and skipping any base
+  that has diverged from origin.
+- Detects PRs that merged on GitHub, deletes those branches locally, reparents
+  their children onto the next surviving ancestor, retargets the children's PR
+  bases via `gh`, and updates navigation comments.
+- Restacks the surviving branches and force-pushes with `--force-with-lease`.
+
+Backed by `cli.ts sync`, which has three modes:
+
+- `--dry-run`: compute and print the plan without mutating anything.
+- No flags: print the plan and prompt `[y/N]` before executing.
+- `--force`: execute without the prompt (non-interactive or trusted automation).
+
+Optionally restrict the run to a subset of stacks with `--filter=<globs>`: a
+comma-separated list of stack-name globs where any entry starting with `!` is a
+negation. A filter with only negations (e.g. `--filter="!di*"`) includes every
+stack except those matching the excludes. A filter with any positive glob
+narrows to those matches (minus any negations). When the filter matches no
+configured stacks, `cli.ts sync` prints `No stacks match --filter=...` and exits
+without fetching or prompting. The dry-run plan's `filter` and `filteredOut`
+fields surface the active expression and the stack names that were skipped so
+Claude can report them to the user.
+
+1. Run `cli.ts sync --dry-run --json [--filter=<globs>]` to inspect the plan.
+   Parse the returned `stacks[]` array (each entry has `stackName`,
+   `baseBranch`, `rebases[]`, `branchesToPush[]`, `prunes[]`, and `isNoOp`) plus
+   top-level `baseFastForwards[]` with
+   `{ baseBranch, action: "ff" | "skip-diverged", ... }` entries.
+2. **No-op check:** if `plan.isNoOp` is true, report "All stacks are already
+   synced with origin" and stop. The CLI still fetches base branches in this
+   path so the user's origin refs stay current.
+3. For each non-no-op stack, run `cli.ts verify-refs --stack-name=<name>`
+   (read-only). If any stack reports duplicate patches or structural drift that
+   the per-branch rebase cannot fix, stop and ask the user to resolve manually.
+4. Collect every branch with status `planned` across all stacks. Run
+   `checkWorktreeSafety` on the union. If any dirty worktrees are returned,
+   present them with cleanup commands and stop.
+5. **Present the full plan** grouped by section:
+   - Base branches to fetch and fast-forward, plus any bases flagged
+     `skip-diverged` (call out the warning; the CLI will continue past them).
+   - Merged PRs to prune per stack (branch to delete, PR number, children being
+     reparented, PR bases to retarget on GitHub).
+   - Each stack's rebase list (old-parent to new-target) and branches to
+     force-push.
+6. **Wait for confirmation.**
+7. Run `cli.ts sync --force [--filter=<globs>]` to execute. Forward the same
+   `--filter` expression used during planning so execution operates on the same
+   stack set. Execution order per stack is: prune merged branches (with PR base
+   retargets and nav updates), restack survivors, then
+   `git push --force-with-lease`. On the first conflict or push failure it stops
+   and reports `failedAt: <stackName>`.
+   - If a conflict: resolve the files in the stack that failed, then run
+     `cli.ts restack --stack-name=<failed> --resume`. Re-run
+     `cli.ts sync [--filter=<globs>]` to finish the remaining stacks.
+8. Run `cli.ts verify-refs --stack-name=<name>` per synced stack as a
+   post-flight check. If it is not clean on any stack, print the report and ask
+   the user to inspect.
+9. Report per-stack results: fast-forwarded bases, pruned branches, pushed
+   branches.
+
+### `restack`
+
+Rebase the stack tree without fetching or pushing. Useful for local
+reorganization before reviewing the diff.
+
+**Flags:** `--upstack-from=<branch>`, `--downstack-from=<branch>`,
+`--only=<branch>` (default: full stack)
+
+`cli.ts restack` has three modes:
+
+- `--dry-run`: compute and print the plan without mutating anything.
+- No flags: print the plan and prompt `[y/N]` before executing.
+- `--force`: execute without the prompt.
+
+On successful completion, HEAD is restored to the branch you were on when you
+started. On conflict, HEAD stays on the conflicted branch so you can resolve.
+
+1. Run `cli.ts verify-refs --stack-name=<name>` (read-only). If it reports
+   structural problems, stop. If it reports drift, remember for the plan.
+2. Run `cli.ts restack --dry-run --json --stack-name=<name> [flags]`.
+3. **No-op check:** if every entry is `skipped-clean` and verify-refs was clean,
+   report "Stack is already fully synced" and stop.
+4. Collect `planned` branches from the dry-run and run `checkWorktreeSafety`. If
+   any dirty worktrees, present and stop. (The CLI repeats this check internally
+   before touching git; this step surfaces failures earlier in the plan output.)
+5. **Present plan** (tree with old-parent to new-target, drift notes if any).
+6. **Wait for confirmation.**
+7. Run `cli.ts restack --force --stack-name=<name> [flags]` to execute. On
+   conflict, the rebase stops at the first conflicted branch; resolve the files
+   and run `git rebase --continue` or
+   `cli.ts restack --stack-name=<name> --resume`. `--resume` skips the prompt
+   since the original plan was already approved.
+8. Run `cli.ts verify-refs` (informational only, do not gate; there is no push
+   step). If it reports problems, print them so the user can inspect.
+
+### `submit`
+
+Push every stack branch, create or update PRs with correct bases and draft
+state, and refresh the stack navigation comments. Mirrors `gt submit`. Backed by
+`cli.ts submit`.
+
+**Before running submit**, remind the user to verify each branch is CI-clean at
+its own tip (see "Verifying CI health before submitting" in the "Building
+Review-Ready Stacks" section). If the user has not yet verified, ask whether
+they want to do so before proceeding. A stack with a broken lower branch will
+block every upstack PR from landing once it reaches GitHub CI.
+
+**Draft policy:** A PR's draft state is a function of its position in the stack.
+PRs whose parent is the stack's base branch (e.g. `main`) are submitted as ready
+for review. All other PRs in the stack are kept as drafts so they cannot be
+merged out of order. The submit plan reconciles drift on every run via the
+`desiredDraft` and `draftAction` fields per branch.
+
+**Body policy:** The branch description (`branch.<name>.description`) is the
+source of truth for the PR body (see "Branch descriptions"). New PRs for
+described branches are created with the description as the body and the oldest
+commit's subject as the title (`bodyAction: "set"`); existing open PRs whose
+body has drifted from the description are overwritten (`bodyAction:
+"update"`),
+discarding any manual GitHub-side edits. Branches without a description use gh's
+`--fill` and are never body-edited. Titles are set once at creation and never
+updated.
+
+`cli.ts submit` has three modes:
+
+- `--dry-run`: compute and print the plan without mutating anything.
+- No flags: print the plan and prompt `[y/N]` before executing.
+- `--force`: execute without the prompt.
+
+Add `--only=<branch>` to scope per-branch ops (push, create/edit, draft flips)
+to a single branch in the stack. Nav comments still rebuild stack-wide so
+sibling PRs reflect any newly-created PR. The CLI errors out if `<branch>` is
+not a live (non-tombstoned) member of the stack.
+
+1. Run `cli.ts submit --dry-run --stack-name=<name>` to inspect the plan. Add
+   `--json` to get the raw `SubmitPlan` shape. Add `--only=<branch>` to limit
+   per-branch actions to one branch.
+2. **No-op check:** if the plan reports `isNoOp: true`, report "All PRs are up
+   to date with correct bases, draft state, and nav comments" and stop.
+3. **Present full plan:**
+   - Git: branches to force-push.
+   - GitHub: PRs to create (branches with action "create"; show base + flag
+     `--draft` for any branch where `desiredDraft` is true, plus the derived
+     title when `bodyAction` is "set").
+   - GitHub: PRs to update base (branches with action "update-base"; show old ->
+     new base).
+   - GitHub: PR bodies to overwrite from branch descriptions (branches with
+     `bodyAction: "update"`; call out that GitHub-side manual edits will be
+     lost).
+   - GitHub: PRs to flip draft state (branches with `draftAction` of "to-draft"
+     or "to-ready"; show the transition and the reason, e.g. "parent is feat/a,
+     not main").
+   - Comments: nav comments to create/update. Note that the dry-run plan only
+     reflects nav actions for PRs that already exist on GitHub. Any branch with
+     action `"create"` will also get a nav comment posted after its PR is
+     opened, even though the dry-run plan doesn't list it.
+4. **Wait for confirmation.**
+5. Run `cli.ts submit --force --stack-name=<name>` to execute. The CLI pushes
+   with `--force-with-lease`, then creates/edits PRs via `gh pr create|edit`
+   (body and title from the branch description where present, `--fill`
+   otherwise; base retarget and body sync share one `gh pr edit` call), flips
+   draft state via `gh pr ready` / `gh pr ready --undo`, and finally rebuilds
+   the nav plan against the live PR set (so freshly-created PRs are included)
+   and posts/updates nav comments.
+6. Report the PR URLs from the CLI output.
+
+### `pr`
+
+Open the pull request for a branch in the browser. Mirrors `gt pr`. Backed by
+`cli.ts pr`. Read-only and needs no confirmation.
+
+- `cli.ts pr` opens the current branch's PR.
+- `cli.ts pr --branch <name>` opens the PR for an explicit branch.
+- `cli.ts pr --print` prints the URL instead of opening the browser.
+- `cli.ts pr --json` returns a structured lookup result.
+
+### `status`
+
+Show current stack state. **No confirmation needed** (read-only).
+
+1. On a non-default branch, run `cli.ts status --stack-name=<name>` to get
+   ladder output for that stack. On the default branch, plain `cli.ts status`
+   behaves like `--all`.
+2. Display formatted with the compact ladder renderer:
+   ```
+   │ ◯      feature/auth-ui     up-to-date
+   │ ◉      feature/auth-tests  #102 (draft)  behind-parent
+   ◯─┘      feature/auth-api    #103 (open)   up-to-date
+   ◯─┘      feature/auth        #101 (open)   up-to-date
+   ```
+3. When the user wants every stack at once, run `cli.ts status --all`. It
+   renders every configured stack grouped by base branch. Archived stacks are
+   hidden; add `--archived` to include them. In the TUI, press `a` to toggle
+   archived stacks (they render dimmed with an `(archived)` tag).
+4. Sync status compares each root branch against `origin/<base>` when that
+   remote-tracking ref exists (falling back to the local base branch when there
+   is no origin). Add `--fetch` to refresh the remote-tracking ref first; a
+   fetch failure prints a warning and falls back to the last-fetched ref.
+5. Branch descriptions: when `branch.<name>.description` is set (markdown,
+   written with `git branch --edit-description <branch>` or
+   `git config branch.<name>.description "..."`), `status` shows the dimmed
+   first line under the branch; add `--description` to print descriptions in
+   full. The supported markdown subset is bold, italic, inline code, links,
+   paragraphs, and flat bullet lists; unsupported syntax stays literal. Setting
+   a description is a plain metadata config write and needs no confirmation
+   gate. The tooling itself never writes this key unprompted. Descriptions are
+   also the source of truth for PR bodies on `submit`; see "Branch
+   descriptions".
+
+#### Interactive view
+
+Run `stacked-prs status --interactive` (or `-i`) to launch a TUI. Without
+`--all`, it opens on the current stack tab by default, except on the default
+branch where it starts on the all-stacks tab. The TUI renders every configured
+stack as a horizontal left-to-right tree with per-stack colors, shows PR state
+and sync status per branch, and provides arrow-key navigation plus a live commit
+detail pane for the focused branch.
+
+Key bindings: `?` shows the full list. Press `L` on a branch whose stack is
+eligible to land (root PR merged, or every PR merged) to open the land modal,
+which plans and executes the full cleanup automatically without requiring
+Claude. Press `a` to toggle whether archived stacks are shown, and `A` to
+archive or unarchive the focused stack (applied immediately, with a status
+notice). The TUI's two write operations are `L` (land) and `A` (archive).
+
+### `checkout`
+
+Open an interactive branch picker that renders the same ladder output as
+`status`, prefixes the selected branch row with a cursor, and runs
+`git checkout <branch>` when Enter is pressed. Esc or Ctrl-C aborts without
+changing branches. Up/Down moves one branch, Page Up/Page Down jumps between
+stacks, and Home/End jumps to the top or bottom of the list. Printable typing
+updates a fuzzy filter, Backspace edits it, and Ctrl-U clears it. The selected
+row is rendered in white text, overriding the status colors on that row. The
+current branch starts selected when it is visible, including when it is the
+stack base; otherwise the first candidate is selected. Split escape and UTF-8
+input sequences are buffered, and unsupported escape sequences are ignored. The
+picker renders inline in the current terminal scrollback and leaves the final
+frame visible with checkout or abort output below it. When the ladder is taller
+than the terminal, it keeps a viewport-sized window around the selected row,
+counting wrapped ladder and prompt rows. Terminal dimensions are re-read on
+every redraw, so a resize is reflected after the next handled keypress. The
+picker includes the base branch shown at the bottom of the ladder. This is a
+local working-tree operation, not a stack rewrite, so the picker itself is the
+confirmation surface.
+
+Use the same display scoping as `status`: on a non-default branch it defaults to
+the current stack, on the default branch it defaults to `--all`, and the `--all`
+/ `-a`, `--stack-name`, `--archived`, `--pr` / `-p`, `--fetch`, and
+`--description` flags carry over.
+
+### `serve`
+
+Open a local browser view for explicit repository folders and visualize
+configured stacks. **No confirmation needed** (read-only).
+
+1. Run `cli.ts serve [folders...]`. If no folders are provided, the command uses
+   the current working directory as the only repository.
+2. The command starts a localhost server and opens the default browser.
+3. The browser renders branch relationships as a lane graph and includes the
+   same status metadata as the CLI for those repositories: stack name, base
+   branch, merge strategy, branch parentage, PR number/state/draft state when
+   available, sync status, current-branch markers, and expanded markdown branch
+   descriptions when `branch.<name>.description` is set.
+4. When multiple repositories have a stack with the same name, the top selector
+   can show that shared stack as one combined graph. Each repository appears as
+   the root node, then connects to its base branch, then to its stack branches.
+5. Repositories with no stacked-prs metadata are omitted from the browser view.
+6. Archived stacks are hidden by default; the header's "Show archived" switch
+   reveals them (dimmed, with an `(archived)` badge), and the choice persists
+   across reloads.
+7. The view updates live by default: the page watches each repository's `.git`
+   and polls GitHub, then re-renders the changed repository and shows a toast,
+   so no manual reload is needed.
+
+Use `--port <number>` to choose a specific port, `--host <host>` to bind a
+specific interface, `--no-open` to print the URL without launching a browser,
+`--no-watch` to disable live updates, and `--poll-interval <seconds>` to set the
+PR poll cadence (default 60, 0 disables polling). Use `--debug` to print the
+repository and trigger reason before each live refresh, including the relevant
+Git file category or PR poll interval.
+
+### `land`
+
+Handle cleanup after a PR merges. Auto-splits the stack if landing creates
+multiple roots.
+
+**Preferred path:** press `L` in the TUI. It plans and executes the full land
+automatically. Use the Claude-orchestrated steps below only when the TUI is not
+available.
+
+Two supported shapes are handled by `executeLandFromCli` (in
+`src/commands/land.ts`):
+
+- **root-merged:** exactly one root PR is merged, no other branch is merged.
+  Remaining branches are rebased onto the base branch and force-pushed.
+- **all-merged:** every PR in the stack is merged. No rebase or push is needed;
+  all branches are deleted and config is removed.
+
+**Claude-orchestrated steps:**
+
+1. Run `cli.ts land --stack-name=<name> --json`
+2. If `ok: true`: report landed branches and any splits shown in the output.
+3. If `error: "conflict"`:
+   - Show the user the `conflictFiles` list and `recovery.resolve` command.
+   - After the user resolves conflicts, run `recovery.resume` (the `--resume`
+     command).
+   - Repeat from step 1 until `ok: true`.
+4. If `error: "blocked"`: report the preflight blockers and ask the user to
+   resolve them.
+
+Read-only operations (`cli.ts status`, `cli.ts land --dry-run --json`) run
+without confirmation. The `cli.ts land` command itself requires no separate
+confirmation step -- the plan is built and executed in one call.
+`cli.ts checkout` is also unplanned: it renders an interactive picker and only
+runs `git checkout <branch>` after the user presses Enter.
+
+### `clean`
+
+Detect and remove stale stack/branch config entries (orphaned branches, missing
+parents, empty stacks, stale resume-state, legacy `stack-merged` flags on live
+branches).
+
+`clean` also understands `stack.<name>.landed-branches`,
+`stack.<name>.landed-pr`, and `stack.<name>.landed-parent`: multi-value keys
+that act as the stack-level tombstone list for branches that have been landed
+and deleted (the second records the PR number as `<branch>:<number>` so nav
+comments can keep showing merged PRs after the branch ref is gone, and the third
+records the branch's stack-parent as `<branch>:<parent>` so the tombstone keeps
+its structural position in the tree). Entries in any of these keys are expected
+and are not stale. A branch with a live stack-name entry whose ref is missing is
+ALSO not stale when that branch appears in `landed-branches` - the tombstone's
+structural placement is preserved intentionally. The branch-level
+`branch.<name>.stack-merged = true` key is the legacy pre-migration form; when
+it appears on a live branch with a live `stack-name`, `clean` reports a
+`legacy-merged-flag` finding and `--force` removes it. See `CLAUDE.md` for the
+full git-config schema.
+
+**Flags:** `--stack-name=<name>`, `--force`, `--json`
+
+1. Run `cli.ts clean [--stack-name=<name>] --json` (read-only, no gate needed)
+   to get the structured report.
+2. **No-op check:** if `findings` is empty, report "No stale config found" and
+   stop.
+3. **Present plan:** show each finding with its kind, subject (branch or stack),
+   details, and the config keys that would be removed.
+4. **Wait for confirmation.**
+5. Run `cli.ts clean [--stack-name=<name>] --force` to apply.
+6. Report the removed keys.
+
+### `archive`
+
+Mark a stack as archived (or clear the flag with `--unarchive`). An archived
+stack keeps all of its config but is hidden by default from `status`, TUI, and
+`serve` views, and is skipped by `sync`. Explicit single-stack operations such
+as `status --stack-name`, `submit`, `restack`, `land`, and `clean` continue to
+work regardless of archive state. **No confirmation needed** (single config
+write, no git/gh mutation).
+
+**Flags:** `[<stack>]` (defaults to the current branch's stack), `--unarchive`,
+`--json`
+
+1. Run `cli.ts archive [<stack>]` to archive, or
+   `cli.ts archive [<stack>] --unarchive` to restore.
+2. Reveal archived stacks on demand: `cli.ts status --archived`,
+   `cli.ts sync --archived`, the `a` key in the TUI, or the "Show archived"
+   switch in the `serve` web UI.
+
+## Confirmation Gate Rules
+
+**CRITICAL: Never execute any of these without showing the plan first:**
+
+- `git push` (any variant)
+- `git rebase`
+- `git branch -d`
+- `gh pr create`
+- `gh pr edit`
+- `gh pr ready`
+- `gh pr comment`
+- `gh api --method PATCH`
+
+**Always allowed without confirmation (read-only):**
+
+- `git status`, `git log`, `git branch --show-current`, `git fetch`
+- `gh pr list`, `gh pr view`, `gh repo view`
+- `stacked-prs status`
+- `stacked-prs status --json`
+- `stacked-prs status --interactive` / `-i`
+- `stacked-prs checkout` (local branch switch after interactive selection)
+- `stacked-prs serve` (read-only local HTTP server and browser UI)
+- `stacked-prs nav --dry-run`
+- `stacked-prs verify-refs`
+- `stacked-prs restack --dry-run` (with or without `--json`)
+- `stacked-prs clean --json` (report-only; `--force` mutates)
+- `stacked-prs archive` / `archive --unarchive` (single config write, no gate)
+- `stacked-prs create --dry-run` (with or without `--json`)
+- `stacked-prs land --dry-run` (with or without `--json`)
+- `stacked-prs submit --dry-run` (with or without `--json`)
+- `stacked-prs sync --dry-run` (with or without `--json`)
+- `stacked-prs init --dry-run` (with or without `--json`)
+- `stacked-prs import --dry-run` (with or without `--json`)
+- `stacked-prs insert ... --dry-run` (with or without `--json`)
+- `stacked-prs fold ... --dry-run` (with or without `--json`)
+- `stacked-prs move ... --dry-run` (with or without `--json`)
+- `stacked-prs split ... --dry-run` (with or without `--json`)
+- `stacked-prs pr` (read-only PR lookup; also opens the browser, which is a
+  local action, not a repo mutation)
+
+**If the plan changes mid-execution** (e.g., rebase conflicts), pause and
+re-present the remaining operations before continuing.
+
+## Scripts
+
+All scripts are accessed through a single unified CLI entry point:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs <subcommand> [flags]
+```
+
+`--stack-name` is auto-detected from the current branch's git config when not
+provided. `--owner` and `--repo` are auto-detected from `gh repo view` when not
+provided.
+
+### `status`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs status \
+  [--stack-name=<name>] [--owner=<owner> --repo=<repo>] [--json] [--pr|-p] [--all] [--archived] [--fetch] [--description] [--interactive|-i] [--theme <theme>]
+```
+
+Returns human-readable ladder output by default. Pass `--json` for structured
+JSON with full stack state. Pass `--all` to render every configured stack
+grouped by base branch in the terminal. On the default branch, plain `status`
+behaves like `--all`; on other branches it stays scoped to the current stack
+unless `--all` is passed. Descriptions are markdown from the native
+`branch.<name>.description` key, shown first-line by default, in full with
+`--description`, and always raw in `--json`. Rendering supports bold, italic,
+inline code, links, paragraphs, and flat bullet lists; unsupported syntax stays
+literal. Pass `--interactive` / `-i` to launch the read-only TUI. Without
+`--all`, it starts on the current stack, except on the default branch where it
+starts on the all-stacks view. The TUI renders every stack as a horizontal tree
+with per-stack colors, PR state, sync status, and a live commit detail pane. PR
+metadata is opt-in: pass `--pr` / `-p` to load PRs from GitHub; otherwise status
+stays local-only and skips PR fetching. Pass `--theme light` or `--theme dark`
+to override auto-detection. Archived stacks are hidden from the `--all` view by
+default; pass `--archived` to include them (`--json` always includes every stack
+with an `archived` flag, and the TUI toggles them with the `a` key). Root
+branches compare against `origin/<base>` when that remote-tracking ref exists,
+falling back to the local base branch otherwise; pass `--fetch` to refresh the
+ref first. Fetch failures degrade to warnings on stderr.
+
+### `checkout`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs checkout \
+  [--stack-name=<name>] [--owner=<owner> --repo=<repo>] [--pr|-p] \
+  [--all|-a] [--archived] [--fetch] [--description]
+```
+
+Renders the same ladder as `status`, lets the user move a `>` cursor with
+Up/Down, jump between stacks with Page Up/Page Down, jump to list edges with
+Home/End, fuzzy-filter by typing printable characters, edit the filter with
+Backspace, clear it with Ctrl-U, override status colors on the selected row with
+white text, and run `git checkout <branch>` on Enter. Esc or Ctrl-C aborts. The
+current branch starts selected when it is visible, including the base branch.
+Split escape and UTF-8 input sequences are buffered; unsupported escape
+sequences are ignored. The picker renders inline in the current terminal
+scrollback and clips tall ladders to the terminal viewport around the selected
+row, counting physical rows created by wrapped ladder and prompt lines. It
+re-reads terminal dimensions on every redraw. The branch list includes the base
+branch and excludes landed tombstone rows because those refs no longer exist
+locally.
+
+### `serve`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs serve \
+  [folders...] [--host <host>] [--port <port>] [--no-open] \
+  [--no-watch] [--poll-interval <seconds>] [--debug]
+```
+
+Starts a local browser UI for the provided repository folders. Relative folders
+are resolved from the current working directory. When no folders are provided,
+the current working directory is used as the only repository. Each repository's
+stacks render using the same metadata returned by `status --all --pr`. PR
+metadata is best-effort: it is loaded when the repository's `origin` remote
+points at GitHub and `gh pr list` is available. If PR loading is unavailable,
+the view still renders local stack metadata. Each stack's name (and each
+repository header in the single-stack view) carries a muted relative time of the
+most recent commit on that stack, for example `2 days ago`. Stacks are ordered
+most-recent-commit first in both the overview and the switcher dropdown, and
+each switcher entry shows that relative time too. Archived stacks are hidden by
+default; a "Show archived" switch in the header reveals them (the preference is
+remembered across reloads). The view updates live by default (a `.git` file
+watch plus GitHub polling re-render changed repositories with a toast); pass
+`--no-watch` to disable it or `--poll-interval <seconds>` to change the PR poll
+cadence (0 disables polling). Branch descriptions render expanded as muted
+markdown blocks under each branch. Pass `--debug` to print the repository and
+trigger reason before each live refresh, including the relevant Git file
+category or PR poll interval.
+
+### `restack`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs restack \
+  [--stack-name=<name>] \
+  [--upstack-from=<branch>] \
+  [--downstack-from=<branch>] \
+  [--only=<branch>] \
+  [--resume] \
+  [--dry-run] \
+  [--force] \
+  [--json]
+```
+
+Performs per-branch topological rebase of the tree. Walks the tree in DFS order,
+snapshots each branch's parent SHA before any mutation, and rebases each branch
+individually with an explicit `git rebase --onto` call against the new target
+and the snapshotted old-parent SHA. Root branches target `origin/<base-branch>`;
+intermediate branches target their parent's current (possibly just-rewritten)
+tip. On successful completion HEAD is restored to the branch the caller started
+on so the walk does not strand the user on the last-rebased leaf. On the first
+conflicted branch the walk stops and leaves git mid-rebase with HEAD on the
+conflicted branch; resolve the files and run `git rebase --continue` or
+re-invoke with `--resume` to pick up the remaining branches.
+
+Same three-mode shape as submit/sync: `--dry-run` prints the plan without
+mutating anything (combine with `--json` for structured output); with no flags
+the CLI prints the plan and prompts `[y/N]`; `--force` skips the prompt. When
+every entry is `skipped-clean`, the CLI prints
+`Stack is already fully synced. Nothing to do.` and exits without prompting.
+`--resume` skips the prompt since the original plan was already approved.
+
+### `nav`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs nav \
+  [--stack-name=<name>] [--owner=<owner> --repo=<repo>] [--dry-run]
+```
+
+Creates or updates stack navigation comments on PRs. Use `--dry-run` to preview
+without writing.
+
+### `verify-refs`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs verify-refs \
+  [--stack-name=<name>]
+```
+
+Verifies all stack branches have correct ancestry after a rebase and detects
+duplicate patches across branch ranges (caused by failed `--update-refs`).
+Outputs JSON with branch status, repair commands for stale branches, and a
+`duplicates` array listing commits whose patch-id appears in multiple branches.
+Exits with code 1 if any branches are stale or duplicates are found.
+
+### `create`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs create <branch> \
+  [-m <message>] [--create-worktree <dir>] \
+  [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--force] [--dry-run] [--json]
+```
+
+Creates a new branch in the stack off the current branch. Auto-resolves between
+child-in-stack, auto-init, and auto-init-with-worktree based on the current
+branch's git config. Prints a plan (including the literal git commands that
+would run) and prompts on TTY unless `--force` is passed. `--dry-run` reports
+the plan without mutating anything.
+
+### `import-discover`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs import-discover \
+  [--branch=<name>] [--owner=<owner> --repo=<repo>]
+```
+
+Discovers the tree of local branches between the given branch and main, then
+annotates each with PR data from GitHub. Returns JSON with the discovered tree,
+base branch, and any warnings (e.g., PR base mismatches).
+
+### `submit`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs submit \
+  [--stack-name=<name>] [--owner=<owner> --repo=<repo>] \
+  [--only=<branch>] [--dry-run] [--force] [--json]
+```
+
+Runs the full submit flow: force-pushes branches, creates or edits PRs (with
+`--draft` derived from the stack's shape; title and body from the branch
+description when set, `--fill` otherwise), syncs open PR bodies that have
+drifted from their branch descriptions, flips draft state when needed, and
+applies the nav comment plan. `--dry-run` prints the plan without mutating
+(combine with `--json` for the raw `SubmitPlan` shape: per-branch actions
+including `bodyAction`/`title`/`description`, an `isNoOp` flag, an optional
+`scope.only` field, and nav comment plan); with no flags the CLI prints the plan
+and prompts `[y/N]`; `--force` skips the prompt. `--only=<branch>` restricts
+per-branch ops (push, create, edit, body sync, draft flips) to a single live
+branch in the stack while leaving the nav comment rebuild stack-wide; the CLI
+errors out if the branch is not a live member.
+
+### `sync`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs sync \
+  [--dry-run] [--force] [--filter=<globs>] [--archived] [--json]
+```
+
+Applies to **every** non-archived stack in the repo by default. Archived stacks
+are skipped (and listed under `Archived (skipped):` in the plan); pass
+`--archived` to include them. Fetches each distinct base branch from origin
+once, fast-forwards each local base branch when safe (warning and continuing
+past any that have diverged), prunes branches whose PRs merged (deleting the
+branch locally, reparenting its children, retargeting their PR bases on GitHub,
+and refreshing nav comments), then for each surviving stack runs `restack` and
+force-pushes with `--force-with-lease`. Stops at the first conflict or push
+failure; the returned JSON (`--json`) records `failedAt: <stackName>` so the
+caller can resume that stack with
+`cli.ts restack --stack-name=<failed> --resume` and then re-run `cli.ts sync`
+for the rest. Same three-mode shape as submit: `--dry-run`, interactive default,
+`--force`.
+
+Pass `--filter=<globs>` with a comma-separated list of stack-name globs to
+restrict the run to a subset of stacks. Entries prefixed with `!` are negations:
+`--filter="!di*"` syncs every stack whose name does not match `di*`;
+`--filter="feat-*,!feat-draft*"` syncs stacks named `feat-*` except those
+matching `feat-draft*`. Only matched stacks' base branches are fetched and
+fast-forwarded; skipped stack names appear in `plan.filteredOut`. If the filter
+matches nothing, the CLI prints `No stacks match --filter=...` and exits without
+fetching.
+
+### `pr`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs pr \
+  [--branch=<name>] [--owner=<owner> --repo=<repo>] [--print] [--json]
+```
+
+Opens the PR for the current (or specified) branch in the browser via
+`gh pr
+view --web`. `--print` emits the URL instead. `--json` returns the raw
+lookup result (`{ ok, branch, pr?: { number, url, state, isDraft }, error? }`).
+
+### `land`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs land \
+  [--stack-name=<name>] [--dry-run] [--json] [--resume]
+```
+
+Lands a merged PR and cleans up the stack. Builds the land plan, executes
+rebases and force-pushes (root-merged case) or deletes all branches (all-merged
+case), and auto-splits the stack when multiple roots result. Pass `--dry-run` to
+print the plan without executing. Pass `--json` for structured output. Pass
+`--resume` to continue after resolving a rebase conflict. Exits with code 1 on
+failure (conflict or blocked).
+
+### `clean`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs clean \
+  [--stack-name=<name>] [--force] [--json]
+```
+
+Detects four classes of stale git config: orphaned branch entries (config
+references a deleted ref), stale stack-parent (parent ref does not exist), empty
+stacks (stack metadata with no member branches), and stale resume-state (resume
+marker but no rebase in progress). Default: print report and prompt to apply.
+Pass `--force` for non-interactive use. Pass `--json` for structured output.
+
+### `archive`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs archive \
+  [<stack>] [--unarchive] [--json]
+```
+
+Sets (or clears with `--unarchive`) `stack.<name>.archived`. Defaults to the
+current branch's stack when no name is given. Archived stacks are hidden by
+default from `status`/TUI/`serve` views and skipped by `sync`; reveal them with
+`--archived` (CLI), the `a` key (TUI), or the "Show archived" switch (`serve`).
+Explicit single-stack operations still work on archived stacks.
+
+### `init`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs init \
+  [--branch <name>] [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--base-branch <name>] [--force] [--dry-run] [--json]
+```
+
+Initializes the current branch (or `--branch`) as the root of a new stack. The
+CLI guards against running on the base branch, against a branch already in a
+stack, and against a stack-name collision. Same three-mode shape as submit:
+`--dry-run`, interactive default, `--force`.
+
+### `import`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs import \
+  [--branch <name>] [--stack-name <name>] [--merge-strategy merge|squash] \
+  [--owner <owner> --repo <repo>] [--force] [--dry-run] [--json]
+```
+
+Wraps `import-discover` with a config-write step. Flattens the discovered tree
+into `(branch, parent)` pairs and writes all four config keys per branch in a
+single run. Guards against any discovered branch already being in a stack, and
+against stack-name collisions. Warnings from the discovery phase (e.g. PR base
+mismatches) are surfaced in the plan.
+
+### `insert`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs insert <branch> \
+  [--stack-name <name>] [--child <name>] [--force] [--dry-run] [--json]
+```
+
+Creates `<branch>` off the parent of `--child` (default: current branch) and
+reparents the child under the new branch. Config-only plus the branch creation;
+no rebase happens because the inserted branch starts empty.
+
+### `fold`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs fold \
+  [--stack-name <name>] [--branch <name>] [--strategy ff|squash] \
+  [--message <msg>] [--force] [--dry-run] [--json]
+```
+
+Merges `--branch` (default: current) into its parent, reparents its children
+onto the parent, removes the folded branch's stack metadata, and deletes the
+branch ref. `--strategy=ff` requires a fast-forward; `--strategy=squash`
+collapses the branch into a single commit on the parent.
+
+### `move`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs move \
+  [--stack-name <name>] [--branch <name>] --new-parent <name> \
+  [--force] [--dry-run] [--json]
+```
+
+Reparents `--branch` under `--new-parent`, reparents its direct children back to
+its previous parent, and runs
+`git rebase --onto <new-parent> <old-parent>
+<branch>`. On conflict the CLI
+stops and returns recovery commands matching the `restack` / `sync` shape.
+
+### `split`
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/stacked-prs/scripts/stacked-prs split \
+  [--stack-name <name>] [--branch <name>] --new-branch <name> \
+  (--by-commit <sha> | --by-file <f1,f2,...>) \
+  [--extract-message <msg>] [--remainder-message <msg>] \
+  [--force] [--dry-run] [--json]
+```
+
+Two modes:
+
+- `--by-commit <sha>`: keep commits up to `<sha>` on the original branch, move
+  the remaining commits onto a new upper branch, and reparent the original's
+  children under the new branch.
+- `--by-file <paths>`: extract the listed file changes into a new lower branch
+  inserted between the original and its parent. Lossy: each side collapses to a
+  single commit with `--extract-message` and `--remainder-message`.
+
+### Config operations
+
+Config operations (set-branch, remove-branch, set-strategy, get, validate,
+land-cleanup) are library functions in `src/lib/config.ts`, not CLI subcommands.
+They are called internally by the other subcommands and are not invoked
+directly. The branch-structure primitives (`configInsertBranch`,
+`configFoldBranch`, `configMoveBranch`, `configSplitStack`) are the underlying
+config mutations used by `insert`, `fold`, `move`, and the auto-split path of
+`land`.
+
+## References
+
+- [Workflows and usage guide](references/workflows.md) for end-to-end recipes
+  combining CLI commands and Claude-orchestrated skill flows. Surface this when
+  a user asks "how do I use this?" or wants a worked example.
+- [Git commands reference](references/git-commands.md) for rebase, --onto,
+  conflict resolution, and edge cases

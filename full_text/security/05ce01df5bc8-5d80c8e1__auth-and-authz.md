@@ -1,0 +1,400 @@
+---
+name: auth-and-authz
+description: Authentication & Authorisation control plane for Yuzu — the canonical entry point for any work on RBAC, OIDC SSO, SAML, SCIM, MFA/TOTP, AD/Entra integration, API tokens, session lifecycle, enrollment, and the audit/evidence chain. Use when the user says "/auth-and-authz", "/auth", "/iam", asks to plan or implement an enterprise A&A feature, asks "what's our auth gap to enterprise readiness", asks to audit current auth state against SOC 2 CC6.x / Workstream B, or starts work that touches `auth_*`, `rbac_*`, `oidc_*`, `api_token_*`, `enrollment_*`, or `cert_store.*`. The skill bundles current-state inventory, required-features inventory, gap matrix, the canonical workflow for adding a new A&A feature, and the load order for the routed reference docs.
+---
+
+# Authentication & Authorisation skill
+
+The single entry point for any A&A work in Yuzu. Bundles three things:
+
+1. **Current state** — what's shipped today and where it lives.
+2. **Required state** — the enterprise/SOC 2 feature set we owe customers.
+3. **Gap matrix + workflow** — what's missing and the standard procedure for
+   closing a gap.
+
+This skill does NOT replace the routed docs or specialist agents. It tells
+you which to load, in which order, and what questions to ask before you
+start cutting code.
+
+---
+
+## Usage
+
+```
+/auth-and-authz                # default: print gap matrix + suggested next gaps
+/auth-and-authz audit          # produce a compliance-ready snapshot of A&A state
+/auth-and-authz plan <feature> # plan-only walk-through for a single feature (e.g. SAML, SCIM, TOTP)
+/auth-and-authz implement <feature>  # full workflow: plan → governance → implement → test → docs
+```
+
+If the user invokes the skill without a subcommand, default to printing the
+**gap matrix** (Section 3) and asking which gap they want to work on.
+
+---
+
+## 1. Current state — what's shipped
+
+Authoritative reference: `docs/auth-architecture.md`. Read it before this
+skill claims anything is "done."
+
+### Shipped capabilities
+
+| Capability | Status | Source of truth |
+|---|---|---|
+| Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp:69` `pbkdf2_sha256()` (OpenSSL `PKCS5_PBKDF2_HMAC` + BCrypt path) |
+| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.claude/agents/authdb.md` |
+| Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
+| API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
+| Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
+| Granular RBAC — 6 roles × **19** securable types × 6 ops | Shipped (Phase 3) | `rbac_store.cpp:129-193` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState; ops: Read/Write/Execute/Delete/Approve/Push |
+| Self-target principal-destruction guard (#397/#403) | Shipped | `settings_routes.cpp:434,1830,2488-2504` (3 call sites); design in `docs/auth-architecture.md` §self-target |
+| OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp:189` `generate_code_verifier()`, L194 `compute_code_challenge()`, L385 `code_verifier` post, L766 `/.well-known/openid-configuration` discovery, L542/L623 JWKS fetch + JWT signature verify |
+| Directory Sync — AD/Entra users + groups + role mapping via Microsoft Graph v1.0 | Shipped | `directory_sync.cpp:336,509,556,608` calls `https://graph.microsoft.com/v1.0/users`, `/groups`, `/groups/{id}/members`; persisted `directory_group_role_mappings` + `directory_sync_status` tables (`directory_sync.cpp:147`). NOTE: `oidc_provider.cpp:248` only parses the JWT `groups` claim — Graph integration is the separate Directory Sync subsystem. |
+| mTLS for agent ↔ server | Shipped | `main.cpp:111` `--ca-cert` flag; peer-cert identity match in `agent_service_impl.cpp:47,354` |
+| Windows certificate-store mTLS (CryptoAPI/CNG) — **agent-side only** | Shipped | `agents/core/src/cert_store.cpp:78,84,199-201` (`CertOpenStore`, `NCrypt` CNG export) |
+| HTTPS-by-default, secure bind default (127.0.0.1) | Shipped (hard invariant) | `main.cpp:100` 127.0.0.1 default, L216 `--no-https` opt-out; design in `docs/auth-architecture.md` |
+| HTTP security headers — six (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy) | Shipped (SOC2-C1) | `security_headers.cpp:187-195` (HSTS conditional on HTTPS responses) |
+| Cert hot-reload (HTTPS) with audit + metrics | Shipped | `cert_reloader.cpp:31` audit `cert.reload`, L80 watcher loop, L114-191 atomic `SSL_CTX` swap |
+| Agent enrollment — pre-shared / platform-trust (auto-approve via attestation_provider) / admin-approval queue (3 tiers) | Shipped | `auth.cpp:717-948` + `agent_service_impl.cpp:67-189` (pre-shared L70, attestation auto-approve L101-136, pending-admin queue L138-189) |
+| MCP token issuance + tier-before-RBAC ordering | Shipped | `mcp_server.cpp:556-557,591,599` (tier check at L591 precedes RBAC at L599); design in `docs/mcp-server.md` |
+| `auth.admin_required` denied audit on every 403 | Shipped (gate) | `auth_routes.cpp:150` inside `require_admin` |
+| Private-key permission validation | Shipped | `cert_reloader.cpp:120` `validate_key_file_permissions()` (helper in `file_utils.hpp`); called at startup from `server.cpp` and on hot-reload |
+| Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
+| Account lockout after N failed local-password logins | Shipped (SOC 2 CC6.3) | `auth.db` v3 columns + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins` (`auth_db.cpp`); `POST /login` pre-check + record/clear (`auth_routes.cpp`); admin unlock `POST /api/v1/users/<name>/unlock` (`rest_api_v1.cpp`); `--auth-lockout-threshold`/`--auth-lockout-window-secs` (`main.cpp`). Generic-401 (no enum/oracle), auto-expiring window, audit `auth.lockout.applied`/`.cleared`. Ref: `docs/auth-architecture.md` "Account lockout". |
+| MFA / TOTP — full ladder (enrollment + login challenge + recovery codes; step-up on 11 high-risk surfaces; enforcement modes + OIDC `amr` short-circuit + login-time enrollment bootstrap) | Shipped (v0.12–v0.13, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors; `POST /login` 202-branches + `POST /login/mfa`, `/login/mfa/stepup`, `/login/mfa/enroll` at `auth_routes.cpp`; `require_mfa_step_up` + `amr_asserts_mfa` at `mfa_step_up.{hpp,cpp}`; `--mfa-enforcement` at `main.cpp`; Settings panel + self-target disable guard at `settings_routes.cpp`. Remaining: at-rest TOTP-secret encryption — **mechanism decided by ADR-0010** (SecretCodec envelope encryption at the `auth` store's Postgres migration; the `auth_kv` scaffolding will NOT be used). Full reference: `docs/auth-mfa-design.md`. |
+| SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP (`/scim/v2/*`, Users-only) | Shipped (SOC 2 CC6.2/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (storage: `scim_resources`/`scim_tokens` inside `auth.db`, own `"scim"` migration component) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`users.provisioning_source`, auth.db migration v7), now also re-checking `role == "user"`. See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+
+---
+
+## 2. Required state — enterprise / SOC 2 readiness
+
+Source of truth: `docs/enterprise-readiness-soc2-first-customer.md`
+**Workstream B — Identity, Access, and Administrative Security** (§3.2).
+SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
+(authentication), CC6.6 (privileged access), CC6.7 (change in role), CC6.8
+(termination), CC7.2 (anomalies → audit).
+
+### Required-but-not-yet-shipped feature inventory
+
+| Feature | Workstream B line | SOC 2 link | Gap class |
+|---|---|---|---|
+| **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
+| **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
+| **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
+| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only. Admins are now reachable via SAML without a local account. Deferred: AuthnRequest signing, AttributeStatement parsing beyond the group attribute, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
+| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **SHIPPED (Users slice)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push, and SCIM users are always `role=user` at creation so a compromised IdP can't create an admin. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`; metrics `yuzu_scim_requests_total{op,status}` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** Groups→role mapping, native email-`userName` support, `userName` rename, per-route rate-limiting, API-token revocation on user delete/deactivate (pre-existing gap shared with the dashboard's manual disable path), SCIM-token-at-rest encryption. See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+| **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
+| **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
+| **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
+| **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` §7 specs overlap-pair rotation (bounded idempotent mint, window-floor, last-used tracking); scoped to engine credentials first (plan PR 4.3), deliberately credential-generic for later human-token adoption. |
+| **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
+| **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
+| **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
+| **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` specs the `engine` principal type: dedicated identity store, no login surface, credential-only auth, mandatory rotation, default-deny scoped grants. Implementation lands via plan PRs 4.1–4.5. |
+| **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
+| **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **SHIPPED** — `GET /api/v1/audit/auth-sample` (`rest_api_v1.cpp`); `AuditQuery.action_prefixes` + `random_sample` (`audit_store.{hpp,cpp}`); scoped to `auth.`/`mfa.`/`session.`; `AuditLog:Read`; export audited as `audit.auth_sample.exported` |
+| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. CSR API, lifecycle (issue / renew / revoke), audit chain. Today operators must bring their own PKI for both surfaces. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **MISSING** |
+| **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA (future) or any public CA / operator-internal CA today*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **PARTIAL — verifier shipped, CA upstream pending** |
+
+### Hard invariants that must NOT regress when adding any of the above
+
+These are pulled from `docs/auth-architecture.md` and
+`.claude/agents/authdb.md`. Every PR adding a feature in Section 2 above
+must check them:
+
+- HTTPS by default; refuse to start without `--https-cert` + `--https-key`
+  unless `--no-https` is passed.
+- Web UI binds 127.0.0.1 by default; warn at startup if overridden.
+- Private-key files must not be group/others-readable on Unix.
+- Every error response uses the structured JSON envelope.
+- Six security headers on every HTTP response.
+- All SQL parameterised; no string interpolation.
+- Self-target principal-destruction guard applied to any new
+  destructive/demoting endpoint.
+- `auth.db` 0600 / restricted ACL at create.
+- `MigrationRunner::run` for any new schema migration.
+- `unique_ptr<AuthDB>` lifetime spans `Server::create()`.
+- `yuzu-server.cfg` is a one-shot first-boot seed, not a live source.
+- `POST /api/settings/users` `role` field stays ignored; role changes only
+  via the dedicated endpoint.
+- `require_admin` emits `auth.admin_required` denied audit on every 403.
+- New code never holds `AuthDB::mu_` while publishing to a sibling
+  subsystem's bus.
+
+---
+
+## 3. Gap matrix — priority order
+
+Recommended order for closing gaps. Each block stands alone; pick whichever
+matches the customer ask.
+
+### Priority 0 — needed for first enterprise customer
+
+1. ~~**MFA / TOTP for admin login + high-risk approvals.**~~ **DONE** —
+   the full 3-PR ladder shipped: TOTP enrollment + login challenge +
+   recovery codes, step-up on 11 high-risk surfaces, enforcement modes
+   (`admin-only`/`required`) with login-time enrollment bootstrap, and the
+   OIDC `amr` short-circuit. See `docs/auth-mfa-design.md`. Only the
+   at-rest TOTP-secret encryption follow-up remains — per ADR-0010 it lands
+   as SecretCodec envelope encryption with the `auth` store's Postgres
+   migration (the `auth_kv` scaffolding will NOT be used).
+2. ~~**Account lockout after N failed logins.**~~ **DONE** — `auth.db` v3
+   columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) +
+   `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`;
+   `--auth-lockout-threshold` (default 5, 0 disables) /
+   `--auth-lockout-window-secs` (default 900). `POST /login` pre-check returns
+   the **same generic 401** as a bad password (no enumeration/oracle, skips
+   PBKDF2 on a locked account); the window auto-expires and a waited-out user
+   gets a fresh budget. Admin unlock `POST /api/v1/users/<name>/unlock`
+   (`UserManagement:Write` + step-up, self-target allowed). Audit
+   `auth.lockout.applied`/`.cleared`; metrics `yuzu_auth_lockout_applied_total`
+   / `yuzu_auth_lockout_blocked_total`. See `docs/auth-architecture.md`
+   "Account lockout".
+3. ~~**Hardened-mode local-password disable.**~~ **DONE** — `--auth-mode=sso-only`
+   (`YUZU_AUTH_MODE`) disables the local-password path fleet-wide; only OIDC SSO
+   mints a session, and the server **refuses to start** without OIDC configured
+   (it would otherwise lock everyone out). The `POST /login` gate returns the
+   **same generic 401** as a bad password (no enumeration/mode oracle); the
+   denial is **metric-only** (`yuzu_auth_local_disabled_total{target}`), NOT a
+   per-attempt audit row (anti-flood, matches the lockout-blocked posture).
+   Break-glass account: `--break-glass-user` is the single exempt principal,
+   exempt **only while armed** (`users.break_glass_armed_until`, migration v4 — a
+   future timestamp evaluated in SQL like `locked_until`, so it **auto-expires**;
+   `--break-glass-window-secs` default 24h). **Mandatory MFA** is enforced two
+   ways: boot fails closed if the break-glass user lacks MFA
+   (`break_glass_account_problem`), and at login an un-enrolled break-glass
+   account is **hard-denied 403** (`auth.breakglass.denied`) — enrollment is
+   never offered (it would defeat the second factor; governance UP-1). Arming is
+   an out-of-band **host CLI** op — `yuzu-server --break-glass-arm` (audited
+   `auth.breakglass.armed` at `kCritical`, attributed to the kernel OS identity,
+   audit-store writable-checked before mutate; mirrors the `--mfa-reset`
+   contract) — so it works when the IdP is down. Use is loud: `kCritical`
+   `auth.breakglass.login` audit + `yuzu_auth_break_glass_login_total` metric.
+   See `docs/auth-architecture.md` "Hardened mode",
+   `docs/security-reviews/auth-hardened-mode-2026-06-29.md`, the
+   `docs/ops-runbooks/auth-db-recovery.md` arm runbook;
+   `tests/unit/server/test_auth_break_glass.cpp` + `test_auth_routes_hardened.cpp`.
+4. ~~**Sampled auth-log evidence export.**~~ **DONE** —
+   `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` returns a
+   pseudo-random sample of the auth surface (`auth.`/`mfa.`/`session.` action
+   prefixes) over an optional window. Gated on **`AuditLog:Read`** (NOT
+   `require_admin` — a read-only auditor role can pull evidence without full
+   admin; separation of duties), and the export is itself audited as
+   `audit.auth_sample.exported`. Backed by `AuditQuery.action_prefixes` +
+   `random_sample`. SOC 2 CC7.2. See `docs/security-reviews/auth-sample-export-2026-06-15.md`.
+5. ~~**Session revocation REST surface.**~~ **DONE** —
+   `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me`
+   (self) over `AuthDB::invalidate_all_sessions()`; audit `session.revoke_all`
+   / `session.revoke_all.self`, step-up, self-target guard. (The skill matrix
+   previously listed this as PARTIAL — it has in fact shipped.)
+
+### Priority 1 — enterprise-friction reducers
+
+6. **SAML 2.0 SP** — thin first slice shipped, **plus group→role mapping**
+   (`feat/auth-saml-group-role`). SP-initiated login via HTTP-Redirect
+   binding; ACS via HTTP-POST binding. Assertion signature validated against
+   the pinned IdP cert (in-document `<KeyInfo>` ignored); XML
+   signature-wrapping defended; audience / recipient / expiry validated;
+   solicited-only + single-use `InResponseTo` (replay-protected). Sessions are
+   ephemeral, `auth_source="saml"`; role is `admin` when the assertion's
+   IdP-attested groups (`--saml-group-attribute`) contain the configured
+   `--saml-admin-group` (exact match only, parsed from the same
+   XSW-verified assertion node as NameID — mirrors the OIDC
+   `--oidc-admin-group` guard), else `role=user`. Both flags empty (default)
+   reproduces the original all-`role=user` behaviour. **Linux and macOS
+   only** — Windows fails closed at startup. **Remaining (next slice):**
+   AuthnRequest signing, AttributeStatement parsing beyond the group
+   attribute, Windows support, IdP-metadata auto-fetch, Settings-UI
+   reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP".
+7. ~~**SCIM v2 provisioning**~~ **DONE (Users slice)** — auto-create/deactivate/
+   reactivate users from the IdP over `/scim/v2/*` (`--scim-enable`/
+   `--scim-token`, fail-closed without a token or without HTTPS). Reuses
+   `auth.db`'s user table (a new `provisioning_source` column, migration v7)
+   plus two new SCIM-owned tables (`scim_resources`/`scim_tokens`) under
+   their own migration component on the same db file — not a new store.
+   Bearer-token auth (constant-time, separate from operator API tokens),
+   fixed `role=user` provisioning (no SCIM path to admin), soft-delete +
+   session-revoke on deactivate, lockout-clear (not MFA-restore) on
+   reactivate. The **provenance guard** — every mutating call re-verifies
+   `provisioning_source == "scim"` immediately before touching the account,
+   refusing `404` (never `403`, no existence oracle) on mismatch — is the
+   invariant that makes it safe to point a third-party IdP connector at this
+   surface: a local admin or the break-glass account can never be
+   deactivated by SCIM — a check now extended to also re-verify `role ==
+   "user"`, so an operator-elevated former-SCIM account is likewise beyond
+   SCIM's reach. `PUT` triggers the same deactivate/reactivate semantics as
+   `PATCH` when `active` flips; a `POST` against a deactivated SCIM account's
+   `userName` revives it (returning-employee reprovision) rather than
+   `409`ing. Audit result values are `success`/`failure`/`denied`; metrics
+   `yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
+   `yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
+   **Remaining (next slice):** Groups→role mapping (every SCIM user is
+   `role=user` regardless of IdP group membership), native email-shaped
+   `userName` support (Yuzu usernames are slug-only — a stock Okta/Entra
+   `userName=email` mapping 400s until the operator remaps it), `userName`
+   rename via `PUT`, per-route rate-limiting, API-token revocation on
+   user delete/deactivate (currently only auth sessions are revoked — a
+   pre-existing gap shared with the dashboard's manual disable path, not
+   SCIM-specific), and SCIM-token-at-rest encryption. See
+   `docs/auth-architecture.md` "SCIM v2 provisioning".
+8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
+   (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
+   0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
+   Enforced in `AuthManager::validate_session` against the in-memory `Session`
+   (the authoritative read path — `auth.db` sessions are v1 dead-writes): a
+   **monotonic `steady_clock` `last_activity_at`** is bumped on each
+   authenticated touch (sliding window) and the session is rejected + evicted
+   once idle past the window, *under* the absolute 8h `kSessionDuration`. Cookie
+   sessions only — API/MCP tokens resolve via `synthesize_token_session`, never
+   `validate_session`, so they are **never idle-timed-out**. The `auth.db`
+   `last_activity_at` mirror is best-effort + throttled (`touch_session_activity`,
+   ≤1 write/session/60s, off `mu_`). See `docs/auth-architecture.md` "Inactivity
+   session timeout"; `tests/unit/server/test_auth.cpp` `[idle]`.
+9. ~~**JIT admin elevation**~~ **DONE** — `POST /api/v1/elevate` `{justification,
+   duration_secs}` promotes the caller's **effective role** to admin for a
+   bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
+   Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
+   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`; keyed on
+   a `users` row, which OIDC login does not create — a federated identity needs
+   one provisioned first), distinct from standing admin and enumerable for
+   access reviews. Gated on eligibility + **mandatory MFA enrollment**
+   (unconditional — elevation is the privilege boundary) + a fresh MFA step-up;
+   the grant audit is fail-closed, revoking eligibility ends active elevations,
+   and self-grant is blocked. A local session's factor is local TOTP; an OIDC
+   session with an IdP-MFA (`amr`) proof satisfies this WITHOUT local
+   enrollment, per `--jit-oidc-amr-elevation` (default true) — an OIDC session
+   never consults a local namesake account's TOTP enrollment, and
+   `--no-jit-oidc-amr-elevation` blocks OIDC sessions from elevating entirely
+   (they cannot present a local TOTP step-up).
+   `auth::effective_role(session)` (admin while
+   `now < elevated_until`) is honoured by `require_admin` + the permission gates;
+   the window is monotonic `steady_clock`, in-memory per **cookie** session
+   (restart/logout drops it; API/MCP tokens can never elevate). Audits
+   `role.elevation.{granted,denied,revoked,expired}` + `user.elevation_eligibility.set`;
+   `POST /api/v1/elevate/revoke` for step-down. Passive expiry is now audited
+   too — lazily, at the `AuthRoutes::resolve_session` cookie chokepoint on the
+   operator's next authenticated request after the window lapses (no
+   background reaper); a session already at/past its own absolute lifetime is
+   rejected `401` rather than granted a zero-length window (dead-window guard).
+   See `docs/auth-architecture.md` "JIT admin elevation";
+   `tests/unit/server/test_auth_jit_elevation.cpp`.
+10. **Self-managed Certificate Authority (mTLS + code signing).** A single
+    PKI root, server-managed, that operators can use instead of standing up
+    their own CA. Two consumers:
+    - **mTLS** — issue server certs and per-agent client certs against the
+      Yuzu CA so an out-of-the-box deployment doesn't require an external
+      PKI. Today `--ca-cert` consumes whatever bundle the operator hands
+      over; the new flow lets the server *be* the CA.
+    - **Plugin code signing** — issue developer signing certs whose chain
+      anchors at the same root, so the agent's `--plugin-trust-bundle`
+      points at one PEM and the operator can sign their own plugins. The
+      verifier (issue #80, shipped) is already deployment-format-agnostic:
+      same code path accepts public-CA, internal-CA, and self-managed-CA
+      issued certs. The CA closes the operator UX gap, not a security gap.
+
+    Surface required:
+    - Schema additions via `MigrationRunner`: `ca_root` table (root key +
+      cert + lifecycle), `ca_issued` table (issued cert inventory + status
+      + revocation reason), `ca_crl_versions` table.
+    - REST: `POST /api/v1/ca/issue` (CSR in, cert chain out),
+      `POST /api/v1/ca/revoke`, `GET /api/v1/ca/crl` (DER CRL stream),
+      `GET /api/v1/ca/root` (root cert PEM, public).
+    - Audit actions: `ca.root.created`, `ca.cert.issued`, `ca.cert.revoked`,
+      `ca.crl.published`.
+    - RBAC: gated under the existing `Security` securable type with
+      `Read` (root + CRL) / `Write` (issue) / `Delete` (revoke) ops.
+    - Hardening: root key encrypted at rest using existing
+      `auth.db`-style 0600 file or, preferred, an HSM/keyring abstraction
+      that today wraps OpenSSL `EVP_PKEY` and tomorrow can target PKCS#11.
+
+    Plugin code-signing intersects this: when the CA ships, the agent's
+    `--plugin-trust-bundle` simply points at `/var/lib/yuzu/ca/root.pem`
+    and the operator's plugin build pipeline calls `POST /api/v1/ca/issue`
+    to mint a signing cert. No verifier change required.
+
+### Priority 2 — long-tail polish
+
+10. ~~**API token rotation workflow**~~ **DESIGNED** — `docs/auth-engine-principals-design.md`
+    §7 (overlap-pair, engine credentials first, plan PR 4.3); not yet built.
+11. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
+    (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
+    (`rest_api_v1.cpp`) both surface owner / created / last-used columns from
+    `api_token_store.cpp:325-345`. (The skill matrix previously listed this
+    as PARTIAL — it has in fact shipped.)
+12. **Periodic access-review export** — JSON/CSV of `(user, role, last_login)`
+    triples plus an attestation upload endpoint. Must enumerate
+    `principal_type IN (user, group, engine)` once the engine-principal
+    design ships — see `docs/auth-engine-principals-design.md` §10.
+13. ~~**Service-account principal type**~~ **DESIGNED** — the `engine`
+    principal class in `docs/auth-engine-principals-design.md` (dedicated
+    identity store, no login surface, credential-only auth, mandatory
+    rotation); not yet built.
+
+### Priority 3 — defer
+
+14. **Conditional access policies** (geo / IP / device posture) — large
+    scope, niche customer ask. Defer until specifically requested.
+
+---
+
+## 4. Standard workflow for adding an A&A feature
+
+For every feature in Section 3:
+
+1. **Read first.** In order:
+   - This skill (current file) for the gap framing.
+   - `docs/auth-architecture.md` for the existing auth surface and hard
+     invariants.
+   - `docs/enterprise-readiness-soc2-first-customer.md` §3.2 for the
+     enterprise/SOC 2 framing.
+   - `.claude/agents/authdb.md` if the feature touches `auth.db`.
+   - `docs/mcp-server.md` if the feature touches the MCP surface.
+
+2. **Plan.** Produce a short plan covering:
+   - Schema changes (must use `MigrationRunner`).
+   - REST surface additions and the RBAC permission required.
+   - Audit actions (always emit on the `require_admin` gate side and on
+     every state mutation).
+   - Self-target guard implications (does this destroy/demote a principal?).
+   - Test plan: unit (`tests/unit/`), integration if it touches multiple
+     stores, a puppeteer smoke if it touches the dashboard.
+
+3. **Implement** with a single PR per feature. Drive every change through
+   `MigrationRunner` for schema, `HeaderBundle::make()`/`apply()` for any
+   header touch, `require_admin` for the admin gate, and parameterised SQL
+   throughout.
+
+4. **Test.** Run `/test --quick` before commit. The
+   `tests/unit/test_auth_db.cpp` and `test_auth_routes.cpp` patterns are the
+   reference.
+
+5. **Governance.** Run `/governance dev..HEAD` before pushing — Gate 2
+   (security-guardian + docs-writer mandatory deep-dive) plus the AuthDB
+   review agent (`.claude/agents/authdb.md`) for any `auth_db.*` touch.
+   CRITICAL/HIGH findings block merge.
+
+6. **Docs.** docs-writer always picks up the user-manual + REST API
+   updates during Gate 2; verify the change is in the findings report
+   and ship the doc edit in the same PR (or the immediate follow-up).
+
+7. **Compliance evidence.** For features that close a SOC 2 control gap,
+   add an entry to `docs/security-reviews/` for the change record. The
+   compliance-officer agent will catch this in Gate 6.
+
+---
+
+## 5. Cross-references
+
+- **Routed reference doc:** `docs/auth-architecture.md`
+- **Engine principals & delegation design (ADR-1005 item 2b):**
+  `docs/auth-engine-principals-design.md` — third principal class, scoped
+  role assignments, RFC 8693 delegation, credential rotation/lifetime
+  ceilings; the most detailed reference for the token-rotation and
+  service-account-governance gaps in the matrix above.
+- **AuthDB review agent:** `.claude/agents/authdb.md`
+- **Security review agent:** `.claude/agents/security-guardian.md`
+- **MCP token + tier policy:** `docs/mcp-server.md`
+- **Enterprise readiness plan:** `docs/enterprise-readiness-soc2-first-customer.md`
+- **SOC 2 evidence pattern:** `docs/security-reviews/*` and audit-log
+  emission via `audit_store.cpp`.
+- **Operator runbook:** `docs/ops-runbooks/auth-db-recovery.md`.

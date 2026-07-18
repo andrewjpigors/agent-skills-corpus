@@ -1,0 +1,810 @@
+---
+name: nanobrain-workflow-authoring
+description: How to author a Workflow YAML and (rarely) a Workflow subclass. Workflows are Steps that orchestrate other Steps via links. Covers the WorkflowConfig schema, step registration, link wiring, executor selection per step, DAG validation rules (cycle detection, orphan detection, self-referencing-link prohibition), execution model (event-driven vs. imperative), and the verbatim error messages from `workflow_graph.py`.
+---
+
+# nanobrain-workflow-authoring
+
+## ⚠️ Read first — silent-failure shapes
+
+The framework's static validators catch structural errors (cycles, orphans,
+unknown step IDs). They do **not** catch the four dominant runtime
+silent-failure shapes that make a workflow appear to work while producing
+nothing useful. Cross-reference `architecture.md §13` for the brutal-truth
+list. Summary:
+
+1. **Every `DirectLink` in your YAML must declare `auto_transfer: true`.**
+   Default is False. Without the flag, the link silently no-ops on every
+   trigger. (Gap **G7** proposes flipping the default in `config_version: 2`.)
+2. **`AllDataReceivedTrigger`'s expected set is bound at trigger init.** A
+   gated-off layer that never publishes deadlocks the trigger. (Gap **G2**
+   proposes a dynamic `expected_set_source`; gap **G10** proposes
+   gate-to-bottom semantics.)
+3. **Workflow-level data unit shape mismatch silently drops payloads.** Both
+   `input_data_units` and `output_data_units` must be declared at workflow
+   level AND the link's `target` must match a declared workflow output by
+   exact name.
+4. **Trigger payload wrapping (`{unit_name: payload}` envelope) is the
+   framework's responsibility.** A step's `process()` sees the **raw payload**;
+   if you wrap it again you ship a doubly-wrapped value downstream.
+5. **A `Workflow` instance owns MUTABLE data units — do not run one instance
+   concurrently from two callers.** `Workflow.run()` now serializes overlapping
+   runs on the SAME instance via a per-instance lock (`_get_run_lock`, 2026-06-14),
+   so a cached-per-process workflow (an MCP server fielding overlapping requests)
+   no longer silently returns one caller's result to another — but the cost is that
+   same-instance runs queue. For true parallelism, build a DISTINCT instance per
+   concurrent run (distinct instances keep distinct locks and run fully in parallel).
+   Deciding success from the run's `status` field would have missed this entirely:
+   every contaminated run reported `status: completed` (G127 — assert on output
+   VALUES). A SubworkflowStep in the cascade drives a different instance, so nesting
+   does not deadlock.
+
+After every workflow change, call `Workflow.wait_for_cascade(timeout, settle_ms)`
+synchronously after `process()` and assert the workflow-level outputs
+actually carry your expected payload — don't trust trigger-cascade
+"completion" without checking the data.
+
+### Pre-execution validation across all three authoring paths (2026-05-11)
+
+CLAUDE.md describes three legit workflow-authoring paths. All three
+now route through the same framework-rule validator before runtime:
+
+| Path | Validator entry point | Surfaces violations as |
+|---|---|---|
+| Hand-authored YAML | `Workflow.from_config(path)` | Framework `ValueError` / `ComponentConfigurationError` |
+| LLM composer | `Composer.compose(prompt)` | Structured `WorkflowValidationError` with per-rule `WorkflowViolation` records; retries once with feedback payload (C1) |
+| Lightweight `WorkflowBuilder` | `validate_and_load(builder)` from `apecx_integration.composition.lightweight_validator` | Structured `WorkflowValidationError` (same payload as composer) |
+
+The structured surface (`rule_id`, `path`, `message`,
+`suggested_fix`) is the same across paths so retry / repair logic
+can be reused.
+
+## Alignment-audit findings — author validation/repair as Steps, not pseudocode
+
+Per `nanobrain_alignment_audit.md` F-2, F-3, F-6: the 5-gate validation
+pipeline and the repair loop are **nanobrain Steps connected by Links**, not
+imperative Python. If you find yourself writing a custom Python "validator
+runner" or "repair loop" outside the workflow YAML, stop — it's a duplicate
+of `LoopController` (gap **G18**) and `BaseStep` (existing). Cross-reference
+`agent_workflow_authoring.md §6` for the canonical 5-gate-as-Steps shape.
+
+## Why this skill exists
+
+A workflow is the wiring diagram for a multi-step computation. Get it wrong
+and you'll get one of: a step that never fires, a deadlock from a self-loop,
+an `Orphaned steps found (no connections)` validation error, or a workflow that
+"runs" but produces no output because no link connects to the workflow's
+declared outputs (or every link silently no-ops; see warning above).
+
+## File:line ground truth
+
+| Concern | File | Approx. line |
+|---|---|---|
+| `Workflow` (subclasses `Step`) | `nanobrain/nanobrain/core/workflow.py` | ~466 |
+| `WorkflowConfig` schema | `nanobrain/nanobrain/core/workflow.py` | 38–96 |
+| `_init_from_config` for Workflow | `nanobrain/nanobrain/core/workflow.py` | 1554–1632 |
+| Step + link registration | `nanobrain/nanobrain/core/workflow.py` | 1131–1140 |
+| Step lookup error | `nanobrain/nanobrain/core/workflow.py` | 1281–1282 |
+| `WorkflowGraph` (DAG) | `nanobrain/nanobrain/core/workflow_graph.py` | full file |
+| `validate_graph` | `nanobrain/nanobrain/core/workflow_graph.py` | 286–374 |
+| `has_cycles` (DFS) | `nanobrain/nanobrain/core/workflow_graph.py` | 186–213 |
+
+## Mental model
+
+A workflow is a **Step** (literally inherits from `Step`). It has its own
+`input_data_units` and `output_data_units` — these are the workflow's
+entry/exit ports. Inside, it owns:
+
+- `child_steps: Dict[str, BaseStep]` — the steps it orchestrates
+- `step_links: Dict[str, LinkBase]` — the links wiring data between steps
+- a `WorkflowGraph` — a DAG of step IDs and edges (links)
+
+When the workflow runs, **data flows event-driven**: deposit something into
+the workflow's input data unit → the link from that input fires → the first
+step's input unit receives data → the first step's trigger fires → it
+executes → its output unit fires → the next link fires → and so on, until the
+workflow's output unit gets written.
+
+## Minimal workflow YAML
+
+```yaml
+# config/two_step_workflow.yml
+name: two_step_workflow
+description: "Reads input, processes, returns result"
+
+input_data_units:
+  raw_input:
+    class: "nanobrain.core.data_unit.DataUnitMemory"
+    name: raw_input
+
+output_data_units:
+  final_result:
+    class: "nanobrain.core.data_unit.DataUnitMemory"
+    name: final_result
+
+steps:
+  prep:
+    class: my_project.steps.PreparationStep
+    config: config/prep_step.yml
+
+  aggregate:
+    class: my_project.steps.AggregationStep
+    config: config/aggregate_step.yml
+
+links:
+  input_to_prep:
+    class: "nanobrain.core.link.DirectLink"
+    config:
+      source: "raw_input"          # workflow-level data unit
+      target: "prep.input"         # step's input unit
+      link_type: direct
+
+  prep_to_aggregate:
+    class: "nanobrain.core.link.DirectLink"
+    config:
+      source: "prep.output"
+      target: "aggregate.input"
+      link_type: direct
+
+  aggregate_to_output:
+    class: "nanobrain.core.link.DirectLink"
+    config:
+      source: "aggregate.output"
+      target: "final_result"       # workflow-level data unit
+      link_type: direct
+```
+
+## Fully featured (mixed-execution) workflow
+
+This pattern is the canonical reference; it uses workflow-level data units,
+multiple executors, and Academy links for HPC delegation.
+
+```yaml
+# config/mixed_execution_workflow_aurora.yml
+name: academylink_aurora_workflow
+version: "2.0"
+
+input_data_units:
+  raw_input:
+    class: "nanobrain.core.data_unit.DataUnitMemory"
+    name: raw_input
+    persistent: false
+
+output_data_units:
+  final_results:
+    class: "nanobrain.core.data_unit.DataUnitMemory"
+    name: final_results
+    persistent: false
+
+executors:
+  local_executor:
+    executor_type: local
+    name: local_executor
+    max_workers: 2
+    timeout: 60
+  aurora_executor:
+    executor_type: parsl
+    name: aurora_executor
+    parsl_config_file: ../aurora_parsl_executor.yml
+    timeout: 600
+
+steps:
+  data_preparation:
+    class: demos.academylink_aurora_demo.steps.DataPreparationStep
+    config: config/data_preparation_step.yml
+    executor: local_executor
+  aurora_computation:
+    class: demos.academylink_aurora_demo.steps.AuroraComputationStep
+    config: config/aurora_computation_step.yml
+    executor: aurora_executor
+  result_aggregation:
+    class: demos.academylink_aurora_demo.steps.ResultAggregationStep
+    config: config/result_aggregation_step.yml
+    executor: local_executor
+
+links:
+  aurora_computation_link:
+    class: "nanobrain.academy_integration.academy_link.AcademyLink"
+    config: "config/aurora_computation_link.yml"
+  aurora_results_link:
+    class: "nanobrain.academy_integration.academy_link.AcademyLink"
+    config: "config/aurora_results_link.yml"
+
+execution:
+  timeout: 600
+  retry_attempts: 2
+  parallel_execution: false
+```
+
+Source: `nanobrain/demos/academylink_aurora_demo/`. Read those files when you
+need a working reference.
+
+## WorkflowConfig schema
+
+Inherits StepConfig fields, adds:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enable_monitoring` | bool | true | Enables resource monitor |
+| `max_parallel_steps` | int | 10 | Concurrency cap |
+| `step_timeout` | float | 300 | Per-step default timeout |
+| `retry_attempts` | int | 3 | On step failure |
+| `retry_delay` | float | 1.0 | Seconds between retries |
+| `allow_cycles` | bool | false | If true, validation tolerates cycles (rare) |
+| `validate_graph` | bool | true | Run DAG validation at init |
+| `require_connected_graph` | bool | true | Disconnected components → error |
+| `steps` | Dict[str, StepRef] | {} | Map of step_id → class+config |
+| `links` | Dict[str, LinkRef] | {} | Map of link_id → class+config |
+| `executors` | Dict[str, ExecutorConfig] | {} | Named executors usable by steps |
+
+A `StepRef` is `{class: "...", config: "...", executor: "name"}`. A `LinkRef`
+is `{class: "...", config: "..."}`. The `executor` field on a step ref
+references one of the named entries in the workflow's `executors` map.
+
+## How executors are resolved per step
+
+```yaml
+steps:
+  heavy_step:
+    class: my_project.steps.HeavyStep
+    config: config/heavy_step.yml
+    executor: aurora_executor   # name from workflow's `executors:` map
+```
+
+The workflow's `_init_from_config` builds each named executor from its config,
+then injects it into each step's dependencies during the step's own
+`from_config` call. If a step doesn't specify `executor:`, it inherits the
+workflow's executor.
+
+## Link wiring and dot notation
+
+Source/target strings use dot notation: `step_id.data_unit_name` or just
+`workflow_data_unit_name` for workflow-level units.
+
+```yaml
+links:
+  prep_to_compute:
+    class: "nanobrain.core.link.DirectLink"
+    config:
+      source: "prep.output"          # step prep's output data unit
+      target: "compute.input"        # step compute's input data unit
+      link_type: direct
+```
+
+Invalid forms the framework rejects:
+
+- `source: "prep"` → missing data unit; `Invalid reference: prep. Must use 'step.data_unit' format`.
+- `source: "prep:output"` → wrong separator (colon instead of dot); same error.
+- `source: "prep.output"`, `target: "prep.output"` → self-reference;
+  `❌ ILLEGAL SELF-REFERENCING LINK: {link_id} connects step '{prep}' to itself.`
+
+See the dedicated skill `nanobrain-data-units-triggers-links` for full link
+type taxonomy.
+
+## DAG validation rules
+
+`WorkflowGraph.validate_graph` runs at workflow initialization (when
+`validate_graph: true`, which is the default). It enforces:
+
+1. **Non-empty graph.** `Workflow graph is empty - no steps defined`.
+2. **No cycles** (unless `allow_cycles: true`).
+   `⚠️ WORKFLOW CYCLES DETECTED: This workflow contains cycles. Ensure that appropriate resolution mechanisms are in place...`
+3. **Connected** (unless `require_connected_graph: false`).
+   `Workflow graph is not connected - contains isolated components`.
+4. **No orphans** (steps with no inbound and no outbound edges, when there's
+   more than one step).
+   `Orphaned steps found (no connections): [...]`.
+5. **No self-referencing links.**
+   `❌ ILLEGAL SELF-REFERENCING LINK: {link_id} connects step '{source_id}' to itself.
+   Self-referencing links are prohibited in the workflow architecture as they
+   create infinite trigger loops and prevent proper workflow execution.`
+
+If any rule is violated, the workflow raises an error during `from_config` and
+never reaches a runnable state.
+
+## Execution model
+
+**Event-driven (default).** You don't tell the framework "run step A, then B".
+You deposit data into the workflow's input data unit, and the trigger graph
+takes over. Step A's trigger fires when its input arrives; A runs; A writes
+output; the link to B fires; B's trigger fires; etc.
+
+**Imperative (rare, opt-in via `divergence_enabled` etc.).** A topological
+sort of the DAG is generated and the workflow walks the order itself. Use
+only when event-driven flow is structurally impossible (e.g., a step that
+fans out and rejoins).
+
+For 99% of workflows: event-driven is correct. Set up your data units and
+triggers properly and the framework runs the graph for you.
+
+## Workflow vs. Step ownership
+
+| Owns | Workflow | Step |
+|---|---|---|
+| Workflow-level entry/exit data units | ✅ | — |
+| Step's `input_data_units`, `output_data_units` | — | ✅ |
+| Step's `triggers` | — | ✅ |
+| `child_steps` map | ✅ | — |
+| `step_links` map (links between steps) | ✅ | — |
+| Named executors usable across steps | ✅ | — |
+| Per-step executor binding | ✅ (assigns) | ✅ (uses) |
+
+If you find yourself wanting the workflow to manipulate a step's internal data
+unit directly, you are violating the boundary. Add a link.
+
+## Verbatim error messages
+
+```
+ValueError: Step '{step_id}' not found in workflow
+```
+> A link references a non-existent step. Check the `steps:` block names.
+
+```
+Workflow graph is empty - no steps defined
+```
+> Add at least one step.
+
+```
+Orphaned steps found (no connections): ['step_a', 'step_b']
+```
+> These steps have no inbound or outbound links. Either wire them up or remove them.
+
+```
+Workflow graph is not connected - contains isolated components
+```
+> Two disjoint subgraphs exist. Connect them with a link, or split into two workflows.
+
+```
+⚠️ WORKFLOW CYCLES DETECTED: This workflow contains cycles. Ensure that
+appropriate resolution mechanisms are in place...
+```
+> A cycle was detected. Either set `allow_cycles: true` (and verify your
+> debounce settings prevent infinite firing) or break the cycle.
+
+```
+❌ ILLEGAL SELF-REFERENCING LINK: {link_id} connects step '{source_id}' to itself.
+Self-referencing links are prohibited in the workflow architecture as they create
+infinite trigger loops and prevent proper workflow execution.
+```
+> Source and target are the same step's data unit. Almost always a typo or
+> a wrong design — break the cycle.
+
+## Pitfalls
+
+1. **No link from workflow input to first step.** The workflow input unit
+   gets data, but no listener fires. Add `input_to_first_step` link.
+2. **No link from last step to workflow output.** The pipeline runs but the
+   workflow's declared output never updates; downstream callers see nothing.
+3. **Dot-notation typo.** `"step.outpu"` (missing `t`) — silent failure
+   because the data unit name doesn't match anything; the link sits there
+   waiting forever.
+4. **Cycle without debounce.** Even with `allow_cycles: true`, an unthrottled
+   cycle fires indefinitely. Use `debounce_ms` on the trigger to throttle.
+5. **Step's `executor:` references a name not in `executors:`.** Step
+   initialization fails because the dependency cannot be resolved.
+6. **Mixed ownership mistake.** Putting a step's I/O units into the
+   workflow-level `input_data_units` because "they're the workflow's input
+   too" — this conflates entry-point ownership with internal step ownership.
+   Keep them separate; wire with a link.
+
+## Checklist
+
+- [ ] Workflow YAML has both `input_data_units` and `output_data_units` at
+      the top level (entry/exit ports).
+- [ ] Every step is declared under `steps:` with `class:` and `config:`.
+- [ ] Every step's input data unit is the target of at least one link
+      (otherwise it never fires).
+- [ ] Every workflow output data unit is the target of at least one link
+      from a step (otherwise the workflow produces nothing).
+- [ ] Every link uses dot notation `step.data_unit` or a workflow-level unit name.
+- [ ] No self-referencing links.
+- [ ] DAG passes `validate_graph` (cycles, orphans, connectedness).
+- [ ] Executor names referenced by steps exist in `executors:` block.
+- [ ] Smoke test loads the workflow without error; integration test against
+      real data is recorded.
+
+## New primitives (2026-05-09 — eval_03 Tier 1-3 chain)
+
+Two ergonomic additions to ``Workflow``:
+
+### ``Workflow.from_skeleton(skeleton, bindings)`` — G9-completion
+
+A *parameterized* workflow loader. The skeleton declares typed holes;
+the caller binds them; the framework lowers + loads. Use when the same
+workflow shape runs against many parameter sets (or when an LLM agent
+picks a skeleton from a registry).
+
+```python
+wf = Workflow.from_skeleton(
+    "configs/skeletons/rag_pipeline.yml",
+    bindings={"corpus": "pubmed_2025_q1", "min_evidence": 5},
+)
+```
+
+Skeleton input may be a Path/str (YAML file), a Skeleton instance, or
+an inline dict. Missing required holes FAIL-FAST; extra binding keys
+not declared in skeleton.holes FAIL-FAST. Optional holes get their
+declared default. See ``nanobrain/library/orchestration/skeleton.py``
+for the Skeleton schema and ``nanobrain/docs/workflow_authoring_paths.md``
+for the multi-path picker.
+
+### ``Workflow.run(..., nest_under_active_context=True)`` — G31 runner-side
+
+When invoking a workflow as a **nested sub-workflow** of another
+workflow, set ``nest_under_active_context=True`` on the inner ``run()``
+call. The framework auto-installs a nested ``WorkflowRunContext`` whose
+namespace derives from the outer parent via ``derive_nested_namespace``
+(strategy: ``"scoped"`` default, ``"inherit"`` opt-in via
+``WorkflowConfig.namespace_strategy``).
+
+```python
+# Inside a parent step that invokes a child workflow:
+result = await child_workflow.run(
+    {"query": "..."},
+    nest_under_active_context=True,
+)
+# child_workflow's data units, capability checks, and provenance
+# all key off "<parent_namespace>.<child_workflow_name>" automatically.
+```
+
+When False (default): no behavior change; existing top-level callers
+unaffected. When True without an outer context: warns + falls through
+to non-nested run.
+
+### Capability-token enforcement (G28)
+
+Workflows that load tools with ``requires_capability: [...]`` now have
+those tokens enforced at ``ToolExecutionStep.process()`` time. The
+runner / caller populates ``WorkflowRunContext.capability_tokens`` on
+the active context BEFORE invoking the workflow:
+
+```python
+ctx = WorkflowRunContext.from_config({
+    "run_id": "abc",
+    "capability_tokens": ["hpc.submit", "data.read"],
+})
+with ctx.activate():
+    await workflow.run(...)
+```
+
+Missing tokens → ``CapabilityNotGranted`` workflow-terminal exception.
+
+### Cost envelope enforcement (G26)
+
+Long workflows can declare cumulative cost caps via ``CostEnvelope`` +
+``CostTracker``. Cost-emitting code paths (LLM client, tool dispatch)
+call ``record_cost(kind, amount)`` which checks against the active
+tracker's caps:
+
+```python
+from nanobrain.core.cost_envelope import CostEnvelope, CostTracker
+
+tracker = CostTracker(CostEnvelope(usd=10.0, tokens=1_000_000))
+with tracker.activate():
+    await workflow.run(...)  # any record_cost call past the cap raises
+```
+
+### Step-level events (G37)
+
+Subscribe to live step lifecycle events (``step_start`` / ``step_complete``
+/ ``step_failed``) for dashboards / log shippers / provenance recorders:
+
+```python
+from nanobrain.core.step_events import subscribe_to_step_events
+
+events = []
+with subscribe_to_step_events(events.append):
+    await workflow.run(...)
+# events is now a list[StepEvent] with one event per step boundary
+```
+
+### Embedding a workflow as a step — ``SubworkflowStep`` (2026-05-12)
+
+When one workflow is naturally a reusable reasoning pattern (write
+→ review, decompose → solve → integrate, verify, etc.), embed it
+as a single step in a larger workflow rather than redeclaring its
+topology each time.
+
+Two usage shapes:
+
+**1. Concrete subclass per pattern (recommended for composer use).**
+The composer's RAG matcher sees a concrete step class with a rich
+``rag_description``; the workflow-embedding mechanism is invisible.
+
+```python
+from nanobrain.library.steps.subworkflow_step import SubworkflowStep
+
+class CodeReflectionStep(SubworkflowStep):
+    COMPONENT_TYPE = "code_reflection_step"
+
+    @classmethod
+    def _default_inner_workflow_path(cls):
+        return "workflows/code_writing/code_reflection_workflow.yml"
+
+    async def process(self, input_data, **kwargs):
+        # Explicit override delegates to super(); subclass surface
+        # documents its specific input/output shape.
+        return await super().process(input_data, **kwargs)
+```
+
+**2. Direct config (advanced).** Use ``SubworkflowStep`` directly
+with ``inner_workflow_path`` in the step YAML. Do NOT let the
+composer author this shape — the path field is a hallucination
+surface. Reserved for hand-written workflows.
+
+**3. Builder-sourced inner workflow (E2-F1).** When the inner
+workflow exists ONLY as a lightweight ``WorkflowBuilder`` builder
+(a no-arg ``build_*()`` returning ``builder.load()``, e.g. apecx's
+``viral_conserved_sites``) with no YAML on disk, set
+``inner_workflow_builder`` (a dotted-path to that no-arg callable)
+INSTEAD of ``inner_workflow_path``. The two are mutually exclusive
+(both-set or neither-set → load-time FAIL-FAST); the callable is
+resolved + invoked once at step init and the returned ``Workflow``
+is cached, so every silent-failure gate below is preserved
+unchanged. The callable MUST return a ``Workflow`` (not the builder,
+not a dict) — wrong type FAIL-FASTs. **G117 still applies**: the
+outer step's own input DU name must differ from the inner
+workflow's first-step input DU name. See the ``nanobrain-lightweight``
+skill for the full YAML example + regression pointer
+(``nanobrain/tests/unit/test_subworkflow_step_builder.py``).
+
+Both paths run the inner workflow via
+``inner.process(routed_input) + inner.wait_for_cascade()`` — NOT
+``inner.run()``. The wrapper auto-routes ``input_data`` to the
+inner workflow's first-step input data unit when there's exactly
+one (sidesteps the framework's workflow-level-DU routing gap that
+``test_rag_e2e_workflow_yaml.py`` also works around).
+
+Silent-failure discipline (built in, opt-out per-step):
+
+* **Inner step raised → surfaced FAST + accurate (BUG A, 2026-06-13).**
+  When an inner step ``process()`` raises, the trigger executor
+  SWALLOWS the exception (G127 — ``Workflow.run`` does not propagate
+  it), so the inner output DU never populates. ``SubworkflowStep``
+  subscribes to the inner cascade's G37 ``step_failed`` events (the
+  inner step tasks inherit the contextvar-based subscriber because
+  they are ``create_task``-spawned within ``process()``'s task
+  context) and re-raises the inner step's REAL exception immediately
+  — ``"inner workflow step 'fetch' failed (ValueError: <real
+  reason>)"`` — instead of stalling until ``timeout_seconds``. So a
+  degrade-loud OUTER step sees the actual reason in seconds, not an
+  N-minute generic timeout. Regression:
+  ``nanobrain/tests/unit/test_subworkflow_fast_fail.py``.
+* Cascade timeout (inner genuinely stalled, no step raised) →
+  ``TimeoutError`` (not the lenient ``status: cascade_timeout`` shape
+  of ``Workflow.run`` defaults).
+* Empty inner output → ``RuntimeError`` (matches the EMPTY-OUTPUT
+  gate from apecx-mcp-integration's executor `7471b0a`).
+* Operators opt out with ``allow_empty_inner_output: true`` per
+  step config when side-effect-only inner workflows are intentional.
+
+### Cross-domain reflection via `Workflow.from_skeleton` (2026-05-12)
+
+When the same workflow topology (generate → critique, decompose →
+solve → integrate, etc.) needs to be reused across domains with
+DIFFERENT concrete step classes, the right tool is G9's typed-
+bindings skeleton:
+
+```python
+from nanobrain.core.workflow import Workflow
+wf = Workflow.from_skeleton(
+    "path/to/reflection_skeleton.yml",
+    bindings={
+        "generator_class":     "my.domain.SourceGenerator",
+        "generator_config":    "path/to/generator_wrapper.yml",
+        "generator_input_du":  "src_input",
+        "generator_output_du": "src_output",
+        "critic_class":        "my.domain.SourceCritic",
+        "critic_config":       "path/to/critic_wrapper.yml",
+        "critic_input_du":     "critic_in",
+        "critic_output_du":    "critic_verdict",
+    },
+)
+```
+
+The skeleton body uses `{{<hole_name>: <hole_type>}}` tokens that the
+framework's lowering pipeline (G17) substitutes at load time. Each
+hole's type is one of {string, integer, number, boolean, array,
+object, any, tool_descriptor_ref}.
+
+Required-vs-default + extra-binding-name validation is enforced by
+`Workflow.from_skeleton` — bindings that miss a required hole OR
+provide an undeclared name FAIL-FAST. Use this primitive instead of
+hand-writing per-domain copies of the same topology.
+
+### Workflow inspection: `WorkflowAnalysisStep` + `WorkflowSummarizerStep`
+
+For "explain this workflow to a domain expert" or "is the generated
+workflow structurally sound" prompts, prefer the two-step:
+
+  1. `WorkflowAnalysisStep` (pure-Python) parses a YAML and emits a
+     stable dict — workflow_name, steps[], links[], topology_summary,
+     issues[]. Deterministic; safe to use as a CI pre-flight gate.
+  2. `WorkflowSummarizerStep` (LLM-backed, grounded) consumes the
+     analysis dict and emits Markdown with 5 required sections (What
+     this workflow does / Steps / Data flow / Issues / Honest caveats).
+
+This split matters: the analyzer's deterministic output is the
+LLM summarizer's source-of-truth, so the LLM can't hallucinate
+structural claims (it never sees the raw YAML).
+
+### Self-improving workflows via git-tracked memory (2026-05-12)
+
+The Reflexion verbal-memory loop (Shinn et al., NeurIPS 2023,
+arXiv:2303.11366) is shipping as a composable pattern in apecx:
+
+  memory_read → code_write (consumes critique) → code_review → memory_write
+
+Use `MemoryReadStep` + `MemoryWriteStep` (apecx
+`composition/steps/memory_*_step.py`) when the workflow's output
+quality depends on learning from prior attempts. The memory store
+is a flat directory of JSON files (one per cycle), git-tracked, so
+agent-accumulated lessons surface in PR diffs.
+
+Key gates (set in step config):
+
+  - `MemoryReadStep.limit` — Reflexion's Ω=1–3 cap; default 3.
+  - `MemoryWriteStep.min_lesson_chars` — drop low-signal lessons.
+  - `MemoryWriteStep.skip_if_restatement` — keyword + lesson Jaccard
+    > 0.7 vs newest entry for the same spec_id → skip.
+
+Verified end-to-end against real Ollama
+(`test_self_improvement_against_ollama.py`): 32s total for two
+attempts; second attempt receives a 127-char critique formatted from
+the first attempt's lesson.
+
+### Nested-cascade pattern verified (2026-05-12)
+
+The deterministic no-LLM reproducer
+(`tests/integration/test_nested_subworkflow_reproducer.py`) PASSES
+in 0.46s. Two `SubworkflowStep` instances chained at workflow level
+correctly fire both inner cascades and propagate data.
+
+**Don't** retry the "framework can't do nested cascades" myth —
+it can. When you see a nested-cascade test hang, the cause is
+specific to the inner-step contracts (LLM timing, data-shape
+mismatch), not the framework's task-set bookkeeping.
+
+### Picking a code-writing nested workflow (2026-05-12)
+
+Five LLM-backed code-writing workflows ship under
+`composition/workflows/code_writing/`. They are non-overlapping by
+**input shape** + **verification gate** — pick by what the caller
+has on hand and what proof of correctness is needed:
+
+| Workflow | Required inputs | Gate | Use when |
+|---|---|---|---|
+| `code_writing_workflow` | `code_spec` | AST + reviewer rubric | Greenfield: spec → reviewed code. |
+| `code_with_tests_workflow` | `code_spec` | AST + test_code authored alongside | The caller wants both source and a smoke test in one pass. |
+| `code_verification_workflow` | `code_source` + `test_code` | `IsolatedPyExecStep` subprocess result | Caller already has code; wants exec proof. |
+| `code_reflection_workflow` | `code_spec` | AST + reviewer + reflection memo | Caller wants a self-critique trace alongside the code. |
+| `self_improving_code_writing_workflow` | `code_spec` + `spec_id` | AST + reviewer + git-tracked memory | Recurring task where prior failures should inform the next attempt (Reflexion arXiv:2303.11366). |
+| **`iterative_bug_fix_workflow`** (NW1) | `code_spec` + **`previous_attempt`** + **`critique`** (error trace) + `test_code` | `IsolatedPyExecStep` re-run on the patch | Caller has BROKEN code + failure trace; needs the FIX verified (Self-Debug arXiv:2304.05128, SWE-agent arXiv:2405.15793). |
+| **`code_documentation_workflow`** (NW2) | `code_source` (bare, no docstring) | AST-equivalence at function-body level + reviewer rubric | Caller has working code; wants Google-style docstring without behavior change (DocAgent arXiv:2504.08725). |
+
+Decision shortcut:
+- Got a **spec only** → `code_writing` / `code_with_tests` /
+  `code_reflection` / `self_improving` depending on how much critique
+  / persistence is needed.
+- Got **broken code + a trace** → `iterative_bug_fix`.
+- Got **bare code, want docs** → `code_documentation`.
+- Got **code + a test, want exec proof** → `code_verification`.
+
+All six (post-NW1, NW2) are concrete `SubworkflowStep` subclasses,
+manifest-listed (CW01–CW13), and each ships with a real-Ollama
+integration test under `tests/integration/test_*_against_ollama.py`.
+
+### Closed-class authoring (2026-05-12) — applies to all 3 paths
+
+When authoring a NEW workflow (whether via hand-authored YAML,
+`Workflow.from_skeleton`, or the lightweight `WorkflowBuilder`), the
+rule is: **do not modify an existing library class to make your
+workflow work.** If you need behavior the existing class doesn't
+provide, author a NEW Python class in a NEW file and reference it
+from your workflow.
+
+Concrete consequences per path:
+
+1. **Hand-authored YAML** — `class:` strings point at existing or
+   NEW Python class paths. Never edit `composition/steps/*.py` (or
+   any other shared step file) to add a parameter that only your
+   workflow needs. Author `your_workflow/your_step.py` with a new
+   class and point at that.
+
+2. **`Workflow.from_skeleton`** — skeleton holes accept class paths
+   via bindings. The closed-class rule applies to the binding
+   targets: bind to existing classes verbatim or to NEW classes
+   you authored alongside your skeleton. Never bind to a "patched
+   fork" of an existing library class.
+
+3. **Lightweight `WorkflowBuilder`** — `.add_step(name, step_cls,
+   config=...)` accepts a class object. Pass the existing class as
+   imported, or pass a NEW class you defined. Do not monkey-patch
+   the imported class's methods before passing it; the framework
+   treats the class object as a stable identity.
+
+Why this rule is load-bearing for adoption: every existing workflow
+keeps working only if shared classes stay stable. The "I'll just
+edit `CodeWriteStep.process` to take one extra kwarg" path silently
+breaks 6 other code-writing workflows (5 nested code-writing + 1
+self-improving) and 13 manifest entries. The cost of inventing a new
+class is small (one file, one YAML reference); the cost of mutating
+a shared class is unbounded breakage across the consumer surface.
+
+Pinned by `tests/unit/test_closed_class_rule_pinned_in_prompts.py`
+(8 assertions, marker + remedy stem in 7 authoring-side prompts).
+
+### Reuse-first authoring (2026-05-12) — applies to all 3 paths
+
+Companion to closed-class. Before authoring NEW code in ANY of the
+three workflow construction paths, check whether existing
+capabilities already cover the task. Strict priority order:
+
+1. **Existing library component** → cheapest. Reviewable on sight, no
+   T13b sandbox gate, no novel-Python HITL review.
+2. **Composition of existing components via DirectLink** → two
+   library components stitched is still 100% library-grade.
+3. **Existing sub-workflow step** (``CodeReflectionStep``,
+   ``CodeVerificationStep``, ``CodeWithTestsStep``,
+   ``SynthesisContextAssemblyStep``, etc.) → encapsulates common
+   topologies so callers do not redeclare them.
+4. **Existing skeleton via ``Workflow.from_skeleton``** → use when
+   topology is reusable but steps differ by domain.
+5. **Novel Python step** → last resort. Justify with a one-line
+   rationale comment; goes through HITL + T13b.
+
+Per-path consequences:
+
+| Path | Reuse-first practice |
+|---|---|
+| Hand-authored YAML | Search the manifest before authoring a new step file. |
+| `Workflow.from_skeleton` | Bind to existing classes; skeleton is the reuse vehicle. |
+| `WorkflowBuilder.add_step` | Import existing step class; only define new class when no candidate fits. |
+
+Inside a code-writing prompt context (the `CodeWriteStep` family,
+not workflow composition): reuse means stdlib over hand-rolled —
+`sum`/`max`/`Counter`/`itertools.groupby`/`pytest.raises` etc.
+The reviewer prompt explicitly flags re-implementations.
+
+Framework-native enforcement consumer:
+`CompositionSummary.reuse_ratio` (composer_schemas.py) — derived
+from `steps_reused / (steps_reused + steps_generated)`. The
+`is_reuse_dominated(threshold=0.8)` predicate is the default-policy
+adoption check. Used by telemetry + the composer reviewer prompt.
+
+Pinned by `tests/unit/test_reuse_first_rule_pinned_in_prompts.py`
+(9 assertions, marker + concrete-target list in 8 prompts) and
+`tests/unit/test_composition_summary_reuse_ratio.py` (9 assertions
+on the derived field's correctness + frozen-dataclass invariant).
+
+### Supervisor onboarding (2026-05-12)
+
+A new supervisor of LLM-authored apecx work should start at
+`docs/supervisor_handbook.md`. The handbook covers scope (what
+supervision IS / IS NOT), a day-one checklist, drift patterns
+D1-D8 observed in real sessions, the rules currently shipped
+(closed-class, reuse-first, plus framework-level gates), signals to
+monitor, termination conditions, and the session-end distillation
+policy. It is pinned by
+`tests/unit/test_supervisor_handbook_pinned.py` against silent
+section removal.
+
+### Rule-authoring asymmetry (2026-05-12, CW-CO1)
+
+When authoring an LLM-facing rule:
+
+* The **prompt** carries imperatives + remedies only ("DO X, DO NOT Y, when X fails do Z").
+* The **human-facing docs** (CLAUDE.md, this SKILL) carry rationale ("why this is non-negotiable", adoption signal).
+
+Mixing rationale into the prompt costs tokens without changing LLM
+behavior — measured 1.18 KB of "why this is non-negotiable" prose
+trimmed from `system.md` (CLOSED-CLASS + REUSE-FIRST blocks) had
+zero effect on T01 AC1 in a real-Ollama check.
+
+The composer enforces a prompt-budget cap at load time via
+`composer_schemas.PromptBudget` + `Composer._enforce_prompt_budgets`.
+Defaults: soft cap 14 KB (warn), hard cap 16 KB (FAIL-FAST raise).
+Operators override via `composer_config.yml` (`prompt_soft_cap_kb`,
+`prompt_hard_cap_kb`) when shipping with a larger model. A
+regression test (`tests/unit/test_prompt_budget.py::test_current_system_md_is_within_soft_cap_regression`)
+fails a future PR that pushes system.md past 14 KB before merge.

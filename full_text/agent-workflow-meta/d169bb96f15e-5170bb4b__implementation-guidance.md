@@ -1,0 +1,703 @@
+---
+name: implementation-guidance
+description: |
+  Guide implementation execution with plan-driven task lists, subagent delegation, deviation tracking,
+  and commit discipline. Use when transitioning from planning to implementation phase.
+  Trigger phrases: "let's implement", "start implementing", "ready to build", "execute the plan",
+  "build it", "start coding", "implement the plan".
+---
+
+# Implementation Guidance
+
+You are guiding the implementation phase of a feature development lifecycle. Implementation should be mechanical — the plan defines what to build, your job is to execute it faithfully, track what actually happened, and document deviations.
+
+## Architectural Commitment: Functional Core, Imperative Shell
+
+The plugin commits to a **functional core, imperative shell** architecture for all features (see [`CLAUDE.md`](../../CLAUDE.md) Key Principles). Pure-core code takes values in and returns values out — no I/O, no time, no randomness, no mutable shared state. Shell code performs I/O and calls into the core. Some features are genuinely shell-only by nature (thin CRUD, glue, integration wrappers) — those declare so in the plan with a rationale, and the rules below apply with the shell-only carve-outs noted.
+
+Implementation enforces this commitment three ways:
+
+1. **Tasks carry a core/shell classification** (set during materialization). Pure-core tasks must not introduce I/O. Shell tasks must keep substantive logic in the core they call. Tasks in shell-only plans only have shell rules to enforce.
+2. **"Needing a mock to test pure-core logic" is a deviation trigger.** It signals the plan's core/shell boundary is wrong. Do not add the mock — log the deviation and surface it. Mocks of internal modules in shell integration tests are acceptable when the real collaborator is external, expensive (real money per invocation), non-deterministic in ways you can't control, or absent in test — each such mock must be named with its justification.
+3. **Sub-agent prompts carry the rules** so any code-writing agent knows to prefer extracting a pure core over adding a mock when the mock would cover pure logic, and knows which mocks are acceptable in shell tests.
+
+---
+
+## CRITICAL: Execute From Plan
+
+**ALWAYS start from a specific plan.** Never begin implementation without one.
+
+### Before Writing Any Code:
+
+1. **Read the specified plan** — the single source of truth
+2. **Verify task docs exist** — check `plans/<plan>/tasks/` for `.md` files. If missing: BLOCK. "No task docs found. Task documents must be materialized by materialize-tasks before implementation can begin."
+3. **Validate task docs match plan** — compare task doc count and task numbers against the plan's `## Task Breakdown` sections. Mismatches: BLOCK with details.
+4. **Read prerequisites** — research docs, Driver context, or materials referenced in the plan's Context or Architecture Fit section
+5. **Pre-flight** — Step 2 runs environment checks before execution begins
+6. **Tell the user** — "Found N task docs matching the plan. Starting with Task 1."
+
+If the user says "implement" without specifying a plan, list available plans and ask which one.
+
+---
+
+## Implementation Defaults
+
+Implementation builds only what the plan specifies. Nothing more.
+
+**Core principles** (always apply):
+- **Only what's in the plan** — No bonus features, no "while I'm here" improvements
+- **No hypothetical futures** — Build for now, not for imagined requirements
+- **No mocks of pure-core logic** — If a test needs to mock to exercise pure-core logic, stop. The boundary in the plan is wrong. Log a deviation and surface it; do not paper over the architectural problem with a mock. Mocks of internal modules in shell integration tests are acceptable only when the real collaborator is external, expensive, non-deterministic, or absent in test — and each must be named with its justification (typically a comment on the mock or a note in the test docstring).
+
+**Default practices** (override via plan constraints, codebase standards, or project CLAUDE.md):
+- **Three lines over an abstraction** — Prefer inline code over one-time helpers
+- **Validate at boundaries only** — Trust internal code, validate user input
+- **Delete, don't deprecate** — If something is unused, remove it completely
+
+---
+
+## CRITICAL: Track Deviations
+
+**Every task must end with a deviation check.** Plans are hypotheses — implementation reveals what actually works.
+
+After completing each task:
+1. **Compare actual vs. planned** — files touched, approach used
+2. **Note deviations** with category and reasoning
+3. **Update the implementation log**
+
+| Category | Example | Action |
+|----------|---------|--------|
+| **None** | Built exactly as planned | Note "No deviations" |
+| **Minor** | Slightly different method signature | Note it, continue |
+| **Approach change** | Different pattern than planned | Explain why |
+| **Scope change** | More/less work than expected | Note impact on remaining tasks |
+| **Core/shell boundary** | Test would need a mock to exercise pure-core logic; pure-core code needs to perform I/O; shell entry point grew substantive logic that belongs in the core. Does NOT include justified mocks (external / expensive / non-deterministic / absent) in shell integration tests. | Stop, log the boundary problem with what would need to move where, surface it as a high-severity deviation. Do NOT add the mock or entangle the core to "make it work." |
+| **Blocker** | Can't proceed as planned | Stop, explain, ask the user |
+
+For **Approach change**, **Scope change**, or **Core/shell boundary** deviations, also append a decision entry to `DECISIONS.md` capturing the reasoning — what was planned, what changed, what alternatives existed, and why this deviation was the right call. Core/shell boundary deviations should always include what would need to move (which logic to extract, which I/O to push outward) so the user has a concrete fix to evaluate.
+
+#### Entry template
+
+```markdown
+---
+
+### DEC-NNN: <Title>
+
+**Date**: YYYY-MM-DD
+**Phase**: Implementation
+**Trigger**: <what prompted this decision>
+
+**Decision**: <what was decided>
+
+**Alternatives Considered**:
+- <Alt 1>: <why rejected>
+- <Alt 2>: <why rejected>
+
+**Rationale**: <why this choice was made>
+
+**Context**: <links to research docs, plan sections, or external sources>
+```
+
+When appending the first decision entry (replacing the `_No decisions recorded yet._` placeholder), also append a row to `FEATURE_LOG.md`: `| <today> | First decision logged | \`DECISIONS.md\` |`
+
+---
+
+## Commit Discipline
+
+**Commit at every task boundary where tests pass.**
+
+1. One commit per completed task (or batched task group)
+2. Tests must pass — never commit broken state
+3. Follow the project's commit message conventions. If none exist, reference the task — e.g., `"Add webhook handler (Task 2/5)"`
+4. If tests fail, fix before committing
+
+---
+
+## CRITICAL: Verify Before Declaring Complete
+
+**Never claim a task or plan is done without verification.** Premature completion claims waste debugging cycles.
+
+- After completing each task, **run the relevant test suite** before marking it done
+- Before declaring a plan complete, **verify all tasks have passing tests**
+- Do not claim an issue is resolved without **executing a verification command** (test run, build, lint, or manual check)
+- If no automated tests exist, explicitly state what manual verification you performed
+
+---
+
+## CRITICAL: Phase Transitions
+
+**NEVER suggest moving to the next SDLC phase.** After Step 5 bookkeeping, you may suggest the next available plan (informational only). The user controls all phase transitions.
+
+---
+
+## Execution Workflow
+
+### Step 1: Read Task Documents
+
+```
+User specifies plan → Check plans/<plan>/tasks/ → Read all task docs → TaskCreate for each → Read plan for context + verify approval
+```
+
+1. **Check for task docs**: Look for `plans/<plan>/tasks/` directory containing `.md` files
+2. **If task docs exist**: Read each task doc, create `TaskCreate` for each (using `task_number` and `depends_on` from frontmatter). Set up dependencies from `depends_on` fields.
+3. **If no task docs directory, or directory exists but contains zero `.md` files**: BLOCK. "No task docs found at `plans/<plan>/tasks/`. Implementation requires materialized task documents. To proceed: return to planning-guidance to approve the plan, then run `materialize-tasks` to materialize task docs. I cannot start implementation without materialized task docs."
+4. **Check for completed tasks**: If some tasks have `status: complete` in frontmatter, report them and start from the next incomplete task
+5. **Read the plan file** for overall context (Architecture Fit, Constraints) — task docs are for individual task execution
+6. **Verify plan approval** — Read the plan file's YAML frontmatter. If `status` is not `approved`: BLOCK. "Plan '\<plan\>' has not been approved for implementation. Return to planning-guidance and approve the plan first." This check is a process invariant — it cannot be overridden.
+7. **Detect standards artifact**: Search for `## Standards Source` in the feature's research directory. If found, extract the absolute path from the Standards Source table's Path column. Store this for subagent prompt construction.
+
+CRITICAL: Task docs are the execution source of truth. The plan provides strategic context only.
+
+### Step 2: Pre-Flight Validation
+
+Before executing any tasks, run the 5-phase pre-flight validation. Input is the task documents directory (task docs are the primary input; the plan provides context).
+
+**Severity model:** PASS (continue), INFO (notable, continue), WARN (report, user decides), BLOCK (stop, must resolve).
+
+#### Phase 1: Task Document Integrity
+
+Fast checks — no codebase access needed.
+
+- **1.1 Task docs exist** — Read `plans/<plan>/tasks/` directory. Verify task documents exist. If no task docs: BLOCK. If count doesn't match plan: BLOCK with missing task numbers.
+- **1.2 Frontmatter validation** — For each task doc, verify required fields: `type: task`, `status`, `plan` (must match current plan), `task_number`, `depends_on`, `created`, `materialized_at`. Missing fields: WARN. Wrong plan reference: BLOCK.
+- **1.3 Dependency graph validation** — Build dependency graph from `depends_on` fields. Circular dependencies: BLOCK. Missing dependency targets: BLOCK. Ordering violations: WARN.
+- **1.4 Already-completed tasks** — Check for tasks with `status: complete`. Report: "Tasks 1-N are already complete (from prior session). Starting from Task N+1." Verify completed task commits exist in git history; if not: WARN. **Severity:** INFO.
+
+#### Phase 2: Codebase Targeting
+
+Validate the codebase target from task docs' `## Codebase` section.
+
+- **2.1 Codebase root exists** — Read the codebase root path from any task doc. Verify the path exists on disk and is a directory. If not: BLOCK.
+- **2.2 Git repository check** — Verify the codebase root is a git repo: `git -C <root> rev-parse --is-inside-work-tree`. If not: WARN.
+- **2.3 Branch check** — Compare `git -C <root> branch --show-current` against the Feature Branch in the task doc's `## Codebase` section. If the task doc uses a single `**Branch**:` field (legacy format), compare against that. Mismatch: WARN. Detached HEAD: WARN.
+- **2.4 Uncommitted changes** — Run `git -C <root> status --short`. Cross-reference files with uncommitted changes against task doc `## Files` sections. Overlapping files: WARN per file. For session resumption with `in_progress` tasks, cross-reference overlapping files against the `in_progress` task doc's `## Files` section: WARN specifically: "File `<path>` has uncommitted changes from a prior `in_progress` task (\<task doc\>). These may be partial implementation artifacts. Review or discard before restarting this task."
+- **2.5 Codebase table consistency** — Read codebase path info from `plans/00-overview.md` `## Implementation Environment` (or `research/00-overview.md` `## Codebases` if no IE section exists). Compare the task doc's codebase root path against the recorded paths. If paths differ: BLOCK ("Task docs may have been materialized from a different clone"). Also compare the current working directory. If no matching entry found: INFO.
+- **2.6 Worktree readiness** — If the dependency graph has parallelizable tasks (from parallel execution group derivation): (1) **Branch mismatch escalation:** If pre-flight 2.3 detected a branch mismatch (current branch ≠ Feature Branch), escalate from WARN to BLOCK: "Worktree isolation requires the correct Feature Branch. Current branch `<actual>` does not match Feature Branch `<expected>`. Switch to the Feature Branch before running parallel tasks." (2) **Clean working directory:** Verify `git -C <root> status --short --untracked-files=no` shows no uncommitted changes to tracked files. Uncommitted changes: WARN. "Uncommitted changes detected. Worktree isolation requires a clean working directory. Commit or stash changes before parallel execution." (3) **Existing worktrees:** Check `git -C <root> worktree list`. If worktrees other than the main one exist: WARN. "Existing worktrees found. These may conflict with parallel execution."
+
+#### Phase 3: Staleness Detection
+
+Determine if task docs are still fresh relative to the codebase.
+
+- **3.1 Materialization age** — Compare `materialized_at` against current time. < 24 hours: PASS. >= 24 hours: WARN (triggers enhanced 3.2 and 3.3). Missing timestamp: WARN.
+- **3.2 Codebase changes since materialization** — If stale or session resumption: `git -C <root> log --oneline --since="<materialized_at>" -- <files from all task docs>`. Changes detected: WARN per file.
+- **3.3 Interface drift check** — For stale task docs, verify key interfaces referenced in tasks still match local signatures. Mismatch: WARN.
+- **3.4 Upstream plan completion check** — Read the current plan's `depends_on` frontmatter (or `plans/00-overview.md` dependency graph). For each upstream plan, check for `## Implementation Status: COMPLETE`. If found, compare the upstream plan's bookkeeping commit date (`git log --format=%aI -1 -- plans/<upstream>.md`) against task doc `materialized_at`. If upstream was committed after materialization: BLOCK: "Upstream plan '\<name\>' was implemented after tasks were materialized. Re-materialize to pick up changes."
+
+#### Phase 4: Environment Readiness
+
+Existing checks, adapted to read from task docs.
+
+- **4.1 Required tools** — Scan task docs for tool references (test runners, build tools, linters). Check accessibility. Missing: BLOCK.
+- **4.2 Environment variables** — Scan task docs and plan constraints for env var references. Missing: WARN.
+- **4.3 Test baseline** — Run the test suite from the codebase root. Test command comes from: task doc `## Codebase` section (if it includes a test command) → plan overview Implementation Environment → task doc constraints → plan constraints → codebase CLAUDE.md → common defaults. Tests fail: BLOCK. No test command found: WARN.
+- **4.4 Referenced file paths** — For each task doc, verify every file in `## Files` exists (resolved as `<codebase_root>/<relative_path>`). File missing + task says modify: BLOCK. File missing + task says create: OK. File exists + task says create: WARN.
+- **4.5 Interface verification** — For task docs that reference modifying specific functions/classes, read the local file and verify the current signature. Runs unconditionally (not just when stale). Mismatch: WARN. Additionally, if the task doc contains an inline snippet (`#### Snippet:`) for a modified callable, diff the snippet's signature against the local file directly — this catches signature drift that the plan-level check may have missed. Mismatch: WARN.
+
+#### Phase 5: Standards Readiness
+
+- **5.1 Standards path resolves** — If task docs reference a standards file path in `## Code Quality Standards`, verify it exists. Missing: WARN.
+- **5.2 Standards content unchanged** — If stale, compare standards file last-modified time against `materialized_at`. Standards updated after materialization: WARN.
+
+#### Check Summary
+
+- **Blocking checks** (9 total): 1.1, 1.2 (plan mismatch), 1.3 (circular deps), 2.1, 2.5, 3.4, 4.1, 4.3, 4.4 (modify files)
+- **Warning checks** (11 total): 2.2, 2.3, 2.4, 2.6, 3.1, 3.2, 3.3, 4.2, 4.5, 5.1, 5.2
+- **Info checks** (1 total): 1.4
+
+#### Pre-Flight Report Format
+
+```
+## Pre-Flight Report
+
+**Plan:** <plan-name>
+**Task docs:** N found (M complete, K pending)
+**Codebase:** <name> at <root>
+**Feature Branch:** <feature-branch> (matches task docs / WARN: mismatch)
+**Materialized:** <timestamp> (<age> — fresh / stale)
+
+### Checks
+
+| Phase | Check | Result | Details |
+|-------|-------|--------|---------|
+| Integrity | Task docs exist | PASS | N/N found |
+| Integrity | Frontmatter valid | PASS | All fields present |
+| Integrity | Dependency graph | PASS | No circular deps |
+| Integrity | Completed tasks | INFO | Tasks 1-3 complete |
+| Targeting | Codebase root | PASS | Path exists, is git repo |
+| Targeting | Feature Branch | PASS | On <feature-branch> |
+| Targeting | Uncommitted changes | WARN | 1 file overlaps |
+| Targeting | Codebase table | PASS | Task doc root and working directory match Codebases entry |
+| Staleness | Age | PASS | < 24 hours |
+| Environment | Tools | PASS | pytest, black found |
+| Environment | Test baseline | PASS | N tests passing |
+| Environment | Referenced paths | PASS | All files resolved |
+| Environment | Interfaces | PASS | Signatures match |
+| Standards | Path resolves | PASS | CLAUDE.md found |
+| Standards | Content unchanged | PASS | No changes |
+
+### Warnings
+<numbered list, or "None">
+
+### Blockers
+<numbered list, or "None">
+
+**Proceed with implementation?**
+```
+
+#### Session Resumption Variant
+
+When resuming (detected by finding task docs with `status: complete` or `status: in_progress`):
+1. **Always run staleness checks** (Phase 3) regardless of age — session gap means codebase may have changed
+2. **Verify completed task commits** (1.4) — confirm prior work is still in git history
+3. **Re-run test baseline** (4.3) — confirm tests still pass after prior session's changes
+4. **Report starting point:** "Resuming from Task N. Tasks 1-(N-1) complete in prior session."
+5. **In-progress tasks from crashed sessions**: Treat `status: in_progress` as incomplete — restart the task
+
+#### After Pre-Flight
+
+- **All PASS, no WARN:** Proceed automatically. "Pre-flight passed. Starting Task 1."
+- **PASS with WARN:** Report and ask. "Pre-flight found N warnings. [details]. Proceed?"
+- **Any BLOCK:** Stop. "Pre-flight found N blockers. [details]. Resolve before proceeding."
+
+If user proceeds despite warnings, note in implementation log: "Pre-flight warnings acknowledged by user: [list]."
+
+This is a gate — the user decides whether to proceed, skip, or fix issues first.
+
+### Step 3: Execute Each Task
+
+For each task:
+
+1. **Update task doc frontmatter** — Set `status: in_progress`, `updated: <today>`
+2. **Read the task doc** — All execution context is embedded (Codebase, Goal, Files, Tests, Constraints, Standards, Instructions)
+3. **Execute** — Spawn subagent with task doc content or do directly (see below)
+4. **Review the result** — Verify it matches the task doc's Goal
+5. **Run tests** — Verify nothing is broken
+6. **Track deviations** — Compare actual vs. task doc spec
+7. **Commit** — If tests pass
+8. **Update implementation log** — Write to `implementation/log-<plan>.md`, referencing task doc path: `plans/<plan>/tasks/NN-name.md`
+9. **Update task doc frontmatter** — Set `status: complete`, `updated: <today>`
+
+The in-memory TaskList (if created via TaskCreate) should also be updated for session display, but the task doc frontmatter is the persistent source of truth.
+
+#### When to Spawn a Subagent vs. Do It Directly
+
+**Spawn a subagent** for tasks that involve:
+- Writing new files with substantial code
+- Multi-file changes that need coordinated context
+- Complex implementation requiring plan + research context
+
+**Do it directly** for tasks that are:
+- Simple edits (config changes, manifest updates, renaming)
+- Read-only (audits, searches, verification)
+- Single-file modifications where you already have context
+
+#### Task Batching
+
+Adjacent tasks that are tightly coupled should be batched into a single subagent call:
+- Test + implementation pairs: "Write tests for X" + "Implement X" → one subagent call
+- Small related tasks: "Create config" + "Update manifest" + "Register route" → one call
+
+**For batched tasks**: Construct the sub-agent prompt with multiple `## Task` sections, one per task doc. Header: "Implement the following N tasks." Each task gets its own Goal/Files/Tests/Constraints block extracted from its task doc. Shared Codebase and Standards sections appear once (identical across tasks in the same plan). Update ALL batched task doc frontmatters to `in_progress` before execution and `complete` after. Log all batched tasks in one implementation log entry with all task doc paths.
+
+Batching reduces subagent overhead and gives the subagent better context. Only batch tasks that are sequential and closely related — don't batch independent work.
+
+#### Parallel Execution Groups
+
+Before executing tasks, analyze the `depends_on` DAG to identify parallelizable work:
+
+1. Build the dependency graph from all task doc frontmatter `depends_on` fields
+2. Identify tasks with no unresolved dependencies (all dependencies either complete or absent)
+3. Among those, identify tasks that are mutually independent (no task depends on another in the group) AND whose `## Files` sections have no overlapping file paths. Tasks with overlapping files must be ordered sequentially even if the DAG allows parallelism — parallel worktree modifications to the same file will always conflict on merge. When multiple tasks overlap, keep the lowest-numbered overlapping task in the parallel group and defer higher-numbered overlapping tasks to subsequent groups (they'll be re-evaluated after the current group completes).
+4. These form a **parallel execution group** (max 4 concurrent worktree agents — split larger groups into sub-groups of up to 4, executed sequentially between sub-groups. The user can override this default.)
+5. Report to user: "Tasks N, M, P have no mutual dependencies — running in parallel with worktree isolation."
+6. After the group completes and merges, re-evaluate: the next set of unblocked tasks forms the next group
+7. Continue until all tasks are complete
+
+**Mandatory worktree isolation:** For tasks in a parallel group, ALWAYS spawn a subagent with `isolation: "worktree"` regardless of task complexity. The existing "do it directly for simple edits" guidance does NOT apply to parallel tasks — main-repo modifications would break isolation for concurrent worktree agents.
+
+**Skip worktrees when:**
+- The plan has only 1 task remaining
+- All remaining tasks form a linear dependency chain (no parallelism possible)
+- The user explicitly requests sequential execution
+- Tasks are candidates for batching (sequential and closely related per the Task Batching subsection) — batching takes precedence over parallelization even if `depends_on` fields allow parallelism
+
+**Dependency-respecting execution order example:**
+```
+Tasks: 1(none), 2(none), 3(deps:1), 4(deps:1,2), 5(deps:3)
+Group 1: [1, 2] — parallel (worktree isolation)
+Group 2: [3, 4] — parallel (both unblocked after Group 1 completes)
+Group 3: [5] — sequential (depends on 3)
+```
+
+**For each task in a parallel group:**
+1. Spawn the subagent with `isolation: "worktree"` — Claude Code creates a temporary git worktree automatically
+2. The subagent's prompt is the same as the standard template, but the worktree may have a different root path. The subagent should use its working directory (the worktree) as the codebase root.
+3. The subagent commits its changes within the worktree before returning
+
+**Items 1-9 mapping for parallel groups:** The standard per-task items are reorganized:
+- **Before spawning:** Set all tasks in the group to `status: in_progress` (item 1) — this happens before agents run, so it doesn't violate the modification guard.
+- **During execution (within each worktree subagent):** Items 2 (read task doc), 3 (execute), 5 (run tests), and 7 (commit) happen inside the subagent.
+- **After merge-back:** Item 4 (review result), 6 (track deviations), and 8 (update log) are processed for all group tasks together. Item 9 (set `status: complete`) is done per-task after each successful merge.
+
+**Merge-Back Procedure:** After all parallel subagents complete, merge worktree branches one at a time:
+
+1. `git merge <worktreeBranch>` — merge into current (Feature) branch
+2. If merge succeeds: clean up with `git worktree remove <worktreePath>` and `git branch -d <worktreeBranch>`. Log task as complete.
+3. If merge conflict: **BLOCK**. Do NOT merge remaining worktrees until resolved. Report: "Merge conflict from parallel task N. Conflicting files: X, Y. Remaining unmerged worktrees: worktree-task-M, worktree-task-P. Resolve conflicts manually, then continue with remaining merges." Store merge state in the implementation log. On re-invocation or after conflict resolution, detect remaining worktrees via `git worktree list` and continue the merge sequence.
+4. If a parallel subagent fails (tests fail, subagent errors, or timeout): skip merge-back for that task — do NOT merge its worktree. Clean up with `git worktree remove --force <worktreePath>` and `git branch -D <worktreeBranch>`. Mark task as failed in the implementation log. Continue merging other successful tasks. WARN: "Task N failed in worktree — skipping merge. Review output and re-run sequentially." If the subagent result does not include worktree fields (crash/timeout), check `git worktree list` for orphaned worktrees and clean up any found.
+5. If worktree creation itself fails: fall back to sequential execution for that task. WARN: "Worktree creation failed for Task N — falling back to sequential execution."
+6. After all merges complete, run the test suite to verify the combined changes work together. If post-merge tests fail: report failing tests and let the user decide how to proceed.
+
+**Worktree subagent prompt overrides:**
+1. **Root path:** Replace `**Root**: <absolute path>` with `**Root**: (worktree — use your current working directory)`
+2. **cd/branch instruction:** Replace instruction 1 with: "Your current working directory IS the codebase root (worktree isolation). Do NOT change to any other directory and do NOT change branches."
+3. **Test command:** Strip any `cd <path> &&` prefix from test commands — the worktree is already at the codebase root.
+4. **Branch annotation:** `**Feature Branch**: <value> (informational — do not run git checkout)`. `**Base Branch**: <value> (informational — merge target and Driver MCP context branch)`.
+5. **Commit instruction:** Add: "Commit your changes within the worktree before reporting."
+6. **Emergent files:** Add: "If you create files not listed in `## Files`, prefer unique names or paths to minimize merge conflicts with other parallel tasks."
+7. Goal, Files, Tests, Constraints, Context, Standards sections are copied unchanged from the task doc.
+
+**Main-repo modification guard:** Do NOT modify any files in the main working directory while worktree agents are running. Defer all bookkeeping, log updates, and task doc status changes until after all merges and post-merge tests complete.
+
+**For sequential tasks (with dependencies):** Continue using the existing subagent spawning without `isolation: "worktree"`. The main working directory is used directly.
+
+### Step 4: Summarize
+
+After all tasks are complete:
+1. Write a final summary in the implementation log
+2. List all deviations across tasks
+3. Note any follow-up work identified during implementation
+
+### Step 5: Review Deviations and Bookkeeping
+
+After the summary, present deviations for user review before proceeding with bookkeeping.
+
+#### 5.0: Review Deviations
+
+Present the deviation summary from the implementation log. For each deviation, the user should understand what changed and why.
+
+> "Implementation complete. Here are the deviations from the plan: ..."
+> "Are these acceptable, or would you like to go back and address any of them?"
+
+- **If the user wants changes** → return to Step 3 for rework on specific tasks
+- **If the user approves** → proceed to bookkeeping (5.1+)
+
+**After approval, execute steps 5.1 through 5.5 automatically without pausing for acknowledgment.** These are mechanical bookkeeping steps — plan status, overview update, cascade check, commit, and transition suggestion. Only pause if cascade-check (5.3) surfaces design-impact decisions requiring user input.
+
+**If no overview file exists at `plans/00-overview.md`, skip steps 5.2, 5.3, and 5.5.**
+
+#### 5.1: Update Plan Status
+
+Write a status header at the TOP of the plan file (before `## Context`):
+
+```markdown
+## Implementation Status: COMPLETE
+
+**Feature Branch:** `<from log>`
+**Implementation log:** `implementation/log-<plan>.md`
+**Tests:** <test count> passing
+**Commits:** <count> on branch
+
+| Commit | Tasks | Description |
+|--------|-------|-------------|
+| `<hash>` | <task range> | <commit message> |
+
+### Deviations from Plan
+<numbered list from log, or "None">
+```
+
+Follow this format exactly. Then mark all `- [ ]` checkboxes as `- [x]` under both `## Acceptance Criteria` and `## Test Strategy`.
+
+#### 5.2: Update Overview Progress Table
+
+If `plans/00-overview.md` exists:
+1. Find the progress table row matching this plan
+2. Update: Status → `COMPLETE`, Tests → count, Key Artifact → one-line summary from log
+3. If no row exists, add one at the correct position
+
+#### 5.3: Cascade Check
+
+**Verify upstream commits:** Before spawning cascade-check, verify upstream plan commits exist in the local git history. Read the implementation log for commit hashes. For each commit listed, run `git -C <codebase-root> rev-parse --verify <hash>^{commit}`. If any commit is not found: WARN. "Upstream commit `<hash>` from `<task>` not found in local git history. This may indicate implementation happened in a different clone. Proceed with cascade-check anyway?"
+
+Spawn the [cascade-check](../../agents/cascade-check.md) agent with:
+- Implementation log path
+- Overview path
+- Downstream plan paths (from overview's dependency graph)
+
+The agent reads all files, classifies each deviation as informational or design-impact, writes informational cascades to the overview's "Gaps to Address" section, and returns results.
+
+If the agent reports design decisions needed, present each to the user with options. Otherwise report: "Cascade check complete. N gaps added to overview." (or "No cascading needed.")
+
+#### 5.4: Commit Bookkeeping
+
+```
+git add plans/<plan>.md plans/00-overview.md
+```
+
+Also stage task doc status changes:
+```
+git add plans/<plan>/tasks/*.md
+```
+
+Stage implementation log and feature log:
+
+```
+git add implementation/log-<plan>.md FEATURE_LOG.md 2>/dev/null
+```
+
+```
+git commit -m "chore: Bookkeeping complete — plan <name>"
+```
+
+#### 5.5: Transition Suggestion
+
+Use the overview's progress table and dependency graph to identify the next unblocked plan:
+- "Next unblocked plan is X. It has [a plan document / no plan document yet]."
+- Multiple unblocked: "Two plans are unblocked: X and Y."
+- None unblocked: "All dependencies for remaining plans are not yet complete."
+- All complete: "All plans complete. Run `/drvr:assess` to curate the test suite before handoff."
+
+This is informational — the user decides what to do.
+
+---
+
+## Subagent Task Prompts
+
+When spawning subagents, construct prompts from task document content:
+
+```
+Implement the following task.
+
+## Codebase
+**Root**: <from task doc ## Codebase section>
+**Base Branch**: <value> (merge target / Driver MCP context branch — for reference only, implementation targets Feature Branch)
+**Feature Branch**: <from task doc ## Codebase section>
+
+All file paths are relative to the codebase root.
+Change directory to the codebase root before starting work.
+Do NOT navigate to or modify files outside this directory.
+
+## Architectural Commitment: Functional Core, Imperative Shell
+This codebase commits to a functional core / imperative shell architecture. Pure-core code takes values in and returns values out — no I/O, no time, no randomness, no mutable shared state. Shell code performs I/O and calls into the core. Some plans are declared shell-only (thin CRUD, glue, integration wrapper); in that case the shell-only rules apply.
+
+**This task is classified as**: <core | shell | both> (from task doc ## Core/Shell section)
+
+**Rules for this task:**
+- If your task is **core**: do not introduce I/O, time, randomness, or mutable shared state. If the task requires any of these, stop and report — the plan's boundary is wrong, not your job to paper over.
+- If your task is **shell**: keep substantive logic out of the shell. The shell should receive I/O input, call into pure-core functions, and emit I/O output. If you find yourself writing branching, calculation, or state machinery in the shell, extract it into the core first. **Exception**: if the plan is declared shell-only, routing/dispatch branching IS the feature — that's expected, not a violation.
+- **Do not mock to test pure-core logic** — that's a boundary failure. Stop and report it.
+- **Mocks of internal modules in shell integration tests are acceptable** only when the real collaborator is external (third-party with no sandbox), expensive (real money per invocation), non-deterministic in ways you can't control (real wall-clock for timing-sensitive tests where you can't inject a fake), or absent in the test environment. Each such mock must be named with its justification — a comment on the mock or a note in the test docstring. Mocking just because "the real thing is slow" or "I don't want to set up the DB" is not acceptable.
+
+## Task: <name from task doc>
+**Goal**: <from task doc>
+**Files**: <from task doc>
+**Tests**: <from task doc>
+**Constraints**: <from task doc>
+
+## Code Quality Standards
+<from task doc — key rules + source path>
+
+## Context
+- Plan: <from task doc ## Context section>
+- Prerequisites: <from task doc ## Context section>
+
+## Instructions
+1. Change directory to the codebase root above
+2. Read the plan file for full architectural context, including the Core/Shell Decomposition in Architecture Fit
+3. Read the code quality standards document at the source path above
+4. Implement exactly what's specified in the Goal — no extras
+5. Respect the core/shell rules above. If your code would violate them, stop and report instead of working around.
+6. Verify your code follows the listed standards rules
+7. Run tests after implementation. Tests must not mock to exercise pure-core logic. Mocks of internal modules in shell integration tests are acceptable only when justified (external / expensive / non-deterministic / absent) — and each must carry a comment naming the justification.
+8. Report: what you built, files touched, any deviations from the spec (especially core/shell boundary deviations), and any standards compliance concerns
+```
+
+Include the full task spec — don't summarize. Copy constraints verbatim.
+
+**Data flow:** Implementation-guidance reads task docs to construct the prompt. Task docs already have embedded context (codebase root, standards, file paths), so the prompt is a direct extraction — not ad-hoc assembly from multiple sources.
+
+**Code Quality Standards section:** Include this section only if the task doc has a `## Code Quality Standards` section. If the task doc has no Code Quality Standards section (because no standards artifact existed during materialization), omit it from the prompt AND use this shorter Instructions list:
+1. Change directory to the codebase root above
+2. Read the plan file for full architectural context, including the Core/Shell Decomposition in Architecture Fit
+3. Implement exactly what's specified in the Goal — no extras
+4. Respect the core/shell rules above. If your code would violate them, stop and report instead of working around.
+5. Run tests after implementation. Tests must not mock to exercise pure-core logic. Mocks of internal modules in shell integration tests are acceptable only when justified (external / expensive / non-deterministic / absent) — and each must carry a comment naming the justification.
+6. Report: what you built, files touched, and any deviations from the spec (especially core/shell boundary deviations)
+
+The longer Instructions list (with items about reading standards and verifying compliance) is only used when the Code Quality Standards section is present. The core/shell instructions are present in both variants.
+
+**Standards detection (Step 1):** In Step 1 (Read Task Documents), after reading the plan, search for a codebase standards artifact in the feature's research directory (search for `## Standards Source`). If found, extract the absolute path from the Standards Source table's Path column. This path is used to verify standards availability during pre-flight (Phase 5). Task docs already embed key rules and the source path — the subagent reads the authoritative, current version at that path.
+
+**Batched task prompts:** For batched tasks, use this structure:
+```
+Implement the following N tasks.
+
+## Codebase
+<shared — from any task doc>
+
+## Task 1: <name>
+**Goal**: ...
+**Files**: ...
+**Tests**: ...
+**Constraints**: ...
+
+## Task 2: <name>
+**Goal**: ...
+**Files**: ...
+**Tests**: ...
+**Constraints**: ...
+
+## Code Quality Standards
+<shared — from any task doc>
+
+## Context
+<shared — from any task doc>
+
+## Instructions
+<same as single-task, applies to all tasks>
+```
+
+---
+
+## Implementation Log Format
+
+Write to `implementation/log-<plan>.md` (e.g., `implementation/log-01a.md`).
+
+```markdown
+# Implementation Log: <Plan Name>
+
+**Plan:** `plans/<plan>.md`
+**Feature Branch:** `<branch-name>`
+**Started:** <date>
+
+---
+
+## Task 1: <name>
+
+**Task doc:** `plans/<plan>/tasks/NN-name.md`
+**Status:** Complete
+**Execution:** parallel group N, worktree isolation | sequential (main working directory)
+**Commit:** `<hash>` — <message>
+
+**Planned:**
+- <what the plan said>
+
+**Actual:**
+- <what was done>
+
+**Deviations:**
+- <differences, or "None">
+
+---
+
+## Summary
+
+**Tasks completed:** N/N
+**Total commits:** N
+
+| Commit | Tasks | Description | Execution |
+|--------|-------|-------------|-----------|
+| `<hash>` | <range> | <message> | parallel group N, worktree | sequential |
+
+**Total deviations:** N
+**Follow-up work identified:** ...
+**Key learnings:** ...
+```
+
+---
+
+## Cross-Session Continuity
+
+Implementation often spans multiple sessions. Two artifacts persist across sessions:
+
+1. **Implementation log** (`implementation/log-<plan>.md`) — what was done, deviations, commit hashes
+2. **Task documents** (`plans/<plan>/tasks/*.md`) — frontmatter `status` field tracks completion
+
+TaskList (from TaskCreate) does NOT persist across sessions — it's session-only display state.
+
+### Starting a New Session Mid-Implementation
+
+1. **Read the implementation log** — it tells you what's done, what's next, and what deviated
+2. **Read task documents** — check `status` field in each task doc frontmatter. Completed tasks have `status: complete`. No need to reconstruct completion state.
+3. **Read the plan** — refresh on overall context (Architecture Fit, Constraints)
+4. **Identify next incomplete task** — first task doc where `status` is not `complete`
+5. **Recreate TaskList** if needed (for session display only)
+6. **Run pre-flight session resumption variant** — always run staleness checks (Phase 3), verify completed task commits, re-run test baseline
+7. **Continue from the next incomplete task**
+
+Task docs are the persistent source of truth for task state. The implementation log is the persistent source of truth for what actually happened (deviations, commits, learnings).
+
+---
+
+## Anti-Patterns
+
+**Don't:**
+- Mock to test pure-core logic — that's a boundary failure, log a core/shell deviation instead
+- Add mocks of internal modules without a justification fitting the Mocking Rules (external / expensive / non-deterministic / absent) — log a deviation
+- Introduce I/O, time, or randomness into a pure-core task — stop and report
+- Let substantive logic accumulate in a shell entry point — extract it into the core (routing/dispatch in shell-only plans is fine)
+- Start coding without reading the plan and task docs (including the Core/Shell Decomposition)
+- Extract tasks from the plan inline — read task docs from `plans/<plan>/tasks/`
+- Spawn sub-agents without the codebase root path from the task doc
+- Spawn sub-agents without the functional-core / imperative-shell instructions in the prompt
+- Skip pre-flight staleness checks when resuming from a prior session
+- Skip deviation tracking
+- Commit broken state
+- Implement things not in the plan ("while I'm here...")
+- Move to the next task with unresolved issues
+- Suggest moving to the next SDLC phase
+- Skip post-implementation bookkeeping
+- Mix bookkeeping commits with implementation commits
+- Omit the Code Quality Standards section from subagent prompts when a standards artifact exists
+
+**Do:**
+- Treat "needing a mock for an internal module" as a stop-and-surface signal — that's the plugin's strongest deviation indicator
+- Prefer extracting a pure core over adding a mock, even if extraction is more work
+- Read task docs as the execution source of truth, including the Core/Shell classification
+- Read the plan and task doc before every task
+- Update task doc status (`in_progress`, `complete`) during execution
+- Run the full 5-phase pre-flight before executing any task
+- Track deviations for every task, even "None"
+- Commit at task boundaries
+- Batch tightly coupled tasks for subagent efficiency
+- Do simple tasks directly, spawn subagents for complex ones
+- Write to the implementation log as you go
+- Run Step 5 bookkeeping after all tasks complete
+- Suggest next unblocked plan (informational only)
+- Include codebase standards AND the functional-core / imperative-shell instructions in subagent prompts — the subagent is the actor writing code and must know both the quality bar and the architectural commitment
+
+---
+
+## Related
+
+- Previous phase: [planning-guidance](../planning-guidance/SKILL.md) → [/drvr:dry-run-plan](../../commands/dry-run-plan.md)
+- Context gathering: [driver-task-context](../../agents/driver-task-context.md)
+- Cascade check: [cascade-check](../../agents/cascade-check.md)
+- After completion: [sdlc-orchestration](../sdlc-orchestration/SKILL.md)
+- Handoff: [/drvr:docs-artifacts](../../commands/docs-artifacts.md)
+
+---
+
+## Before Responding Checklist
+
+- [ ] **Core/shell rule in sub-agent prompt?** — Does every sub-agent prompt I construct include the Architectural Commitment block and the task's core/shell classification?
+- [ ] **No internal mocks?** — Did any test added during this task mock an internal module? (If yes, stop and log a core/shell boundary deviation.)
+- [ ] **Pure-core task stayed pure?** — If the task was classified `core`, did the implementation avoid introducing I/O, time, or randomness?
+- [ ] **Shell task stayed thin?** — If the task was classified `shell`, did substantive logic stay in the core?
+- [ ] **Read plan?** — Have I read the specific plan the user specified, including the Core/Shell Decomposition in Architecture Fit?
+- [ ] **Task docs read?** — Am I reading from `plans/<plan>/tasks/`, not extracting from the plan?
+- [ ] **Tasks created?** — Is there a task list tracking progress?
+- [ ] **Pre-flight complete?** — Did all 5 phases run with no unresolved BLOCKs?
+- [ ] **Codebase resolved?** — Does the pre-flight report show the correct codebase target?
+- [ ] **Current task in_progress?** — Is the active task marked correctly?
+- [ ] **Task doc status updated?** — Is the current task marked `in_progress`? Are complete tasks marked `complete`?
+- [ ] **Deviations tracked?** — Did I compare actual vs. planned?
+- [ ] **Verified?** — Did I run a verification command before claiming this task is done?
+- [ ] **Tests passing?** — Are tests green before committing?
+- [ ] **Log updated?** — Is `implementation/log-<plan>.md` current?
+- [ ] **Committed?** — Is the completed task committed?
+- [ ] **Bookkeeping done?** — If all tasks complete, did I run Step 5?
+- [ ] **Feature log?** — Did I update `FEATURE_LOG.md` at implementation start and completion?
+- [ ] **Standards in subagent prompt?** — If a codebase standards artifact exists, did I include the Code Quality Standards section in the subagent prompt?
+- [ ] **Decision log?** — For approach-change or scope-change deviations, did I append to DECISIONS.md?
+- [ ] **Artifacts committed?** — Does the bookkeeping commit include FEATURE_LOG.md and implementation log?

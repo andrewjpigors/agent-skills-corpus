@@ -1,0 +1,609 @@
+---
+name: berdl_start
+description: Get started with the BERIL Research Observatory. Use when a user is new, wants orientation, or asks what they can do.
+allowed-tools: Read, Bash
+user-invocable: true
+---
+
+# BERIL Research Observatory - Onboarding
+
+Welcome the user and orient them to the system, then route them to the right context based on their goal.
+
+## Phase 1: System Overview
+
+Present this information directly (no file reads needed):
+
+### What is BERDL?
+
+The **KBase BER Data Lakehouse (BERDL)** is an on-prem Iceberg Lakehouse (Spark SQL) hosting databases across multiple tenants. The exact database inventory and access depend on the authenticated user — discover it live in Phase 1.6 below.
+
+Collections currently span: pangenomes (GTDB-derived species pangenomes with functional annotations and pathway predictions), genome structural data, biochemistry (ModelSEED reactions and compounds), genome-wide fitness (RB-TnSeq), environmental microbiology, multi-omics (NMDC), phage-host data, and marine microbial samples. Always discover the exact set live — do not rely on this prose for current inventory.
+
+### Repo Structure
+
+```
+projects/           # Science projects (each has README.md + notebooks/ + data/)
+docs/               # Shared knowledge base
+  schemas/          # Per-collection table/column docs
+  pitfalls.md       # SQL gotchas, data sparsity, common errors
+  performance.md    # Query strategies for large tables
+  research_ideas.md # Future research directions
+  overview.md       # Scientific context and data generation workflow
+  discoveries.md    # Running log of insights
+.claude/skills/     # Agent skills
+data/               # Shared data extracts reusable across projects
+```
+
+### Available Skills
+
+| Skill | What it does |
+|-------|-------------|
+| `/berdl` | Discover BERDL data with access-aware helpers and query with Spark SQL |
+| `/berdl-query` | Run SQL queries locally with remote Spark compute (CLI tools + notebook support) |
+| `/berdl-minio` | Transfer files between BERDL MinIO and local machine |
+| `/berdl-discover` | Explore and document a new BERDL database |
+| `/literature-review` | Search PubMed, bioRxiv, arXiv, Semantic Scholar, and Google Scholar for relevant biological literature |
+| `/synthesize` | Read analysis outputs, compare against literature, and draft findings |
+| `/submit` | Approve a project and upload it to the lakehouse |
+| `/cts` | Run batch compute jobs on the CTS cluster |
+
+> **Note**: Hypothesis generation, research planning, and notebook creation are handled automatically as part of the **Unified Project Workflow** below. You don't need to invoke them separately.
+
+### Existing Projects
+
+**Look projects up through the knowledge layer, not by hand** — the availability check
+and commands are in **Phase 1.8**. When OpenViking is up, list and search projects with
+`knowledge_query.py ls viking://resources/projects/ --simple` and
+`knowledge_query.py find "<user's topic>"` (these fall back to local search over the
+same corpus when the server is down). Present what you find so the user sees what's
+been done.
+
+Use a bare `ls projects/` only as a quick directory sanity-check or when the knowledge
+layer is `UNREACHABLE` — not as the default way to survey prior work. Reading every
+`projects/*/README.md` by hand is slower and misses the cross-project connections the
+knowledge layer surfaces.
+
+### How Projects Work
+
+Each project lives in `projects/<name>/` with a three-file structure plus supporting directories:
+
+```
+projects/<name>/
+├── README.md            — Project overview, reproduction, authors
+├── RESEARCH_PLAN.md     — Hypothesis, approach, query strategy, revision history
+├── REPORT.md            — Findings, interpretation, supporting evidence
+├── REVIEW.md            — Canonical copy of the approved review (set by /submit)
+├── REVIEW_N.md          — Numbered reviews from /berdl-review (history; latest is canonical at submit time)
+├── SUBMITTED.md         — Marker file written when lakehouse upload succeeds (visible from `ls`)
+├── notebooks/           — Analysis notebooks with saved outputs
+├── data/                — Agent-derived data from queries and analysis
+├── user_data/           — User-provided input data (gene lists, phenotypes, etc.)
+├── figures/             — Key visualizations
+└── requirements.txt     — Python dependencies
+```
+
+**Reproducibility is required**: notebooks must be committed with outputs, figures must be saved to `figures/`, and README must include a `## Reproduction` section. See PROJECT.md for full standards.
+
+---
+
+## Phase 1.5: Environment Detection
+
+Run the canonical environment check:
+
+```bash
+python scripts/berdl_env.py --check
+```
+
+This wraps `scripts/detect_berdl_environment.py` with auto-recovery. It:
+1. Detects on-cluster vs off-cluster by testing connectivity to `spark.berdl.kbase.us:443`.
+2. On-cluster: confirms `KBASE_AUTH_TOKEN`, writes to `.env` if missing, reports ready.
+3. Off-cluster: checks `.env`, `.venv-berdl`, SSH tunnels (1337, 1338), pproxy (8123). Auto-starts pproxy if tunnels are up. Prints exact `ssh -f -N -D ...` commands if tunnels are missing.
+
+**Present the output to the user.** If exit code is non-zero, follow the printed next steps. Common cases:
+- "Start SSH tunnels" → ask the user to run the printed command in a terminal, then re-run `python scripts/berdl_env.py --check`.
+- "pproxy not running" → the helper auto-starts it; this should self-resolve.
+- "Missing .venv-berdl" → `bash scripts/bootstrap_client.sh`.
+- "Missing KBASE_AUTH_TOKEN" → get token from https://narrative.kbase.us/#auth2/account and add to `.env`.
+
+**Route follow-up BERDL queries from the detected location:**
+- `on-cluster`: use the active Spark session and `spark.sql(query)` directly. Do not use `--berdl-proxy`.
+- `off-cluster`: use `/berdl-query` or `python scripts/run_sql.py --berdl-proxy` after the helper reports ready.
+
+**Do not skip this step.** The location reported is what every subsequent skill in this session uses to choose its execution path.
+
+---
+
+## Phase 1.6: Live Inventory
+
+After Phase 1.5 reports ready, print the live database inventory:
+
+```bash
+python scripts/berdl_inventory.py
+```
+
+**Cache-backed (fast on repeat runs).** The first run does a live fetch and caches the result to `data/berdl_inventory_cache.json` (keyed by environment + auth token). Subsequent runs within 7 days serve from that cache in a fraction of a second without touching Spark; past 7 days the script auto-refetches once. The stdout summary and `data/berdl_inventory.md` both carry a freshness banner — **paste that banner verbatim** so the user sees how old the data is (e.g. "Cached 3 days ago …").
+
+If any database fails to list (e.g. a transient auth error), the banner says **partial** and the run is **not cached**, so the next run retries rather than serving a lossy inventory for a week. Relay that banner too — the table counts are undercounted on such a run.
+
+To force a refresh at any time:
+
+```bash
+python scripts/berdl_inventory.py --refresh
+```
+
+This is plain `python` in **both** environments. It auto-detects on-cluster vs off-cluster and picks the right discovery path.
+
+- **On-cluster (JupyterHub):** the JH kernel already has every import. Just run the command above.
+- **Off-cluster (local machine):** activate `.venv-berdl` first (`source .venv-berdl/bin/activate`), then run the command above. If the venv isn't bootstrapped yet, run `bash scripts/bootstrap_client.sh`. Ad-hoc alternative without venv: `uv run --with pyspark --with "spark_connect_remote @ git+https://github.com/BERDataLakehouse/spark_connect_remote.git" --with "berdl_remote @ git+https://github.com/BERDataLakehouse/berdl_remote.git" scripts/berdl_inventory.py`.
+
+Do **not** use a bare `uv run scripts/berdl_inventory.py` (without `--with`) — `uv run --script` would create an isolated venv that excludes both the JH kernel's `berdl_notebook_utils` (breaks on-cluster) and the off-cluster Spark deps. The script detects misuse and exits with an actionable message, but pick the right invocation upfront.
+
+**Output contract:** the script prints a compact tenant-level summary (header + one row per tenant + "other tenants" footer) to stdout, and writes the full per-database markdown report to `data/berdl_inventory.md`. This split exists because the Claude Code UI auto-collapses long bash output to "+N lines (ctrl+o to expand)" — keeping stdout short means the summary actually surfaces, and the file gives the user a stable artifact they can open in their editor regardless of how the chat displays bash output.
+
+**What you need to do in your reply:**
+1. Paste the stdout summary verbatim (it's short — the AGENT comment at the end of the summary reinforces this).
+2. Tell the user the full per-database report is at `data/berdl_inventory.md`. Do NOT try to relay that file's contents into chat unless the user explicitly asks — they can open it directly.
+3. If the user asks for a specific tenant's databases, use `Read` on `data/berdl_inventory.md` and excerpt just that section, OR re-run with `python scripts/berdl_inventory.py --full` and quote the relevant block.
+
+Same command works on-cluster and off-cluster — on-cluster it uses access-aware `berdl_notebook_utils.get_db_structure()` plus `list_tenants()` / `get_tenant_detail()` for tenant metadata. Off-cluster (with `.venv-berdl` active), the script falls back to `SHOW DATABASES` + `SHOW TABLES` via the local Spark Connect drop-in (which auto-spawns the JH server on cold start). Tenant metadata is on-cluster only; off-cluster groups by the database's underscore prefix without descriptions.
+
+Useful flags:
+- `--full` — print the full report to stdout instead of the compact summary (also still writes the file unless `--no-file`).
+- `--no-file` — skip writing `data/berdl_inventory.md`.
+- `--output PATH` — override the file destination.
+- `--sample 5` — show up to 5 table names per database in the full report (default: 3).
+- `--with-members` — list each tenant's read-write and read-only members in the full report.
+- `--no-emoji` — plain-text output.
+- `--off-cluster` — force the off-cluster path.
+- `--refresh` — force a live fetch and rewrite the cache (ignores the 7-day TTL).
+- `--no-cache` — one-shot live fetch that neither reads nor writes the cache.
+- `--ttl-days N` — override the 7-day cache lifetime (also `BERDL_INVENTORY_TTL_DAYS`).
+
+For deeper inspection, suggest the user run:
+- `DESCRIBE DATABASE EXTENDED <db>` — database-level description / location / properties.
+- `DESCRIBE EXTENDED <db>.<table>` — table-level description, columns, partitioning, storage.
+- `berdl_notebook_utils.get_table_schema(db, table, detailed=True, return_json=False)` — column-level info (name, type, nullable, description).
+
+**Do not run `COUNT(*)` per database in this phase** — it's expensive and not needed for orientation.
+
+---
+
+## Phase 1.7: Session Naming Reminder
+
+If the session does not already have a name, remind the user:
+
+> **Tip**: Name this session for easy identification — especially useful for long-running or remote sessions where the connection may drop. A good convention is to match the project name and git branch (e.g., `essential_metabolome`).
+
+This is a non-blocking reminder. Move on to Phase 2 regardless.
+
+---
+
+## Phase 1.8: Knowledge Layer Check (how to look up projects & prior work)
+
+**By default, look up projects and cross-project knowledge through OpenViking (the
+knowledge layer) — not by reading `projects/` directly.** Confirm it's available once:
+
+```bash
+uv run --env-file .env knowledge/scripts/knowledge_query.py doctor
+```
+
+- **OK** → the remote knowledge server is up. Use the `knowledge-context` skill for
+  **all** cross-project lookups — listing/finding projects, "what's known about X",
+  "has this been done", "related work":
+  - list projects: `knowledge_query.py ls viking://resources/projects/ --simple`
+  - by topic: `knowledge_query.py find "<topic>"`
+  - exact term / author / db: `knowledge_query.py grep "<term>" --uri viking://resources/`
+
+  **Do not enumerate `projects/` or read `projects/*/README.md` / REPORTs by hand for
+  context** — the server has them indexed and ranked, and hand-scanning misses the
+  cross-project connections it surfaces.
+- **NO API KEY / AUTH FAILED** → server is up but you have no valid key. OpenViking is
+  the default knowledge layer, so surface these steps to the user, then continue
+  (non-blocking — don't wait on them):
+
+  > **Set up OpenViking (~2 min, one-time):**
+  > 1. Open `https://beril-dev.kbase.us` and log in with your ORCiD.
+  > 2. Copy the `beril_session` cookie (DevTools → Application/Storage → Cookies).
+  > 3. In **your own terminal** (never paste the cookie into chat):
+  >    `uv run knowledge/scripts/setup_remote_ov.py --cookie '<paste beril_session value>'`
+  > 4. Verify: `uv run --env-file .env knowledge/scripts/knowledge_query.py doctor` → `OpenViking: OK`.
+  > Full walkthrough & troubleshooting: `docs/remote-openviking-setup.md`.
+
+  Until the key is set, knowledge-layer queries won't return results — the server is
+  reachable, so there's no local fallback (that only applies to `UNREACHABLE`). Setting
+  up the key is what unblocks `find` / `grep` / `read` / `overview`.
+- **UNREACHABLE** → no server; `find` / `grep` / `read` / `overview` still work via
+  local fallback, so keep using them instead of hand-scanning. Only
+  `relations` / `glob` / `ls` / `tree` / `stat` need the server — for those, a plain
+  `ls projects/` is the enumeration fallback.
+
+Non-blocking (like the session-naming reminder) — proceed to Phase 2 regardless.
+**Reserve hand-reading `projects/<id>/` files for the one project you're actively
+working in, never as the way to discover what exists or what's been done.**
+
+---
+
+## Phase 2: Establish Project Context
+
+Every BERIL session works inside a project — including ad-hoc exploration. This gives every artifact (queries, user data, notes, figures) a home from minute one, makes work resumable across sessions, and avoids loose `exploratory/` clutter.
+
+Ask the user which of these applies:
+
+1. **Continue an existing project** — pick from `projects/*` (recommended if any work is in flight)
+2. **Start a new project** — name it now (e.g., `metal_cofitness`, `lanthanide_genomes`)
+3. **I'm just exploring** — agent uses `scratch_<YYYYMMDD>` (or `<topic>_scratch` if the user gives a keyword)
+
+There is no "no-project" door. If the user truly wants only to learn about the system without committing to a session, point them at the **Side Path** at the end of this skill — that's reading, not a session.
+
+Once a project context is established, the workflow is the same regardless of entry door:
+
+| Phase | Status (`beril.yaml`) | What happens |
+|---|---|---|
+| **Phase 0** — Scaffold | (unset → `exploration`) | Create dirs, beril.yaml, stub README; pick branch. Runs only for entry doors 2 and 3. |
+| **Phase A** — Orientation & Exploration | `exploration` | Read docs, explore data, accept `user_data`, develop hypotheses. |
+| **Phase B** — Research Plan | `exploration` → `proposed` | Write `RESEARCH_PLAN.md`. **STOP.** |
+| **Checkpoint** — Plan Review | `proposed` | Mandatory pause: approve, review, or iterate. Do not skip. |
+| **Phase C** — Analysis | `proposed` → `active` | Write & execute notebooks, save figures, capture pitfalls. |
+| **Phase D** — Synthesis | `active` → `analysis` | `/synthesize` → `REPORT.md`. |
+| **Phase E1** — Review | `analysis` → `reviewed` | `/berdl-review` produces a numbered `REVIEW_N.md` with hash footer. Iterate freely. |
+| **Phase E2** — Approve & Submit | `reviewed` → `complete` (+ `SUBMITTED.md` on upload success) | `/submit` verifies the latest review is current, asks for explicit approval, uploads to lakehouse, writes marker file. |
+
+For entry door 1 (Continue existing): start at the phase matching the project's current `status`. For doors 2 and 3: start at Phase 0.
+
+---
+
+### Unified Project Workflow
+
+The flow below applies regardless of entry door. Doors 2 and 3 (new project, just exploring) start at **Phase 0**. Door 1 (continue existing) skips Phase 0 and resumes at the phase matching the project's current `status` in `beril.yaml`.
+
+#### Phase 0: Project Scaffold (entry doors 2 and 3 only)
+
+Establish the project directory and manifest **before** any querying, planning, or user-data handoff. This guarantees every artifact has a home from the first command.
+
+1. **Resolve project name**:
+   - Door 2 (new project): ask for a snake_case identifier (e.g., `metal_cofitness`, `lanthanide_genomes`).
+   - Door 3 (just exploring): default to `scratch_<YYYYMMDD>`. If the user mentioned a topic keyword (e.g., "metal cofitness"), use `<topic>_scratch`.
+2. **Verify uniqueness**: `projects/<id>/` must not already exist. If it does, ask whether to switch to door 1 (continue existing) or pick a new name.
+3. **Author identity**: run `beril user --json` via Bash. The JSON has `name`, `affiliation`, `orcid`. Exit 0 = all three present, use them. Exit 1 = at least one missing; parse the JSON anyway, prompt only for missing fields, then suggest `beril setup` to persist.
+4. **Create directories**: `projects/<id>/{notebooks,data,user_data,figures}`. Add a `.gitkeep` file in each (`touch projects/<id>/notebooks/.gitkeep` etc.) so git tracks the directories through the scaffold commit. Without `.gitkeep`, the empty dirs are dropped from the commit and the "every artifact has a home" promise breaks on checkout elsewhere.
+5. **Write `beril.yaml`** (template at the bottom of this file): `status: exploration`, `created_at` and `last_session_at` set to current ISO timestamp, `engine.name` set to the current agent (e.g., `claude`), authors from beril user, all `artifacts` flags false initially. `branch` is set in step 6.
+6. **Branch (recommended)**: offer to create branch `projects/<id>` and switch to it. Long-running projects on `main` create merge pain. If the user declines, leave on the current branch. Record the actual branch in `beril.yaml`.
+7. **Write a stub `README.md`** (template at the bottom): title (humanized from project_id), Status block reading "Exploration — research plan not yet written", authors from beril user, Quick Links pointing at `RESEARCH_PLAN.md` (TBD) and `REPORT.md` (TBD), Reproduction placeholder.
+8. **Update `beril.yaml`**: `artifacts.readme: true`.
+9. **Commit**: `feat(project): scaffold {id} (exploration phase)`.
+10. Suggest naming this session to match the project: "Consider naming this session `{project_id}` to match the branch — useful for long-running or remote sessions where the connection may drop."
+
+After Phase 0, **every artifact has a home**. User data → `projects/<id>/user_data/`. Exploration queries → `projects/<id>/notebooks/00_*.ipynb`. References → `projects/<id>/references.md`. Move on to Phase A.
+
+#### Phase A: Orientation & Exploration
+
+Status: `exploration`. Read context, explore data, accept user-supplied input, and develop hypotheses — all inside the project directory.
+
+**Required reading before designing any queries:**
+1. `PROJECT.md` — dual goals (science + knowledge capture), project structure, reproducibility standards, JupyterHub workflow, Spark notebook patterns.
+2. `docs/overview.md` — data architecture, key tables, generation workflow, known limitations.
+3. `docs/pitfalls.md` and `docs/performance.md` — **critical: read before any query design**. These are the frozen historical archives; per-project pitfalls hit by recent projects also live in `projects/*/memories/pitfalls.md` (worth a scan, especially for projects on the same database family).
+4. `docs/research_ideas.md` — check for related ideas; avoid duplicating work.
+5. Use `berdl_notebook_utils.get_databases(return_json=False)`, `get_tables(... return_json=False)`, and `get_table_schema(... detailed=True, return_json=False)` for live access-aware discovery. For database-specific gotchas, grep `docs/pitfalls.md` for the database name (e.g., `grep -A 20 "^## kbase\.ke_pangenome$" docs/pitfalls.md`); also check `projects/*/memories/pitfalls.md` for any project-tagged entries on the same database.
+6. For "what's already known" on the research topic across projects, query the knowledge layer rather than scanning REPORTs by hand — see `knowledge-context`. Seed: `knowledge_query.py find "<topic>"` for concepts, or `grep "<exact db/term>" --uri viking://resources/` for the database's documented gotchas; then `read` the strongest hits.
+
+**Setup check (Phase 1.5 already verified KBASE_AUTH_TOKEN and proxy):**
+6. `gh auth status` — needed for branches/PRs. Prompt `gh auth login` if missing.
+
+**Engagement (status stays `exploration`):**
+- Discuss the user's research interest and goals.
+- **If the user has input data** (gene lists, phenotype tables, FASTAs, SQLite, etc.): drop it in `projects/<id>/user_data/`. Never leave user-supplied data in `~/` or the repo root.
+- Run exploratory queries with `/berdl`. For any query worth keeping, save it as a numbered exploration notebook (`projects/<id>/notebooks/00_exploration.ipynb`, then `00b_*.ipynb` if you need more). Even rough exploration gets a home.
+- Search literature with `/literature-review` if relevant. References go to `projects/<id>/references.md`.
+- Check related prior work through the knowledge layer (`knowledge_query.py find "<topic>"` / `relations`), not by hand-scanning `projects/`. Read a specific project's files directly only once the knowledge layer points you to it.
+- Develop 2-3 testable hypotheses with H0/H1.
+
+When the user has a clear hypothesis and is ready to commit to a plan, transition to Phase B.
+
+#### Phase B: Research Plan
+
+Status transition: `exploration` → `proposed`.
+
+1. Write `projects/<id>/RESEARCH_PLAN.md` (template at the bottom of this file): Research Question, Hypothesis (H0/H1), Literature Context, Approach, Data Sources, Query Strategy (tables, filter strategy, performance tier), Analysis Plan (numbered notebooks with goals + expected outputs), Expected Outcomes, Revision History (v1 with today's date), Authors.
+2. Update `projects/<id>/README.md` Status block to "Proposed — research plan written, awaiting analysis." Fill in any other sections that became clearer (Overview, Research Question).
+3. Update `beril.yaml`: `status: proposed`, `last_session_at` to now, `artifacts.research_plan: true`.
+4. Commit: `feat(project): research plan for {id}`.
+
+**STOP HERE.** The plan is the contract for what comes next. Do NOT write or execute notebooks yet. Proceed to the Checkpoint.
+
+#### Checkpoint: Plan Review (mandatory pause)
+
+This pause is the key guard against the agent rushing from plan to compute without human or independent review. **Do not skip it.**
+
+Present the plan to the user concisely:
+- Title and refined research question
+- Hypothesis (H0/H1)
+- Query strategy summary (tables touched, filter strategy, estimated complexity)
+- Expected outcomes (what supports H1, what supports H0, potential confounders)
+
+Then ask explicitly:
+
+> "Plan ready to start analysis?
+> (a) Approve and continue to Phase C (Analysis)
+> (b) Run an independent review first — `bash tools/review.sh {project_id} --type plan` writes `PLAN_REVIEW_<n>.md` with the exact `RESEARCH_PLAN.md` hash. Use `--reviewer codex` for a second opinion.
+> (c) Iterate on the plan"
+
+**Do not proceed to Phase C until the user picks (a).**
+
+- If (b): invoke the plan reviewer, present `PLAN_REVIEW_<n>.md` to the user, then re-ask. Reviewer output is advisory — the user has final say.
+- If (c): iterate on `RESEARCH_PLAN.md`. Record changes in Revision History as `- **v2** ({date}): {change description}`, then re-ask.
+
+#### Phase C: Analysis (Notebooks)
+
+Status transition: `proposed` → `active`.
+
+- Update `beril.yaml`: `status: active`, `last_session_at` to now.
+- Write numbered analysis notebooks (`01_data_exploration.ipynb`, `02_analysis.ipynb`, ...) following the analysis plan in `RESEARCH_PLAN.md`.
+- Notebooks are the primary audit trail — do as much work as possible in notebooks so humans can inspect intermediate results.
+- When parallel execution or complex pipelines are needed, write scripts in `projects/<id>/src/` but call them from notebooks.
+- **Run notebooks** — execute cells, inspect outputs, iterate.
+- If new information emerges that changes the approach, update `RESEARCH_PLAN.md` Revision History as `- **v{n}** ({date}): {change}` before continuing.
+- **Commit frequently** — after each major milestone (notebook complete, data extracted, key result reproduced).
+- Re-read `docs/pitfalls.md` when something doesn't behave as expected.
+
+##### Checkpoint: Results Review
+
+After notebooks are executed and committed, pause and present key results before synthesis.
+
+- Summarize the key results: main statistics, notable patterns, anything unexpected.
+- Ask: "Look at the notebooks/figures before I write up findings, or proceed with `/synthesize`?"
+- If the user wants to explore first, wait. If they want changes, iterate on the notebooks before proceeding.
+
+#### Phase D: Synthesis & Writeup
+
+Status transition: `active` → `analysis` (handled by `/synthesize` itself).
+
+- Run `/synthesize` to create `REPORT.md`. The skill updates `beril.yaml` automatically (`status: analysis`, `artifacts.report: true`, `last_session_at`) and updates `README.md` Status to "Analysis — report drafted, awaiting `/berdl-review` and `/submit`."
+- Commit the report and updated `beril.yaml`.
+- Discuss the report with the user — revise if needed.
+
+#### Phase E1: Review (`analysis` → `reviewed`)
+
+Status transition handled by `/berdl-review`. The user can iterate freely — different models, multiple opinions — each run produces a numbered `REVIEW_N.md`. Each review file embeds a `<!-- report_hash: sha256:... -->` footer (written by `tools/review.sh`) so `/submit` can later confirm the review covers the *current* `REPORT.md`.
+
+- Run `/berdl-review {project_id}` (or with `--reviewer codex` for a different model). After the first successful review, status flips from `analysis` to `reviewed`.
+- If issues are raised that need the report or notebooks updated, address them. If `REPORT.md` changes (re-running `/synthesize`), the project silently demotes back to `analysis` and existing reviews go stale via hash mismatch — run `/berdl-review` again to produce a current review.
+- When the review looks good (or has only issues the user is comfortable approving despite), proceed to Phase E2.
+
+#### Phase E2: Approve & Submit (`reviewed` → `complete`)
+
+Status transition handled by `/submit`. The lifecycle treats `complete` as a human act: the user, as the responsible author, explicitly says "yes, this is done." Lakehouse upload follows; on success a visible `SUBMITTED.md` marker lands in the project so anyone can see at a glance that the project was submitted.
+
+- Run `/submit {project_id}`. The skill:
+  1. Runs the pre-submission checklist.
+  2. Verifies the latest `REVIEW_N.md`'s footer matches the current `REPORT.md` hash (rejects stale reviews).
+  3. Verifies a configured ORCID (`beril user --json` must return one).
+  4. Asks for explicit approval (y/n).
+  5. Writes the approval to `beril.yaml` and copies the approved review to `REVIEW.md`.
+  6. Uploads to the lakehouse.
+  7. Writes `SUBMITTED.md` (success) or `SUBMISSION_FAILED.md` (failure). Status flips to `complete` regardless of upload outcome — the upload is tracked separately via the marker files and `beril.yaml.submissions[]`.
+- If upload fails, just re-run `/submit` after fixing the issue (e.g., MinIO config). It recognizes the existing approval and only retries the upload.
+- Discuss next steps with the user once `SUBMITTED.md` is in place.
+
+#### Re-opening a complete project
+
+If the user discovers an error after submission and wants to revise: run `/synthesize` (or edit notebooks then `/synthesize`). Because status is `complete`, `/synthesize` will explicitly ask for confirmation before overwriting `REPORT.md` and demoting to `analysis`. The previous approval gets archived under `previous_approvals` in `beril.yaml` and both marker files are deleted. Then iterate `/berdl-review` and `/submit` again — the second `/submit`'s approval prompt will warn that this replaces the existing lakehouse archive.
+
+#### Throughout the Workflow
+
+- Commit code often — don't let work accumulate uncommitted.
+- **Capture pitfalls as you go**: when something goes wrong, follow `.claude/skills/pitfall-capture/SKILL.md` — it appends to `projects/<id>/memories/pitfalls.md` (per-project, append-only with corrections). Don't write to the central `docs/pitfalls.md`; it's a frozen historical archive.
+- **Capture discoveries and performance notes in REPORT.md**: when you find something worth surfacing across projects, draft it in the optional `## Discoveries` section of `REPORT.md` (added by `/synthesize`). Project-specific tuning observations go in `## Performance Notes`. These flow through `/berdl-review` and get extracted into `projects/<id>/memories/{discoveries,performance}.md` by `/submit` at approval — only after review and approval, so the memories layer reflects vetted content.
+- **When debugging or designing queries**, check both layers: grep `docs/pitfalls.md` (historical archive — still has most of the canonical gotchas) AND scan `projects/*/memories/pitfalls.md` for recent gotchas hit by related projects (especially the same database family).
+- Re-read `docs/performance.md` when queries are slow — it's still the canonical reference for table-size strategies and anti-patterns. Project-specific tuning hits captured at past approvals live in `projects/*/memories/performance.md`.
+- Follow `PROJECT.md` standards — notebooks with saved outputs, figures as standalone PNGs, `requirements.txt`, Reproduction section in README.
+
+---
+
+### Entry Door 1: Continue an Existing Project (resumption)
+
+Phase 0 is skipped. Resume at the phase matching the project's current status.
+
+1. Run `ls projects/` and list all projects.
+2. For each project, read `beril.yaml` (if present) and display: `status`, `last_session_at`, `branch`, and which `artifacts` are present/missing. If `beril.yaml` is missing (pre-manifest project), note "no manifest" — still works, just legacy.
+3. The user picks one. Read its `README.md`, `RESEARCH_PLAN.md`, and `REVIEW.md` (if present). Read `REPORT.md` if `artifacts.report` is true.
+4. Update `beril.yaml`: `last_session_at` to now.
+5. **Resume detection on `reviewed` / `complete`**: before suggesting a phase, validate currency. The `complete` checks must match what `/submit` Phase 1a does — otherwise the user could see a project listed as `complete` here and then watch `/submit` reject it on the same conditions.
+
+   **Hash comparison rule**: stored hashes in `beril.yaml.approval.*` and the REVIEW footer carry a `sha256:` prefix; computed hashes from `sha256sum` (or `hashlib`) are raw hex. Use `tools.notebook_hash.unprefixed()` to strip the prefix from stored values before comparing to computed hex. Never compare the prefixed and raw forms directly.
+   - For `complete`: validate **all** approved content (REPORT.md, the review files, AND notebooks), not just REPORT.md.
+     - `projects/{id}/REPORT.md` must exist and `sha256sum REPORT.md == unprefixed(approval.report_hash)`.
+     - `projects/{id}/REVIEW.md` exists → `sha256sum REVIEW.md == unprefixed(approval.review_hash)`. Missing alone is fine — `/submit` Phase 3a recreates it from the numbered review.
+     - `projects/{id}/{approval.review}` (numbered file, e.g. `REVIEW_3.md`) exists → its hash matches `unprefixed(approval.review_hash)`. Missing alone is fine. Missing **together with REVIEW.md** is approved-content loss.
+     - **Notebook hashes** (v5): if `approval.notebook_hashes` is present and non-empty, invoke `python {repo_root}/tools/notebook_hash.py compute-hashes {project_path}` (use absolute paths; `/berdl_start` may run from anywhere). Parse the JSON output and compare each entry against `approval.notebook_hashes`. Any mismatch, missing notebook from the approval set, or new notebook in the current set → drift. (Empty / omitted `notebook_hashes` field is treated as legacy and skipped.)
+     - Any hash mismatch, OR REPORT.md missing, OR both review files missing, OR a notebook drift → offer **demote-to-`analysis`**. Phrase the prompt to match the cause ("REPORT.md changed since approval", "REVIEW.md changed since approval", "REVIEW_N.md changed since approval", "REPORT.md is missing — restore it from version control", "Both REVIEW.md and REVIEW_N.md missing on a complete project", "notebook(s) changed since approval: <list>", etc.). On Yes: move `approval` to `previous_approvals` (append) with an added `archived_at: "<now>"` field, set `status: analysis`, update README `## Status` to "Analysis — report drafted, awaiting `/berdl-review` and `/submit`.", delete `REVIEW.md` if present, and delete both marker files. If user declines, warn but leave alone.
+   - For `reviewed`: parse the latest `REVIEW_N.md` footer hash (extract the hex after `sha256:`) and compare to `sha256sum REPORT.md`. If mismatch → offer demote-to-`analysis` (existing reviews stale). On Yes: set `status: analysis`, update README `## Status` to "Analysis — report drafted, awaiting `/berdl-review` and `/submit`." If user declines, warn but leave alone.
+6. Resume at the phase matching the (possibly demoted) status:
+   - `exploration` → Phase A (Orientation & Exploration).
+   - `proposed` → Checkpoint (re-present plan, ask the (a)/(b)/(c) question).
+   - `active` → Phase C (Analysis).
+   - `analysis` → Phase E1 (Review) — suggest `/berdl-review`. If `REPORT.md` doesn't exist yet (rare), drop back to Phase D.
+   - `reviewed` → Phase E2 (Approve & Submit) — suggest `/submit`.
+   - `complete`:
+     - `SUBMITTED.md` present → "Project complete and submitted on {SUBMITTED.md submitted_at}; archive: {archive_key}. Inspect, reopen for revisions (run `/synthesize`), or move on?"
+     - `SUBMISSION_FAILED.md` present (or both markers absent) → "Project approved locally but lakehouse upload pending. Re-run `/submit` to retry."
+   - missing/legacy → infer from artifacts present (REPORT exists → Phase E1; RESEARCH_PLAN exists but no REPORT → Phase C).
+7. Suggest the next concrete action based on the resumed phase.
+
+---
+
+### Side Path: Understanding the System (no project)
+
+If the user truly wants only to understand BERIL without committing to a session, point them at:
+
+- `PROJECT.md` — dual goals (science + knowledge capture), structure
+- `docs/overview.md` — scientific context and data workflow
+- `docs/pitfalls.md` — per-database non-derivable gotchas
+- `docs/research_ideas.md` — backlog and future directions
+
+Also explain:
+- Current inventory and access should be discovered live with `berdl_notebook_utils.get_databases(return_json=False)`.
+- The documentation workflow (tag discoveries, update pitfalls) — captured in `PROJECT.md`.
+- The BERDL JupyterHub UI is browsable at https://hub.berdl.kbase.us.
+- The available skills and what each does (table at the top of this skill).
+
+This is reading, not a session. After reading, the user re-invokes `/berdl_start` to begin actual work — at which point Phase 2's three-door menu applies.
+
+---
+
+### Companion skills used during the workflow
+
+These are project-agnostic helpers — invoke them from inside any project at the right phase:
+
+- **`/berdl`** — query BERDL with Spark SQL. Use during Phase A and Phase C.
+- **`/berdl-query`** — local-machine variant for off-cluster work.
+- **`/berdl-discover`** — explore and document a new database that isn't yet in `docs/pitfalls.md`.
+- **`/berdl-minio`** — file transfer between BERDL MinIO and local.
+- **`/literature-review`** — search PubMed, bioRxiv, arXiv, Semantic Scholar, Google Scholar. Writes to `projects/<id>/references.md`.
+
+**MCP setup check** for `/literature-review`: the `paper-search-mcp` ([openags/paper-search-mcp](https://github.com/openags/paper-search-mcp)) is configured in `.mcp.json` and runs via `uvx paper-search-mcp`. If it fails:
+1. Ensure Python 3.10+ and [uv](https://docs.astral.sh/uv/) are installed.
+2. Test: `uvx --from paper-search-mcp python -m paper_search_mcp.server`.
+3. Optionally set `SEMANTIC_SCHOLAR_API_KEY` for enhanced Semantic Scholar features.
+4. The skill falls back to WebSearch if the MCP server is unavailable.
+
+---
+
+## Key Principles (for the agent)
+
+1. **Always start in a project** — every session establishes a project context (new, existing, or `scratch_<date>`) before doing any work. User data, queries, exploration notebooks, references — all live in `projects/<id>/`. Never leave artifacts loose in the repo root, `~/`, or `exploratory/`.
+2. **Read the docs and discover live data first** — `PROJECT.md`, `docs/overview.md`, `docs/pitfalls.md`, `docs/performance.md` before designing any queries. Use `berdl_notebook_utils.get_databases(return_json=False)`, `get_tables(... return_json=False)`, and `get_table_schema(... detailed=True, return_json=False)` for live inventory.
+3. **Notebooks are the audit trail** — numbered sequentially (00 for exploration, 01+ for analysis), each self-contained with a clear purpose. Commit with saved outputs per `PROJECT.md` reproducibility standards.
+4. **Commit early and often** — after scaffold, after plan, after each notebook, after data extraction, after analysis, after synthesis.
+5. **Branch by default** — create a `projects/{project_id}` branch in Phase 0. Extended work on `main` causes merge pain and risks conflicting with other contributors. If the user explicitly prefers `main`, respect that.
+6. **Never skip the plan-review checkpoint** — after writing `RESEARCH_PLAN.md`, STOP. Do not write or execute analysis notebooks until the user explicitly chooses (a) Approve. This is the most important rule and the easiest to violate.
+7. **Update the plan when reality changes** — if analysis reveals something that changes the approach, update `RESEARCH_PLAN.md` Revision History before continuing. The plan is a contract; revisions are explicit, not silent.
+8. **Drive the process forward between checkpoints** — checkpoints are explicit pause-points (Plan Review, Results Review). Outside of those, keep moving — don't stop after every individual step asking permission.
+9. **Document as you go** — pitfalls live-captured to `projects/<id>/memories/pitfalls.md` via `/pitfall-capture`; discoveries and performance notes drafted in REPORT.md `## Discoveries` / `## Performance Notes` sections (extracted by `/submit` to per-project memories at approval). The central `docs/{pitfalls,discoveries,performance}.md` files are frozen historical archives — don't write to them.
+10. **Use Spark patterns from PROJECT.md** — `get_spark_session()`, PySpark-first, `.toPandas()` only for final small results.
+11. **Look up projects and prior work through the knowledge layer, not `projects/`** — when the OV server is up (Phase 1.8), use `knowledge-context` (`knowledge_query.py ls/find/grep/relations`) for "what exists / what's known / related work". It falls back to local search when the server is down, so this is always safe. Hand-read `projects/<id>/` only for the project you're actively working in.
+
+---
+
+## Critical Pitfalls (always mention)
+
+Surface these early. Database-specific gotchas live in `docs/pitfalls.md` per-database H2 sections (frozen historical archive; `grep -A 20 "^## <database_name>$" docs/pitfalls.md`). Per-project pitfalls hit by recent projects on the same database family also live in `projects/*/memories/pitfalls.md` and are worth a scan. Universal pitfalls:
+
+1. **Species IDs contain `--`** — This is fine inside quoted strings in SQL. Use exact equality (`WHERE id = 's__Escherichia_coli--RS_GCF_000005845.2'`), not LIKE patterns.
+2. **Large tables need filters** — Some tables are very large (e.g., `gene`, `genome_ani`, `reaction_similarity`). Always filter by a partitioned/indexed column. Check `docs/pitfalls.md` per-database section for the current list.
+3. **Annotation coverage varies** — Some annotation tables (e.g., AlphaEarth embeddings) cover only a fraction of genomes. Check coverage with `COUNT(DISTINCT id)` before relying on them.
+4. **Match Spark import to environment** — On JupyterHub notebooks: `spark = get_spark_session()` (no import). On JupyterHub CLI/scripts: `from berdl_notebook_utils.setup_spark_session import get_spark_session`. Locally: `from get_spark_session import get_spark_session` (requires `.venv-berdl` + proxy chain). See `.claude/skills/berdl-query/references/off-cluster-mechanics.md` for off-cluster setup.
+5. **Auth token** — stored in `.env` as `KBASE_AUTH_TOKEN` (not `KB_AUTH_TOKEN`).
+6. **String-typed numeric columns** — Some databases store numbers as strings. Always CAST before comparisons; check `docs/pitfalls.md` per-database section.
+7. **Gene clusters are species-specific** — Cannot compare cluster IDs across species. Use COG/KEGG/PFAM for cross-species comparisons.
+8. **Avoid unnecessary `.toPandas()`** — `.toPandas()` pulls all data to the driver node and can be very slow or cause OOM errors. Use PySpark DataFrame operations for filtering, joins, and aggregations. Only convert to pandas for final small results (plotting, CSV export).
+
+---
+
+## Templates
+
+### RESEARCH_PLAN.md
+
+```markdown
+# Research Plan: {Title}
+
+## Research Question
+{Refined question after literature review}
+
+## Hypothesis
+- **H0**: {Null hypothesis}
+- **H1**: {Alternative hypothesis}
+
+## Literature Context
+{Summary of what's known, key references, identified gaps}
+
+## Query Strategy
+
+### Tables Required
+| Table | Purpose | Estimated Rows | Filter Strategy |
+|---|---|---|---|
+| {table} | {why needed} | {count} | {how to filter} |
+
+### Key Queries
+1. **{Description}**:
+\```sql
+{query}
+\```
+
+### Performance Plan
+- **Tier**: {local bounded Spark SQL / JupyterHub Spark SQL}
+- **Estimated complexity**: {simple / moderate / complex}
+- **Known pitfalls**: {list from pitfalls.md}
+
+## Analysis Plan
+
+### Notebook 1: Data Exploration
+- **Goal**: {what to verify/explore}
+- **Expected output**: {CSV/figures}
+
+### Notebook 2: Main Analysis
+- **Goal**: {core analysis}
+- **Expected output**: {CSV/figures}
+
+### Notebook 3: Visualization (if needed)
+- **Goal**: {figures for findings}
+
+## Expected Outcomes
+- **If H1 supported**: {interpretation}
+- **If H0 not rejected**: {interpretation}
+- **Potential confounders**: {list}
+
+## Revision History
+- **v1** ({date}): Initial plan
+
+## Authors
+{ORCID, affiliation}
+```
+
+### README.md
+
+```markdown
+# {Title}
+
+## Research Question
+{Refined question}
+
+## Status
+In Progress — research plan created, awaiting analysis.
+
+## Overview
+{One-paragraph summary of the hypothesis and approach}
+
+## Quick Links
+- [Research Plan](RESEARCH_PLAN.md) — hypothesis, approach, query strategy
+- [Report](REPORT.md) — findings, interpretation, supporting evidence
+
+## Reproduction
+*TBD — add prerequisites and step-by-step instructions after analysis is complete.*
+
+## Authors
+{Authors}
+```
+
+### beril.yaml (project manifest)
+
+```yaml
+project_id: {project_id}
+status: exploration       # exploration | proposed | active | analysis | reviewed | complete
+created_at: "{ISO 8601 timestamp}"
+last_session_at: "{ISO 8601 timestamp}"
+branch: projects/{project_id}
+engine:
+  name: {agent name, e.g. claude}
+authors:
+  - name: "{author name}"
+    affiliation: "{affiliation}"
+    orcid: "{ORCID}"
+artifacts:
+  readme: false
+  research_plan: false
+  report: false
+  review: false
+```
+
+**Status transitions:** `exploration` (project scaffolded, no plan yet) → `proposed` (RESEARCH_PLAN.md written) → `active` (notebooks started) → `analysis` (REPORT.md written; set by `/synthesize`) → `reviewed` (a `REVIEW_N.md` covers the current REPORT.md; set by `/berdl-review`) → `complete` (user approved and `/submit` recorded the approval). Upload outcome is tracked separately via the `SUBMITTED.md` / `SUBMISSION_FAILED.md` marker files in the project directory. Downstream skills gate on status: `/submit` requires `reviewed` (or already-`complete` for retries); `/synthesize` requires `active` for the forward path (and demotes `reviewed` silently or `complete` with confirmation when re-run). Update `artifacts` flags as each file is created. Update `last_session_at` whenever resuming work. The full audit trail of approvals and uploads lives in `beril.yaml.approval`, `beril.yaml.previous_approvals`, and `beril.yaml.submissions[]`.

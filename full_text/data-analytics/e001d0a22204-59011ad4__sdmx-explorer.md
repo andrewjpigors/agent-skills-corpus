@@ -1,0 +1,870 @@
+---
+name: sdmx-explorer
+description: >
+  Guided, interactive exploration of statistical data via SDMX providers
+  (Eurostat, OECD, ECB, World Bank, ISTAT, and others) using the opensdmx CLI.
+  Use this skill whenever the user asks ANY question about statistics or data
+  that could be answered with SDMX data — even if they don't mention SDMX,
+  Eurostat, or any provider by name. Topics include demographics, economy,
+  employment, births, deaths, population, prices, trade, health, agriculture,
+  GDP, inflation, unemployment, fertility rates, migration, energy, education,
+  poverty, housing, and any other statistical topic. Also use it when the user
+  mentions a dataflow ID. Trigger for implicit questions like
+  "how many births were there in Italy last year?" or "I need EU unemployment
+  data by age group". Guides the user step by step: discovers datasets, proposes
+  the most meaningful candidates, explores the schema using real constraints
+  (not codelists), explains the dataset structure, and invites the user to make
+  informed filter choices before fetching any data.
+license: MIT
+compatibility: >
+  Requires the opensdmx CLI (opensdmx search, info, constraints, values, get, plot, which).
+metadata:
+  author: ondata
+  version: "1.3"
+---
+
+# SDMX Explorer — Guided Dataset Discovery
+
+This skill uses the **opensdmx CLI** to explore any SDMX 2.1 REST endpoint:
+Eurostat, OECD, ECB, World Bank, ISTAT, and others.
+The primary reference provider is **Eurostat** (default in the opensdmx CLI).
+All examples use Eurostat unless stated otherwise.
+
+> **Sandboxed setup (Claude Cowork / SOCKS proxy).** If `opensdmx` is not yet
+> installed, install it with `uv tool install opensdmx` and add `~/.local/bin`
+> to `PATH`. opensdmx v0.12.1+ bundles `httpx[socks]`, so it works behind the
+> SOCKS proxy used by sandboxes out of the box. If a command fails with an
+> `ImportError` about SOCKS (older install), patch the tool venv once:
+> ```bash
+> uv pip install \
+>   --python "$(find ~/.local/share/uv/tools/opensdmx -name 'python3*' -type f | head -1)" \
+>   socksio "httpx[socks]"
+> ```
+
+Every `opensdmx` command supports `--help` — run it first to discover options and
+see usage examples:
+
+```bash
+opensdmx --help                  # list all commands
+opensdmx search --help           # options and examples for search
+opensdmx constraints --help      # options and examples for constraints
+opensdmx get --help              # options and examples for get
+opensdmx run --help              # options and examples for run
+# ... same for info, values, constraints, embed, blacklist, plot
+```
+
+All metadata commands (`search`, `info`, `values`, `constraints`, `providers`) support
+a global `--output` flag for structured output. Use it when you need to parse results
+programmatically instead of reading a Rich table:
+
+```bash
+opensdmx --output json search "unemployment" --n 10
+opensdmx --output json info TIPSUN20
+opensdmx --output json constraints TIPSUN20
+opensdmx --output json values TIPSUN20 geo
+opensdmx --output json providers
+opensdmx --output csv values TIPSUN20 geo   # CSV for tabular use
+```
+
+In `--output json` mode: stdout is pure JSON, stderr carries errors/warnings, spinners
+are suppressed. Pipe directly into `jq` or parse in Python.
+
+## Command discovery — `opensdmx which`
+
+When you are unsure which command fits a task, use `which` to find it without
+reading the full `--help`:
+
+```bash
+opensdmx which                          # list the full capability index
+opensdmx which "visualize time series"  # → plot
+opensdmx which "find a dataset"         # → search, tree
+opensdmx which "download data"          # → get
+opensdmx which "list providers"         # → providers
+```
+
+Exit code 2 means no confident match — fall back to `opensdmx --help`.
+
+In JSON mode the result is an array of `{command, score, description, group}` objects,
+ready to parse without any text processing:
+
+```bash
+opensdmx -o json which "download" | jq '.[0].command'
+# → "get"
+```
+
+This skill runs a four-phase interactive loop. Always follow the phases in order.
+The goal is to help the user understand the data landscape and make informed choices,
+not to fetch data immediately.
+
+---
+
+## Phase 1 — Discovery: find candidate dataflows
+
+Identify which SDMX provider is relevant (ISTAT for Italian statistics, Eurostat for
+European statistics, OECD for international comparisons, etc.). If unclear, ask.
+
+**Default discovery path is top-down via `opensdmx tree`** (Step 1b below), because
+statistical agencies curate a thematic hierarchy that is semantically richer and
+less noisy than any keyword match. Use keyword `search` (Step 1c) only as fallback.
+
+### Step 1a — Extract keywords AND expected dimensions
+
+Before searching, parse the user's question on two levels:
+
+1. **Topic keywords** (2–4 terms) for the `opensdmx search` call.
+   Example: "unemployment", "labour force"
+
+2. **Expected dimensions** — the analytical angles the user wants to slice by.
+   These are often NOT in the dataset title or description, but must appear as
+   dimensions in the dataflow structure. Extract them explicitly:
+
+   | User says | Expected dimension |
+   |---|---|
+   | "by age group" / "per fascia di età" | `age` |
+   | "by sex" / "per sesso" | `sex` |
+   | "by country" / "per paese" | `geo` |
+   | "by region" | `geo` (NUTS level) |
+   | "by education level" | `isced11` or similar |
+   | "quarterly" / "monthly" | `freq` |
+
+   Example: *"unemployment for EU countries, by age group and sex"* →
+   topic keywords: `unemployment`; expected dimensions: `age`, `sex`, `geo`.
+
+### Step 1b — Top-down navigation (primary path)
+
+Navigate the thematic tree. Statistical agencies organise their dataflows into a
+hierarchical catalog (SDMX `categoryscheme` + `categorisation`) — use it instead
+of guessing keywords. This is the **default** discovery flow; fall back to
+keyword search only under the conditions listed in Step 1c.
+
+Supported providers (check with `opensdmx providers` — `categories` column):
+- ✓ `eurostat`, `istat`, `ecb`, `oecd`, `insee`, `abs`, `bis`
+- ✗ `comext`, `bundesbank`, `worldbank`, `imf` — skip to Step 1c.
+
+#### How to tell `cat_id` from `df_id`
+
+IDs are now prefixed in every human-readable output:
+- `[cat:ID]` — category ID. Safe to pass to `--category` or `search --category`.
+- `[df:ID]` — dataflow ID. Pass to `opensdmx info`, `get`, `plot`. Passing
+  it to `--category` is rejected with a clear scheme-aware message.
+
+Rules of thumb:
+- IDs appearing inside the ASCII `tree` output are always `[cat:...]` —
+  the tree renders categories only.
+- Dataflow IDs come from `search`, `info`, `siblings`, or from the `df_id`
+  column of CSV/JSON outputs; the CLI labels them `[df:ID]` in error
+  messages so you never have to guess the kind.
+- CSV/JSON output keeps the raw columns (`cat_id`, `df_id`) unchanged —
+  the prefix lives only in the ASCII rendering.
+- When in doubt, dump IDs with `opensdmx --output csv tree --scheme <id>`
+  and look at the `cat_id` column.
+
+#### Hierarchical drill-down — always `--depth 1`
+
+Never read the whole tree at once. Large schemes can have dozens of nested
+categories and hundreds of dataflows — dumping them floods the conversation
+and buries the signal. Walk the tree **one level at a time**, with the user
+choosing the next branch to enter:
+
+```bash
+# Step 1 — list top-level schemes (cheap, always safe)
+opensdmx tree --provider istat --depth 1
+
+# Step 2 — enter the chosen scheme, ONLY the first level
+opensdmx tree --scheme Z0400PRI --provider istat --depth 1
+
+# Step 3 — drill into the interesting category, still ONE level at a time
+opensdmx tree --scheme Z0400PRI --category PRI_CONWHONAT --provider istat --depth 1
+
+# Step 4 — when the branch looks final, enumerate the dataflows in it
+opensdmx search "" --category DCSP_NIC1B2015 --provider istat
+```
+
+`--depth` is **relative to `--category`** when `--category` is set: `--depth 1`
+always means "the node plus its direct children", regardless of the category's
+absolute depth in the tree.
+
+After each step, present the children to the user in plain language and ask
+which branch to explore next. Do not pre-emptively dive deeper than one level
+unless the user explicitly says "go deep" or the tree is known to be shallow.
+
+`tree --category` and `search --category` are complementary: the first shows the
+category hierarchy (with dataflow counts), the second enumerates the dataflows
+themselves. Use `search --category` only at the leaves, after the user has
+picked a terminal branch.
+
+**Shortcut: `--show-dataflows` (`-l`)**. When the user has committed to a
+terminal branch, append `--show-dataflows` to `tree` to render dataflow
+leaves inline, labelled `[df:DF_ID]`, without a separate `search` call:
+
+```bash
+opensdmx tree --scheme Z0400PRI --category DCSP_NIC1B2015 --show-dataflows --provider istat
+```
+
+Keep the flag off while exploring upper levels — it can flood the output on
+large branches (>200 df triggers a stderr warning).
+
+The `--category` filter accepts either a leaf id (`DCSP_LATTE`) or a full
+dotted path (`AGR_CRP.DCSP_LATTE`). It reduces false positives compared to
+pure token matching (e.g. finds `AGR_R_ACCTS` under Agriculture even when
+the description does not contain the word "agriculture").
+
+If you accidentally pass a category ID to `--scheme`, the CLI detects it and
+suggests the correct command — you can just run the suggested line:
+
+```bash
+opensdmx tree --scheme PRI_HARCONEU --provider istat
+# → 'PRI_HARCONEU' is a category, not a scheme.
+# → Use: opensdmx tree --scheme Z0400PRI --category PRI_HARCONEU
+```
+
+Note: the first `tree` invocation per provider triggers a one-time fetch
+(can take ~1 minute on Eurostat due to the 24 MB categorisation response),
+then the result is cached for 7 days under the provider's cache directory.
+
+For the full top-down walkthrough (decision matrix, real ISTAT/Eurostat
+examples, cat_id extraction via `--output csv`, and provider-specific notes),
+see [references/thematic-tree.md](references/thematic-tree.md).
+
+### Step 1c — Keyword search (fallback)
+
+Use this path only when:
+- The provider has no categories (see list in Step 1b).
+- The user already gave a precise dataflow ID or a narrow, unambiguous acronym
+  (e.g. `NAMA_10_GDP`, `LFSA_ERGAN`, `HICP`).
+- Step 1b returned an empty or uninformative branch after 2 scheme attempts.
+
+Search for dataflows:
+
+- **Eurostat** (default provider — no `--provider` flag needed):
+  `opensdmx search "<keyword>"`
+- **ISTAT**: `opensdmx search "<keyword>" --provider istat`
+- **Other providers**: `opensdmx search "<keyword>" --provider <name>`
+  (available: `oecd`, `ecb`, `worldbank`, `insee`, `bundesbank`, `abs`)
+
+`search` matches the dataset **title and ID**, by substring. That means a short
+keyword also matches longer words starting the same way — searching `comuni` on
+ISTAT also returns titles containing "comunitari" or "comunicazione". Use
+`--grep` (a case-insensitive regex applied to the results) to narrow it down
+without a shell pipe:
+
+```bash
+# whole word only — drops "comunitari", "comunicazione"
+opensdmx search comun --provider istat --all --grep '\bcomuni\b|comunal'
+```
+
+This is the same `--grep` available on `values` and `constraints`.
+
+To see the full list of built-in providers — including which ones support
+`constraints` and `last_n` — run:
+```bash
+opensdmx providers
+```
+The `constraints` column tells you whether `opensdmx constraints` works for that
+provider (✓ = supported, ✗ = returns 400). The `last_n` column tells you whether
+`--last-n N` is supported in `opensdmx get`. Use this to decide which exploration
+flow to apply before you start (see Phase 2 and provider-specific quirks below).
+
+From the search results, pick **5–8 plausible candidates** by title relevance.
+Then run `opensdmx info <id>` on each one **in parallel** to check their dimension
+list. Keep only the candidates that contain **all expected dimensions**.
+Discard candidates missing a required dimension — even if the title looks right.
+
+**If page 1 (50 results) yields no strong candidates**, paginate before giving up:
+
+```bash
+opensdmx search "unemployment" --page 2   # results 51-100
+opensdmx search "unemployment" --page 3   # results 101-150
+```
+
+The title shows the total available (e.g. `51-100 of 114`), so you know how many
+pages exist. Keep paginating until you find at least 3 plausible candidates or
+exhaust the results. Only after exhausting pagination should you try a different
+keyword or provider. Use `--all` only as a last resort (may produce very long output).
+
+Results are ranked by relevance score (id match, start-of-description, occurrence count) —
+the most relevant candidates appear first.
+
+**If keyword search returns 0 or very few results (< 3), offer semantic search:**
+
+> "I didn't find much with a keyword search. I can try a semantic search instead —
+> it matches by meaning, not exact words, so it can find datasets even when the
+> terminology differs. It requires Ollama to be running and is slower (10–30 s).
+> Want me to try?"
+
+If the user agrees:
+
+```bash
+opensdmx search --semantic "<query>"
+```
+
+Semantic search returns the top 20 results ranked by similarity score. Pick the
+most relevant candidates (score > 0.5) and continue with Step 1c as normal.
+
+```bash
+# Example: verify age and sex are present
+opensdmx info UNE_RT_A       # ✓ has age, sex, geo → keep
+opensdmx info TIPSUN20       # ✗ no age, no sex → discard
+```
+
+### Step 1c — Present verified candidates
+
+From the verified candidates, select **3–5** and present them. For each, confirm
+which expected dimensions are present and note any extras or limitations.
+
+Present them like this (use the conversation language; adapt as needed):
+
+```
+I found these datasets that could answer your question:
+
+1. **UNE_RT_A** — Unemployment by sex and age – annual data (Eurostat)  ⭐ recommended
+   Has all three dimensions you need: age (7 ranges), sex (F/M/total), geo (38 countries).
+   Annual data from 2003 to 2025. Clean structure, no extra mandatory filters.
+
+2. **LFSA_URGAED** — Unemployment rates by educational attainment level (Eurostat)
+   Also has age (29 ranges!) and sex, but adds a mandatory education-level dimension
+   (ISCED11). More granular age breakdown, but requires choosing an education filter.
+   Best if you also want to break down by education.
+
+3. **MET_LFU3RT** — Unemployment rates by sex, age and metropolitan region (Eurostat)
+   Has age and sex, but geo is at metropolitan region level — not country level.
+   Not suitable for country comparisons.
+
+Which one would you like to explore? You can also say "the first one" or
+describe more precisely what you need.
+```
+
+Wait for the user's choice before proceeding.
+
+### Step 1d (optional) — Explore siblings of a candidate
+
+Once you have a candidate dataflow, check its **siblings** — other dataflows in
+the same thematic category. This often reveals variants (regional vs national,
+annual vs quarterly, different units of measure) that pure text search misses
+because the candidate's siblings do not share its exact wording.
+
+```bash
+opensdmx siblings <dataflow_id> --provider <p>
+```
+
+Only works on providers with `categories_supported: true`. A dataflow may
+belong to multiple categories: the command returns one group per membership.
+
+When to use:
+
+- The candidate's title sounds specific ("Fertilizers distributed for biological
+  agriculture"); you want to know if a broader version exists.
+- You expect a series at a different granularity (prov/reg/nat) that may not
+  share keywords.
+- The dataset list is fragmented across many small dataflow ids sharing a
+  common prefix — the category view clusters them.
+
+Example — starting from a single result, discover 6 complementary siblings:
+
+```bash
+$ opensdmx siblings 104_466_DF_DCSP_FERTILIZZANTI_2 --provider istat
+
+Agricoltura > Fertilizzanti  (7 siblings)
+  → 104_466_DF_DCSP_FERTILIZZANTI_2   uso in agricoltura biologica
+    104_466_DF_DCSP_FERTILIZZANTI_1   stato liquido o solido
+    104_466_DF_DCSP_FERTILIZZANTI_3   area di produzione
+    104_466_DF_DCSP_FERTILIZZANTI_4   distribuiti - prov.
+    104_466_DF_DCSP_FERTILIZZANTI_5   elementi nutritivi - prov.
+    ...
+```
+
+---
+
+## Phase 2 — Schema: explore the chosen dataflow
+
+Once the user has chosen, retrieve the structure and available codes for the dataflow.
+
+### Default flow (Eurostat, OECD, ECB, etc.)
+
+Step 1 — get the codes **actually present** in the dataflow (real constraints):
+```bash
+opensdmx constraints PRC_HICP_MANR
+# shows all dimensions with count and a 3-code sample — add hint to use --output json for full list
+
+opensdmx constraints PRC_HICP_MANR coicop
+# shows full list of codes present in that dimension, with labels
+```
+
+**Geographic dimensions** (`GEO`, `REGION`, `NUTS`, `ITTER107`, …): always expand the list
+before filtering — the codes are opaque identifiers (NUTS codes, KATOTTG codes, etc.)
+and the only reliable way to map them to readable names is via `constraints`:
+
+```bash
+opensdmx constraints DF_LABOR_FORCE_A REGION --provider derzhstat
+# → 28 KATOTTG codes, each with the Ukrainian region name
+```
+
+`opensdmx constraints` is the ground truth — it queries the best discovery
+endpoint available for the active provider and returns only codes that
+actually exist in this specific dataflow:
+
+- **ISTAT** — the `.Stat Suite` databrowser hub, which returns ground-truth
+  values per dimension in sub-second time. Every dimension is exposed,
+  including `REF_AREA` (~8,000 comuni). Set `OPENSDMX_DISABLE_HUB=1` to fall
+  back to `contentconstraint`/`availableconstraint`.
+- **Eurostat** — `contentconstraint`.
+- **All others** — `availableconstraint` (or the provider-specific equivalent).
+
+**Tip for ISTAT exploration — `has_constraint` flag:**
+The ISTAT dataflow catalog embeds a `has_constraint` boolean (populated at catalog
+build time via a bulk `contentconstraint` call). When `true`, a static constraint
+is available for that dataflow and `opensdmx constraints` will be fast; when
+`false`, it falls back to the dynamic `availableconstraint` endpoint.
+You can inspect it with `opensdmx flows --output json | jq '.[] | select(.has_constraint)'`.
+**Caveat**: even when `has_constraint=true`, the constraint may not cover every
+dimension (e.g. `REF_AREA` is absent from some ISTAT contentconstraints). Always
+verify missing dimensions with `opensdmx constraints` or `opensdmx values`.
+
+**Missing dimensions** are now rare. They appear only on providers/datasets
+where the discovery endpoint does not list a particular dimension (e.g. some
+Eurostat dataflows). The CLI flags these inline:
+
+```
+REF_AREA  –  not in contentconstraint — use: opensdmx values <df> REF_AREA
+```
+
+When you see `–`, run the suggested `opensdmx values <df> <DIM>` to get the
+codes from the codelist (the theoretical universe — verify with a probe `get`
+before scaling, since not every code in the codelist is necessarily populated
+in the dataflow).
+
+The table view truncates each dimension to a 3-code sample. For the **full list of
+codes per dimension**, use `--output json`:
+
+```bash
+# summary: object keyed by dimension → {n_values, codes, source, [hint]}
+opensdmx --output json constraints PRC_HICP_MANR
+# → {"freq": {"n_values": 1, "codes": ["M"], "source": "constraint"}, "geo": {...}, ...}
+
+# all codes + labels for one dimension: array of {id, name}
+opensdmx --output json constraints PRC_HICP_MANR coicop
+# → [{"id": "CP00", "name": "All-items HICP"}, {"id": "CP01", "name": "Food and non-alcoholic beverages"}, ...]
+```
+
+Each dimension entry has a `source` field: `"constraint"` (codes returned by
+the endpoint) or `"missing"` (dim absent from the response). Missing entries
+include a `hint` field with the exact `opensdmx values …` command to run.
+
+Useful `jq` patterns:
+
+```bash
+# list all dimension names
+opensdmx --output json constraints PRC_HICP_MANR | jq 'keys'
+
+# get all codes for one dimension
+opensdmx --output json constraints PRC_HICP_MANR | jq '.geo.codes'
+
+# number of values per dimension (only those exposed by constraint)
+opensdmx --output json constraints PRC_HICP_MANR | jq 'to_entries[] | select(.value.source=="constraint") | {dim: .key, n: .value.n_values}'
+
+# list dimensions missing from the discovery endpoint (need a follow-up `values` call)
+# Note: for ISTAT this returns nothing — the hub exposes every dimension. Useful on
+# Eurostat dataflows where contentconstraint occasionally omits large geo lists.
+opensdmx --output json constraints NAMA_10_GDP --provider eurostat | jq 'to_entries[] | select(.value.source=="missing") | {dim: .key, hint: .value.hint}'
+
+# find a code by label (case-insensitive)
+opensdmx --output json constraints PRC_HICP_MANR coicop | jq '[.[] | select(.name | ascii_downcase | contains("food"))]'
+```
+
+Step 2 — get dimension order and structure:
+```bash
+opensdmx info PRC_HICP_MANR
+# (no --provider needed for Eurostat, it's the default)
+```
+
+`opensdmx values` returns the **full codelist** (all theoretically possible codes),
+not the codes actually present. Use it only when you need labels for codes you already
+know are valid and `opensdmx constraints` doesn't provide enough detail.
+
+**Never use `opensdmx values` to validate filter codes.** A code present in the codelist
+may return no data if it doesn't exist in this specific dataflow.
+
+**Codelist hierarchy (library API).** When a codelist is hierarchical or ordered, the
+Python accessor `opensdmx.get_codelist_hierarchy(ds, dim)` returns `(id, name, parent,
+order)` — useful to filter by geographic level, roll up child→parent, or sort in the
+official sequence. `parent`/`order` are populated when the provider supplies them
+(notably ISTAT territorial codelists like `CL_ITTER107`) and null otherwise (e.g. flat
+Eurostat codelists). It shares the same cache as `values`/`--labels`, so it adds no extra
+request when the codelist is already cached.
+
+### ISTAT flow
+
+ISTAT keeps the `info` → `constraints` → `get` shape, with `values` as an
+optional sidecar for code labels. The SDMX REST endpoint has a strict ~13 s
+rate limit, but `opensdmx constraints` for ISTAT now goes through the
+`.Stat Suite` databrowser hub: every dimension (including `REF_AREA` with
+~8,000 comuni) is returned in sub-second time, even on 11-dimension
+datasets that previously timed out on `availableconstraint`. Some codes
+still carry version/date suffixes (`LBIRTH_FROM2017`, `POP_1JAN2021`) that
+may need stripping when filtering.
+
+For the full step-by-step walkthrough, territory codes, the hub fast path,
+the legacy SDMX REST fallback, and ISTAT-specific quirks, see
+[references/istat-flow.md](references/istat-flow.md).
+
+### Extract from both flows
+
+Parse the output and extract:
+- **Dimension list** in order (position matters for URL construction later)
+- **Available codes** for each dimension, with descriptions
+- **Time range** (StartPeriod / EndPeriod) — see the note below on how to get it
+- **Dimensions with more than one available value** (these are the meaningful filters)
+
+> **Getting the time range.** The `constraints` output does **not** include
+> `TIME_PERIOD` — verified on both Eurostat and ISTAT, where the time dimension is
+> absent from the content constraint. To fill StartPeriod/EndPeriod, probe the data
+> with two lightweight calls (one observation per series, not a full download):
+>
+> ```bash
+> opensdmx get <ID> <minimal filters> --first-n 1   # earliest period
+> opensdmx get <ID> <minimal filters> --last-n 1    # latest period
+> ```
+>
+> This probe works on every built-in provider **except World Bank** (its `last_n`
+> column is ✗ in `opensdmx providers`); for World Bank, read the period range from
+> the returned data instead.
+>
+> **ISTAT caveat.** The probe only works on a **published cell**: filter to a code
+> combination that actually exists. Explicit the single-value dimensions (e.g.
+> `--FREQ A`) — if left out they end up empty in the key and the request 404s. And
+> **do not rely on cross-cutting totals**: many ISTAT dataflows (e.g. `25_74`, which
+> crosses several citizenship/age dimensions) never publish the "all-TOTAL" cell, so
+> a fully-aggregated key returns 404 even though `first_n`/`last_n` are supported.
+> Verified working end-to-end on a clean dataflow, e.g.:
+>
+> ```bash
+> opensdmx get 22_315_DF_DCIS_POPORESBIL1_24 --provider istat \
+>   --FREQ A --REF_AREA IT --DATA_TYPE BEG --SEX 9 --first-n 1   # → 2019-01-01
+> ```
+
+---
+
+## Phase 3 — Presentation: explain the dataset to the user
+
+Synthesize what you learned in Phase 2 into a clear, human-readable summary.
+The goal is for the user to understand the dataset without knowing SDMX.
+
+Structure your summary like this:
+
+### What the dataset contains
+Describe the subject matter in plain language.
+
+### Granularity
+- **Geographic**: national only? Regions? EU countries? Global?
+- **Temporal**: what years are available? Annual, monthly, quarterly?
+
+### Key dimensions to filter
+List only the dimensions with more than one available value that are meaningful
+for the user's question. For each, show the options in plain language:
+
+```
+- **Country** (GEO): IT (Italy), DE (Germany), FR (France)… 35 countries
+- **Indicator** (INDIC_DE): live births (GBIRTHS), deaths (DEATH),
+  crude birth rate (CNBIRTHS), total fertility rate (TOTFERRT)…
+- **Period**: 1960 to 2024, annual frequency
+```
+
+For dimensions with only one available value, mention them briefly:
+"Other dimensions have a single fixed value and are included automatically."
+
+### Estimated size
+Give a rough sense of scale: "Downloading everything (all countries + all indicators +
+all years) would give you approximately X rows." This helps the user decide how to filter.
+
+### Invitation to choose
+
+End with a clear prompt:
+
+```
+How would you like to proceed?
+- Do you want data for a specific country or a European comparison?
+- Which time period are you interested in?
+- Are there any dimensions you want to filter?
+
+Tell me what you want and I'll build the query.
+```
+
+---
+
+## Phase 4 — Data retrieval: after the user decides
+
+Once the user has specified their choices, build the query and fetch the data.
+
+### Building the query — critical rules
+
+1. **Dimension order must match the `opensdmx info` output exactly.** Never guess the order.
+2. **Use only codes confirmed by `opensdmx constraints`**, never codes from `opensdmx values`
+   or other sources. Providers often return 404 or empty results for invalid codes.
+3. **For dimensions with a single available value**, include that value — don't skip them.
+4. **For unfiltered dimensions** (user wants all values), use `.` as wildcard.
+
+Note: Eurostat dimension flags are lowercase (`--geo`, `--coicop`, `--freq`).
+ISTAT dimension flags are uppercase (`--REF_AREA`, `--DATA_TYPE`, `--FREQ`).
+
+### Human-readable labels (`--labels`)
+
+The data returned by `opensdmx get` contains only **codes** (`geo=IT`, `sex=T`).
+Add `--labels` to append a sibling `<DIM>_label` column with the human-readable name
+for each code, resolved from the codelist in the provider's language:
+
+```bash
+opensdmx get NAMA_10_GDP --geo IT --sex T --labels --last-n 1
+```
+
+This adds `geo_label` ("Italy"), `sex_label` ("Total"), etc. alongside the original
+code columns (codes are preserved, not replaced). The label column name mirrors the
+data column case + `_label` (`geo` → `geo_label`, `ITTER107` → `ITTER107_label`).
+
+**Always prefer `--labels` when showing data to the user or building tables/charts** —
+never present raw codes when readable labels are available. The flag is also persisted
+in the YAML query file (`--query-file`) and honored by `opensdmx run`.
+
+### Bulk download — large datasets without REF_AREA filter
+
+When the user wants **all territorial units** (all comuni, all regions, all countries)
+without filtering REF_AREA, use `--yes` to trigger a single wildcard REST request
+instead of chunking:
+
+```bash
+opensdmx get 22_315_DF_DCIS_POPORESBIL1_24 --provider istat \
+  --FREQ A --DATA_TYPE BEG --SEX 9 --start-period 2024 --end-period 2024 \
+  --yes --out /tmp/all_comuni.csv
+```
+
+Without `--yes`, the CLI detects that the dataset has many series and stops with a
+warning. With `--yes`, it builds a single wildcard URL (e.g. `data/{df_id}/A..BEG.9`)
+and fetches everything in one call — typically much faster than looping on chunks.
+
+### Step 1 — Verify with a preview (last observation)
+
+Before fetching everything, do a quick sanity check with `--last-n 1` to confirm
+the query is valid and the data looks correct:
+
+```bash
+opensdmx get PRC_HICP_MANR --coicop CP00 --geo IT+DE+FR --start-period 2020 --end-period 2023 --last-n 1
+```
+
+`--last-n 1` returns the most recent observation per series (one row per country/dimension
+combination), which is enough to verify the query structure without flooding the output.
+Prefer `--last-n 1` over `--first-n N` for previews: it shows the most recent data
+and produces far fewer rows when there are many series.
+
+For ISTAT: use a narrow time range (1–2 years) as preview.
+
+Show the user those few rows and confirm the data makes sense (right columns, right units,
+no unexpected flags). A one-line comment is enough: "Query works — here is the latest observation per series."
+
+### Step 2 — Provide the download URL
+
+Build and show the equivalent curl command so the user can download the full dataset
+independently, without relying on the CLI:
+
+**Eurostat URL pattern:**
+```
+https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{dataflow_id}/{dim1.dim2...}/ALL/?startPeriod={start}&endPeriod={end}&format=SDMX-CSV
+```
+
+Dimension values in the path must follow the exact order from `opensdmx info`,
+with `.` for unfiltered dimensions and `+` for multiple values.
+
+**Example:**
+```bash
+curl "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/APRO_CPNH1/A.I2200.AR./ALL/?startPeriod=2014&endPeriod=2023&format=SDMX-CSV"
+```
+
+**ISTAT URL pattern:**
+```bash
+curl -s \
+  -H "Accept: application/vnd.sdmx.data+csv;version=1.0.0" \
+  "https://esploradati.istat.it/SDMXWS/rest/data/{dataflow_id}/{dim1.dim2...}?startPeriod={start}&endPeriod={end}"
+```
+Without the `Accept` header ISTAT returns XML. `endPeriod` has an off-by-one
+bug: request N-1 to receive data through N. See [references/istat-flow.md](references/istat-flow.md) for details.
+
+### Step 3 — Ask the user what to do next
+
+End with a short, clear question:
+
+```
+Would you like me to download and save the full dataset locally for analysis?
+If yes, tell me where to save it (e.g. /tmp/data.csv) or I'll use a default path.
+I can then run a quick analysis: row count, top values, time range, flagged records.
+```
+
+If the user says yes, download with `--out <path>` and run a quick analysis
+(row count, top values, time range, any missing/flagged data worth noting).
+
+### Step 4 — Offer to save the query as a reusable template
+
+After a successful download, always ask the user if they want to save the query:
+
+```
+This query worked well. Would you like to save it as a YAML template so you can
+re-run it later without remembering all the parameters?
+
+  opensdmx get <id> [filters] --out data.csv --query-file my_query.yaml
+
+The YAML captures provider, dataset, filters with human-readable descriptions,
+and time range. To re-run it later:
+
+  opensdmx run my_query.yaml
+  opensdmx run my_query.yaml --out fresh_data.csv
+
+The file is also useful for version control and sharing with colleagues.
+```
+
+Always suggest a meaningful filename (e.g. `unemployment_eu_2020_2024.yaml`,
+`gdp_annual_eurostat.yaml`) based on the dataset and filters used.
+
+### Step 5 — Offer metadata and README
+
+After downloading, always ask the user two optional extras:
+
+```
+Two optional extras:
+1. **Full metadata**: do you want the complete list of codes and labels for each
+   dimension (e.g. all country names, all flag meanings)? I can extract them from
+   the opensdmx cache and save them as a companion file (e.g. `metadata.csv`).
+2. **README**: do you want a `README.md` that documents the dataset schema —
+   columns, dimension codes with labels, flag meanings, units, and source URL?
+   Useful if you plan to share the data or revisit it later.
+```
+
+If the user says yes to **metadata**:
+- Run `opensdmx constraints <dataflow_id> <dim>` for each dimension with more than
+  one value to get the full code → label mapping.
+- Combine all dimensions into a single metadata file with columns:
+  `dimension`, `code`, `label`.
+- Save it alongside the data file (e.g. `tomato_production_metadata.csv`).
+
+If the user says yes to **README**:
+- Generate a `README.md` in the same folder as the data file.
+- The goal is to make the output **verifiable** (check values against the source),
+  **evaluable** (judge quality and scope), and **repeatable** (reproduce from scratch).
+- Follow the full template in [references/readme-template.md](references/readme-template.md).
+  In summary, include:
+  - Files produced (table)
+  - One section per source dataflow: ID, provider, filters with labels, unit,
+    last update date, and the exact download URL
+  - Derivations: join keys, filters applied after download, computed columns
+    with explicit formulas (not prose)
+  - Column schema: name, type, description, unit for every column in the output
+  - Flag legend: only flags actually present in the data, with row counts
+  - Coverage table when geographic or categorical gaps exist
+  - Caveats: scope limitations, reporting lags, known biases
+
+### Step 6 — Visualization
+
+After downloading data, offer to create charts using `opensdmx plot`.
+The plot command uses plotnine (Python's ggplot2) and accepts both dataflow IDs
+and local files (.csv, .tsv, .parquet).
+
+For the complete visualization reference — Grammar of Graphics concepts, data
+preparation rules, DuckDB examples, iterative chart quality loop, and common
+fixes — see [references/visualization.md](references/visualization.md).
+
+**Supported chart types** (via `--geom`):
+- `line` (default): line chart with points — best for time series
+- `bar`: vertical bar chart — best for comparing values across categories over time;
+  with `--color` produces stacked bars
+- `barh`: horizontal bar chart — best for rankings; bars are automatically sorted
+  by value (lowest at bottom, highest at top)
+- `point`: scatter plot — best for correlations between two numeric variables
+
+For other chart types not supported by `opensdmx plot` (heatmaps, grouped/dodge bars),
+write a short Python script using plotnine directly.
+
+For DuckDB installation and common data-prep patterns, see
+[references/duckdb-setup.md](references/duckdb-setup.md).
+
+Key points:
+- Always prepare data with DuckDB before plotting (separate units, limit series,
+  remove aggregates, use year strings for annual data)
+- After generating a chart, read the image and evaluate it — if it's not good,
+  fix it yourself before showing the user
+- Multiple focused charts are better than one overloaded chart
+
+---
+
+## Key principles
+
+**Always explain the indicator — never assume prior knowledge**
+After presenting any results, always include a plain-language explanation of the
+key indicator(s) used. Do not assume the user knows what GNI, PPP, HICP, or any
+other acronym means. For every indicator shown:
+- State in one sentence what it measures
+- Explain how it differs from similar concepts the user might know (e.g. GNI vs GDP)
+- Clarify the unit and any methodological choice that affects interpretation
+  (e.g. "Atlas method" vs PPP, constant vs current USD)
+
+This applies even when the indicator name seems obvious. A user who asks
+"which are the poorest countries?" may not know what GNI is, even if they
+implicitly agree with using it as a proxy for poverty.
+
+Place this explanation immediately after the data summary, before any offer
+to download or visualize.
+
+**Proposals, not lists**
+When presenting dataflow candidates, reason about each one: explain why it might or
+might not answer the question, what its limitations are, and which one you'd recommend.
+The user should feel guided, not overwhelmed.
+
+**Make filter choices coherent with the user's intent**
+Match the granularity of each dimension to what the user actually asked for.
+For any dimension, SDMX codelists typically contain both **individual units** and
+**aggregate codes** that group them. These two levels must never be mixed silently.
+
+The rule: when the user asks for "all X", return individual-level codes only.
+If aggregates exist in the data, exclude them — or present them separately with an
+explicit label explaining that they are groupings, not individual units.
+
+If an aggregate is useful as a reference (e.g. a total or average alongside individual
+values), propose it explicitly and let the user decide whether to include it.
+
+**Explain dimensions in plain language**
+Translate SDMX dimension IDs into human concepts:
+- `CITIZENSHIP_MOTHER` → "mother's citizenship"
+- `DATA_TYPE: LBIRTH` → "live births (absolute count)"
+- `GEO: IT` → "Italy"
+- `INDIC_DE: GBIRTHS` → "live births"
+- `INDIC_DE: CNBIRTHS` → "crude birth rate (per 1,000 inhabitants)"
+Never show raw codes without an explanation.
+
+**Explore all columns, not just the value column**
+When the preview arrives (Step 1 of Phase 4), look at all columns in the response,
+not just the observation value. SDMX datasets often include extra columns that affect
+interpretation: quality flags, confidentiality markers, unit multipliers, notes.
+For each non-obvious column, check what values are present and explain their meaning
+to the user. For example:
+- `OBS_FLAG` or `OBS_STATUS`: quality/availability flags — look up what each code means
+  in the context of that provider (`b` = break in series, `e` = estimated, `n` = not
+  significant, `u` = unreliable, `p` = provisional, etc.)
+- `UNIT_MULT`: multiplier applied to the value (e.g. `3` means values are in thousands)
+- `CONF_STATUS`: confidentiality status
+- `NOTE_*`: free-text annotations attached to specific dimensions
+
+Don't hardcode these — inspect what columns are actually present in the data and
+explain the ones that are populated. Skip columns that are entirely empty.
+
+**Provider-specific quirks**
+
+Run `opensdmx providers` for a machine-readable overview — the `constraints` and
+`last_n` columns reflect verified test results and tell you which exploration flow
+fits the target provider.
+
+The full capability matrix (Eurostat, ISTAT, ECB, OECD, INSEE, Bundesbank, World
+Bank, ABS, BIS, IMF), dimension flag casing, territory code conventions, and what
+to do when `constraints` or `last_n` are unsupported, are documented in
+[references/providers.md](references/providers.md).
+
+Two providers have flows that diverge enough to deserve their own walkthroughs:
+
+- **ISTAT** — rate limit, suffix patterns, mandatory `constraints` step, territory
+  codes: [references/istat-flow.md](references/istat-flow.md)
+- **World Bank** — single-dataflow architecture (`WDI`), alpha-3 country codes,
+  known issue #5: [references/worldbank-flow.md](references/worldbank-flow.md)

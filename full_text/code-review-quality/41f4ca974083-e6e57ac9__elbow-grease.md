@@ -1,0 +1,647 @@
+---
+name: elbow-grease
+category: code-review
+description: "Systematic code review with sub-agent analysis. Works on PRs, branches, files, or staged changes."
+---
+
+# /elbow-grease — Systematic Code Review
+
+Perform a structured, multi-phase code review. This skill produces actionable findings
+with severity, location, and concrete fixes — not style nits or praise.
+
+**This is a principle-bound skill.** First invoke `bsky:load-design-principles`
+and pass the returned digest to sub-agents as context alongside coding standards.
+
+Use memory-mcp's `read` tool to load the `code-review-patterns` memory (scope: global)
+before starting. It contains learned patterns from previous reviews that should inform
+what you look for. If the memory doesn't exist yet, proceed without it — findings from
+this review will seed it.
+
+## Argument handling
+
+`$ARGUMENTS` determines the review scope:
+
+| Argument             | Scope                                         |
+|----------------------|-----------------------------------------------|
+| *(empty)*            | All uncommitted changes (staged + unstaged)   |
+| `pr` or `pr <N>`     | Current branch's PR diff, or PR #N            |
+| `branch`             | All commits on current branch vs base          |
+| `file <path>`        | Single file, full review                      |
+| `files <glob>`       | Multiple files matching pattern               |
+| `commit <ref>`       | Single commit diff                            |
+| `--since <ref>`      | Incremental: only commits since `<ref>`       |
+
+### Dispatch backend
+
+`--dispatch <skill-name>` selects the sub-agent dispatch backend. Default:
+`bsky:elbow-grease-dispatch` (native Claude Agent tool).
+
+Any skill implementing the dispatch interface contract (see
+`bsky:elbow-grease-dispatch` for the specification) can be used. The orchestrator
+passes role, model, prompt, diff, context, and dismissed findings to the
+dispatch skill and receives structured findings back. This separation allows
+different billing paths, model providers, or execution environments without
+changing the review logic.
+
+### Incremental review mode (`--since`)
+
+When `--since <commit-sha>` is appended to any scope argument (e.g., `branch --since abc123`),
+the review operates in **incremental mode** for fix-round efficiency:
+
+1. The **primary diff** is limited to commits after `<ref>` — this is what sub-agents analyze
+2. Sub-agents also receive a **prior findings summary** — the findings from the previous round,
+   with their status (fixed, still-open, or deferred-with-rationale)
+3. Sub-agents are instructed to:
+   - Verify each prior finding is addressed (fixed in the new commits or explicitly deferred)
+   - Flag **new issues** introduced by the fix commits
+   - Only cross-reference unchanged code when the new changes directly affect it
+   - Not re-review code that hasn't changed since the last review
+4. The coordinator merges the incremental findings with the prior findings to produce a
+   cumulative status report
+
+This mode cuts review time on rounds 2+ significantly by preventing re-analysis of
+already-reviewed, unchanged code. The `/develop` skill's Phase 4.5 should use this mode
+automatically when re-invoking `bsky:elbow-grease` after fixes.
+
+## Phase 1: Gather context
+
+Before reviewing code, build understanding. This phase is **silent** — no output to user.
+
+1. **Identify the diff** — resolve `$ARGUMENTS` to a concrete set of changed files and hunks
+2. **Read project conventions** — check for `.claude/CLAUDE.md`, memory-mcp project memories
+   (use `list` filtered by project scope, look for `project-overview`, conventions), and
+   any linter/formatter configs
+3. **Understand architecture** — for non-trivial changes, use Serena's `get_symbols_overview`
+   on affected files to understand the surrounding code structure. Read symbol bodies only
+   when needed to understand how changed code fits into the system.
+4. **Trace callers** — for any function/method whose signature, behavior, or error handling
+   changed, use `find_referencing_symbols` to identify all call sites. This is critical for
+   catching breakage that looks fine in isolation.
+
+**Context budget:** aim for roughly 1:1 ratio of changed code to surrounding context.
+More context than code means you're over-reading. Less means you're likely missing impact.
+
+**Large diff warning:** research shows review effectiveness drops sharply past 400 lines
+of changed code. If the diff exceeds ~500 lines, tell the user upfront and suggest
+reviewing in logical chunks (by file group or functional area) rather than all at once.
+
+## Phase 2: Analyze
+
+**Language note:** The sub-agent prompts below use Rust-specific examples (iterators,
+`?` operator, `thiserror`, traits, etc.) because that's the primary codebase where this
+skill was developed. When reviewing non-Rust code, map the intent to the equivalent
+idioms in the target language — e.g., Rust's `?` → Python's exception propagation,
+Rust traits → TypeScript interfaces, Rust's ownership model → whatever memory/resource
+management the language provides. The principles are language-agnostic; the examples
+are not.
+
+Launch all five sub-agents concurrently via the dispatch backend (default:
+`bsky:elbow-grease-dispatch`, overridable with `--dispatch <skill-name>`). Each agent
+gets the same diff and context but a different analytical lens. The separation ensures
+independent findings — a bug one agent normalizes, another catches.
+
+**Model assignment** (passed to the dispatch backend as generic names):
+- **sonnet**: Correctness, Design, and Tests sub-agents (mechanical analysis)
+- **opus**: Architecture and Idiomacy sub-agents (judgment-heavy review)
+
+The dispatch backend maps these generic names to provider-specific model IDs.
+When using the default `bsky:elbow-grease-dispatch`, these map to native Claude
+Agent tool calls with the corresponding model parameter.
+
+### Correctness sub-agent
+
+```
+You are reviewing code changes for correctness and safety issues. Precision matters
+more than count. Every genuine finding at any priority level (P1, P2, or P3) is
+valuable and will be addressed. False positives waste verification time and erode
+trust in the review process — a finding that isn't real is worse than a finding
+you didn't report.
+
+Review the following changes for:
+
+**Logic errors**
+- Off-by-one, wrong operator, inverted condition, missing early return
+- Race conditions, TOCTOU, shared mutable state
+- Error handling: swallowed errors, wrong error type, missing propagation
+
+**Completeness gaps** (this is the #1 thing LLM reviewers miss — be thorough)
+- For each branch/match arm: what cases exist in the domain that aren't covered?
+- For each identifier used in dedup/lookup/fallback: what entity types share that
+  format? (e.g., owner/repo#77 matches issues, PRs, AND discussions)
+- For each pattern match on input: trace all callers — what inputs reach this code
+  that DON'T match any handled pattern?
+- "Inputs always look like X" is a red flag — verify by tracing actual data flow
+- For each resource created (sessions, connections, handles, caches, temp files):
+  what cleans it up? Timeout, eviction, explicit close, Drop impl? If nothing
+  cleans it up, that's a finding.
+
+**Data integrity**
+- Mutations that could corrupt or lose data (wrong UPDATE scope, missing WHERE clause)
+- LIKE/GLOB wildcards in user-supplied values without escaping
+- Identifier collisions across entity types sharing the same format
+- Upsert/dedup logic that collapses things that should remain distinct
+
+For each finding, output EXACTLY this format:
+**[P1|P2|P3] <short title>**
+- File: `<path>:<line>`
+- Issue: <1-2 sentence description of what's wrong>
+- Impact: <what breaks, and under what conditions>
+- Fix: <describe the concrete code change or approach — DO NOT implement it>
+```
+
+### Design sub-agent
+
+```
+You are reviewing code changes for design and maintainability issues. Precision matters
+more than count. Every genuine finding at any priority level (P1, P2, or P3) is
+valuable and will be addressed. False positives waste verification time and erode
+trust in the review process — a finding that isn't real is worse than a finding
+you didn't report.
+
+Review the following changes for:
+
+**API contract issues**
+- Breaking changes to public interfaces without migration
+- Inconsistent naming, parameter ordering, or return types vs existing patterns
+- Missing or misleading error messages that will confuse callers
+
+**Dead code & redundancy**
+- Code that the change made unreachable or unnecessary
+- Duplicated logic that should be consolidated
+- Imports, variables, enum variants, or parameters that are no longer used
+- For `Option`-guarded features: does disabling the feature leave allocated-but-unused
+  fields? If so, group the feature's state into a sub-struct and wrap in `Option`.
+
+**Testing gaps**
+- Changed behavior that has no corresponding test update
+- Edge cases in new code that tests don't cover
+- Test assertions that don't actually verify the behavior they claim to test
+
+**Test quality**
+- Do tests exercise the library's public API, or do they duplicate internal logic?
+  Tests that reimplement the production code path instead of calling it prove nothing
+  about the real code.
+- Are assertions non-vacuous? A test should fail if its assertion is removed. Tests
+  that compare single-element collections, assert `true`, or check trivially-true
+  conditions waste CI time and give false confidence.
+- For edge-case tests: is the edge case actually exercised? Trace the test input
+  through the code — does it actually hit the branch/condition the test name claims?
+
+**Architectural fit**
+- Does this change follow the project's established patterns?
+- Are abstractions at the right level? (over-engineering is as bad as under-)
+- Will this change make future work harder? (coupling, hidden dependencies)
+
+For each finding, output EXACTLY this format:
+**[P1|P2|P3] <short title>**
+- File: `<path>:<line>`
+- Issue: <1-2 sentence description of what's wrong>
+- Impact: <what breaks, and under what conditions>
+- Fix: <describe the concrete code change or approach — DO NOT implement it>
+```
+
+### Architecture sub-agent (model: opus)
+
+```
+You are reviewing code changes for architectural fitness and security. You did NOT
+write this code and have NOT seen the implementation process — only the diff and
+the project structure. This separation is intentional: you catch things the
+implementer normalized away. Precision matters more than count. Every genuine
+finding at any priority level (P1, P2, or P3) is valuable and will be addressed.
+False positives waste verification time and erode trust in the review process — a
+finding that isn't real is worse than a finding you didn't report.
+
+Review the following changes for:
+
+**API contracts**
+- Are changes backward-compatible? If breaking: are ALL callers updated?
+  Use `find_referencing_symbols` to verify.
+- Are error types consistent with the project's conventions?
+- Would a consumer of this API be surprised by the new behavior?
+
+**Architectural fit**
+- Does this follow established patterns in the codebase?
+- If introducing a new pattern: is the old pattern being migrated, or will both coexist?
+- Are dependencies flowing in the right direction? (no circular deps, no upward deps)
+- Is the abstraction level appropriate? (not over-engineered, not under-abstracted)
+
+**Completeness**
+- For each match/branch: what cases exist in the domain that aren't handled?
+- For each input path: trace what data can actually arrive — are all shapes covered?
+- Are error paths tested? Is the happy path the only path tested?
+
+**Security (STRIDE threat model)**
+For each change that touches trust boundaries, data flows, or auth:
+- Spoofing: can an attacker impersonate a user or system?
+- Tampering: can data be modified in transit/at rest without detection?
+- Repudiation: can actions occur without accountability/logging?
+- Information disclosure: can sensitive data leak via logs, errors, side channels?
+- Denial of service: can an attacker exhaust resources (CPU, memory, connections)?
+  Specifically: stateful services that accept external connections — is there a
+  session/connection limit and idle timeout? Unbounded accumulation from external
+  triggers is a resource exhaustion vector.
+- Elevation of privilege: can a user gain access beyond their authorization?
+
+Also check for concrete injection vectors:
+- SQL, command, XSS, template, LDAP, path traversal
+- Hardcoded secrets, weak crypto, insufficient randomness
+
+**Security (beyond STRIDE)**
+- Credential exposure: can secrets appear in process listings (ps), logs, stdout,
+  error messages, stack traces, or debug output? Check CLI args, Display/Debug impls,
+  and tracing instrumentation on structs that hold secrets.
+- Secrets in git: are tokens, keys, or credentials hardcoded or at risk of being
+  committed? Check for missing .gitignore entries, secrets in config files, or test
+  fixtures containing real credentials.
+- Trust boundaries: where does external input enter the system? Is it validated before
+  use? Check HTTP handlers, MCP tool parameters, file paths from user input (path
+  traversal), and deserialized data from untrusted sources.
+- Auth bypass: can any code path skip authentication or authorization? Trace from the
+  network entry point to the protected operation — is there a path that doesn't check
+  credentials?
+- Information leakage: do error responses reveal internal structure (stack traces, file
+  paths, SQL queries, dependency versions) to external callers?
+- Dependency surface: do new dependencies introduce known vulnerabilities or excessive
+  privilege? Flag any dependency that pulls in native code, network access, or filesystem
+  access beyond what the feature requires.
+
+**Simplicity**
+- Could the same result be achieved with less code?
+- Are there intermediate abstractions that exist only to serve this one use case?
+- Is there dead code from a previous approach that should be cleaned up?
+- Would a future reader understand this without the PR description?
+
+For each finding, output EXACTLY this format:
+**[P1|P2|P3] <short title>**
+- File: `<path>:<line>`
+- Issue: <1-2 sentence description of what's wrong>
+- Impact: <what breaks, and under what conditions>
+- Fix: <describe the concrete code change or approach — DO NOT implement it>
+```
+
+### Idiomacy sub-agent (model: opus)
+
+```
+You are reviewing code changes for idiomatic language use and elegance. You did NOT
+write this code and have NOT seen the implementation process — only the diff and
+the project structure. Precision matters more than count. Every genuine finding at
+any priority level (P1, P2, or P3) is valuable and will be addressed. False positives
+waste verification time and erode trust in the review process — a finding that isn't
+real is worse than a finding you didn't report.
+
+Review the following changes for:
+
+**Idiomatic language use**
+- Is the code written in the style that experienced practitioners of this language
+  would recognize and expect? Not "clever" — natural.
+- Are language features being used as intended? (e.g., in Rust: iterators over manual
+  loops, `?` over explicit match-on-Result, `impl From` over manual conversion
+  functions, exhaustive matching over catch-all arms, newtypes over primitive obsession)
+- Are there patterns that work but fight the language? (e.g., index-based iteration
+  where `for item in collection` works, manual lifetime annotations where elision
+  applies, unnecessary clones where borrows suffice, Arc<Mutex<>> where channels or
+  message passing fit better)
+- Does error handling follow the ecosystem's conventions? (e.g., thiserror for library
+  errors, anyhow for application errors, not both in the same crate without reason)
+
+**Expressiveness**
+- Could a block of code be replaced by a standard library or well-known crate method
+  that does the same thing? (e.g., `Option::map` over if-let-then-Some, `Iterator::any`
+  over a loop-with-flag, `Entry` API over contains-then-insert)
+- Are there chains of transformations that would read more clearly as iterator pipelines
+  or combinators?
+- Are there nested conditionals that could be flattened with early returns or guard
+  clauses?
+- Is there unnecessary intermediate state (mutable variables used once, temp collections
+  built just to iterate)?
+
+**Type design**
+- Do types encode invariants, or do they rely on runtime checks for things the type
+  system could guarantee? (e.g., separate structs for validated vs unvalidated data,
+  enums over boolean flags, NonZero types where zero is invalid)
+- **Loose-string audit** — challenge every `String`. For each `String` / `Option<String>`
+  field, parameter, or return value, name the constraint on it or confirm it is
+  genuinely free-form text. Flag stringly-typed constrained domains — timestamps, dates,
+  durations, IDs, URLs, paths, semver, enums-encoded-as-strings — and recommend the
+  domain type: a newtype, an existing project type (e.g. a `Timestamp` / `DateTime<Utc>`),
+  or an enum. A field such as `timestamp: String` that a datetime type would model is a
+  finding: it defers to runtime parsing what the type system could guarantee. This is the
+  class of issue that slips through unless every `String` is challenged, so do not skip it.
+- Are generic bounds minimal? Over-constrained generics limit reuse; under-constrained
+  ones push errors to call sites.
+- Are trait implementations missing that would make the types more composable?
+  (Display, From/Into, Default, AsRef where natural)
+
+**Consistency with surrounding code**
+- If the codebase has an established style for similar operations, does the new code
+  follow it? Divergence should be intentional improvement, not accidental inconsistency.
+- If the change introduces a better pattern than what exists, note it as a potential
+  follow-up migration — but don't block the PR on cleaning up pre-existing code.
+
+**Clarity**
+- Would a competent practitioner of this language understand the intent without comments?
+  If not, the code structure is the problem — adding a comment is the wrong fix.
+- Are names precise? A name like `process` or `handle` or `data` is a code smell.
+  Names should distinguish this thing from other things of the same type.
+- Is the code's structure aligned with its logical structure? (e.g., related operations
+  grouped together, guard clauses before main logic, error paths before happy paths)
+
+This reviewer is NOT about style preferences, formatting, or bikeshedding. It's about
+whether the code is using the language well — the way you'd want to find it if you were
+debugging at 2am six months from now.
+
+For each finding, output EXACTLY this format:
+**[P1|P2|P3] <short title>**
+- File: `<path>:<line>`
+- Issue: <1-2 sentence description of what's wrong>
+- Impact: <what breaks, and under what conditions>
+- Fix: <describe the concrete code change or approach — DO NOT implement it>
+```
+
+### Tests sub-agent (model: sonnet)
+
+```
+You are reviewing code changes exclusively for test quality. You did NOT write this
+code. Your ONLY focus is whether the tests actually prove what they claim to prove.
+Do not review production code for correctness, design, or security — other agents
+handle that.
+
+Review ALL tests in the diff (new and modified) for:
+
+**Vacuous tests**
+- Does the test actually exercise the code path it names? Could the test pass even
+  if the feature was completely broken?
+- Would removing the assertion still cause the test to pass? If yes, the test is
+  vacuous.
+- Tests that compare a value against itself, assert `true`, or check trivially-true
+  conditions are vacuous.
+
+**Named path coverage**
+- Trace each test's input through the production code. Does it actually reach the
+  code path the test name implies?
+- If the error fires earlier than intended (e.g., validation rejects before reaching
+  the business logic), the named path is untested even though the test passes.
+
+**Missing edge cases**
+- For each code path added or changed: what inputs aren't covered? Empty collections,
+  boundary values (0, 1, max), error paths, concurrent access patterns.
+- For each match/branch in the production code: is there a test exercising each arm?
+- Are there negative tests — tests for what should NOT happen? (e.g., unauthorized
+  access is rejected, invalid input is caught, duplicate operations are idempotent)
+
+**Test doubles vs production constraints**
+- If mocks, stubs, or test helpers are used: do they enforce the same invariants
+  production code does? Dimension checks, format validation, size limits — if
+  production enforces it, the test double must too.
+- Are test fixtures representative of real data, or do they use trivial values that
+  skip production validation?
+
+**Assertion completeness**
+- Does the test check return values, side effects, AND state changes? A test that
+  only checks the return value misses mutations.
+- For error-path tests: does it verify the specific error type/message, or just that
+  "an error occurred"?
+- For serialization tests: does it pin the exact wire format (snapshot test), or just
+  check a single field?
+
+**Chunk/batch boundary tests**
+- When code processes items in batches: does the test compare an item batched WITH
+  OTHERS against standalone? Comparing a solo-batch item against standalone is
+  vacuously true.
+
+**Pruning/eviction/lifecycle tests**
+- When code has capacity limits, TTLs, or cleanup: is there a test that exceeds the
+  limit and verifies eviction behavior? Not just "item is added" but "oldest item is
+  removed when capacity is exceeded."
+
+For each finding, output EXACTLY this format:
+**[P1|P2|P3] <short title>**
+- File: `<path>:<line>`
+- Issue: <1-2 sentence description of what's wrong>
+- Impact: <what breaks, and under what conditions>
+- Fix: <describe the concrete test to add or fix — DO NOT implement it>
+```
+
+### Providing context to sub-agents
+
+Each sub-agent receives:
+1. The diff (changed lines with surrounding context)
+2. Project conventions (from Phase 1)
+3. Symbol overview of affected files
+4. Caller information for changed function signatures
+5. Contents of `code-review-patterns` memory from memory-mcp (learned patterns)
+6. **Previously dismissed findings** (for multi-round reviews only — see Phase 3)
+
+Use Serena tools within sub-agents for any additional code exploration needed.
+
+When running a subsequent round on the same scope, include a "Previously dismissed"
+section in each sub-agent prompt. This prevents agents from re-discovering the same
+false positives and wasting verification cycles. Use this format:
+
+```
+Previously evaluated and dismissed (do not re-flag unless you have NEW evidence
+that changes the analysis):
+- "<finding title>" — <reason for dismissal>
+```
+
+Only include findings that were **verified as false positives** in a prior Phase 3 —
+not findings that were real and fixed (those belong in the "previously fixed" context).
+
+### Severity definitions
+
+| Level | Meaning                                                    |
+|-------|------------------------------------------------------------|
+| P1    | Data loss, security vulnerability, crash, or silent corruption |
+| P2    | Incorrect behavior, broken edge case, or test gap            |
+| P3    | Design issue, dead code, or maintainability concern          |
+
+## Phase 3: Deduplicate & verify
+
+After all five sub-agents return:
+
+1. **Merge findings** — combine all five agents' results, removing duplicates
+2. **Verify each finding** — for every P1 and P2, read the actual code to confirm
+   the issue is real. LLM reviewers hallucinate findings; do not pass through
+   unverified claims. Drop any finding you cannot confirm by reading the code.
+3. **Check for false positives** — common traps:
+   - "Missing error handling" when the framework/caller already handles it
+   - "SQL injection" when parameterized queries are actually used
+   - "Race condition" in single-threaded or async-but-sequential code
+   - "Missing null check" when the type system prevents nulls
+   - "Unused variable" that is used in a macro, template, or framework convention
+   - "Breaking change" to an internal API with no external consumers
+   - Flagging an intentional pattern as a bug (check if the same pattern appears
+     elsewhere in the codebase — if so, it's likely deliberate). However: if a
+     pattern *looks* like a bug but appears intentional, still flag it as a P3
+     asking the author to add a comment explaining why. Code that requires
+     reviewer investigation to distinguish from a bug needs a comment.
+4. **Track dismissed findings** — for each finding dropped as a false positive,
+   record the finding title and a one-line reason for dismissal. This list is
+   carried forward into sub-agent prompts in subsequent rounds (see Phase 2,
+   "Providing context to sub-agents") so agents do not re-flag the same non-issues.
+   Include dismissed findings in the report's Summary section for transparency.
+5. **File issues for pre-existing findings** — if a finding is real but dismissed
+   because it's a pre-existing pattern (not introduced by this PR), file a GitHub
+   issue documenting the problem and affected code locations. These are real issues
+   discovered during review — capturing them ensures they don't get lost. Include
+   the issue URLs in the report's Dismissed section.
+
+## Phase 3.5: Fix & re-review (autonomous loop)
+
+If any P1, P2, or P3 findings survived verification in Phase 3:
+
+1. **Fix all findings** — implement the concrete fixes described in each finding.
+   Do not ask the user which findings to address. Fix all of them.
+2. **Commit the fixes** — create a new commit with a clear message describing what
+   was fixed (e.g., "fix: address PR #N review findings").
+3. **Re-run Phase 2** with `--since <previous-commit>` to get incremental review of
+   only the fix commits. Include the prior findings as "previously fixed" context so
+   sub-agents can verify fixes and check for regressions.
+4. **Repeat** — if the incremental review produces new findings, fix those and re-run.
+   Continue until a review round returns PASS (zero findings).
+
+This loop is autonomous — no user intervention between rounds. The user sees the
+final clean result, not each intermediate round. Each round should push the fix
+commit so the PR reflects the full review history.
+
+**Exit conditions:**
+- PASS — zero findings. Proceed to Phase 4 (Report).
+- Stalemate — a finding cannot be fixed without changing the design intent. Report
+  it as deferred with rationale and proceed to Phase 4.
+
+## Phase 4: Report
+
+Present findings grouped by severity, then by file. Use this format:
+
+```
+## Code Review: <scope description>
+
+### P1 — Critical (N findings)
+
+**<title>** — `path/to/file.py:42`
+<description with concrete fix>
+
+### P2 — Important (N findings)
+
+...
+
+### P3 — Suggestions (N findings)
+
+...
+
+### Summary
+- N files reviewed, M findings (X P1, Y P2, Z P3)
+- Key themes: <1-2 sentence synthesis of what the findings reveal>
+```
+
+If there are zero findings at a severity level, omit that section entirely.
+If there are zero findings total, say so clearly — don't invent issues to fill space.
+
+## Phase 5: Post findings
+
+Findings should be captured somewhere durable, not just displayed in-session. Try each
+option in order and use the first that works:
+
+### Option A: Post to an existing PR
+
+Check if the reviewed scope corresponds to a PR:
+- If `$ARGUMENTS` is `pr` or `pr <N>`, the PR is already known
+- If `$ARGUMENTS` is `branch`, check for an open PR on the current branch:
+  `gh pr list --head <branch> --state open --json number,url`
+- If a PR exists, post the review as a PR comment: `gh pr comment <N> --body <review>`
+
+### Option B: Post to an existing issue
+
+If no PR exists, check if there's a tracked issue for the work:
+- Check Serena project memories for issue references
+- Check gh-notify work items for linked issues
+- If an issue exists, post findings as a comment: `gh issue comment <N> --repo <repo> --body <review>`
+
+### Option C: Create a PR
+
+If the work is in a git repo with uncommitted or unpushed changes on a feature branch:
+1. Ensure changes are committed and pushed
+2. Create a PR: `gh pr create --title "<branch context>" --body <review>`
+3. The review becomes the PR description
+
+Only do this when it's straightforward — the branch exists, changes are committed, and
+it's clear what the PR should be. Ask the user if anything is ambiguous.
+
+### Option D: Create an issue
+
+If the work is in a repo but there's no PR or existing issue:
+- Create an issue with the review findings: `gh issue create --title "Code review: <scope>" --body <review>`
+- This captures findings for later action
+
+### Option E: Display in-session only
+
+If none of the above apply (e.g., reviewing files outside version control, or the user
+is working interactively and will act on findings immediately), displaying the review
+in the conversation is sufficient. The findings are still valuable even without a
+durable destination.
+
+Always tell the user where the review was posted (PR URL, issue URL, or "displayed in-session").
+
+## Phase 6: Learn
+
+Every review is a learning opportunity. This phase feeds findings back into the
+process so the same gaps don't recur.
+
+### 6a. Pattern capture
+
+If the review produced P1 or P2 findings that reveal a **recurring pattern** (not
+just a one-off bug), update the `code-review-patterns` memory in memory-mcp
+(scope: global):
+
+- New pattern: what to look for, why it matters, example from this review
+- Refinement: if an existing pattern helped catch something, note the confirmation
+- Removal: if a pattern consistently produces false positives, remove it
+
+Only update patterns for findings that were **verified** in Phase 3.
+
+### 6b. Skill self-improvement
+
+Ask: did this review reveal a gap in the review process itself?
+
+- Did a sub-agent consistently miss a class of issue? → strengthen its prompt
+- Did a finding type emerge that no existing reviewer covers? → add it to the
+  relevant sub-agent, or propose a new one
+- Did false positives cluster around a specific check? → refine or remove it
+- Did the severity definitions cause miscategorization? → adjust
+
+If yes, update this skill's SKILL.md. The review skill should get sharper with
+every use, not just accumulate patterns in memory.
+
+### 6c. Left-shifted feedback
+
+Ask: should an upstream skill (`/design`, `/develop`) have caught this?
+
+- Architectural issue that design should have surfaced → flag for design skill update
+- Implementation gap that the develop planning phase should have specified → flag
+  for develop skill update
+
+When invoked standalone (not through `/develop`), note left-shifted feedback in the
+review output. When invoked through `/develop`, the develop skill's Phase 6 handles
+propagation.
+
+## Configuration
+
+The skill respects project-level overrides. If a project's memory-mcp memories contain a
+`code-review-config` memory (check with `list` filtered by project scope), read it and apply:
+
+- **skip_categories**: list of categories to suppress (e.g., `["dead_code"]`)
+- **extra_patterns**: additional domain-specific patterns to check
+- **severity_overrides**: reclassify certain finding types (e.g., `dead_code: P3→ignore`)
+
+## Guidelines
+
+- **No style nits** — formatting, naming conventions, and whitespace are for linters, not review
+- **No praise** — "great use of X" wastes everyone's time
+- **Concrete fixes only** — every finding must include a specific fix, not "consider refactoring"
+- **Assume competence** — if the author demonstrates a practice correctly elsewhere in the
+  diff (e.g., parameterized queries in 9 out of 10 call sites), the 10th omission is a real
+  finding. But explaining *what* parameterized queries are is not — the author clearly knows.
+  Focus on what they missed, not what they already understand. Generic tutorial-style advice
+  erodes trust in the review and makes developers skim past the findings that matter.
+- **Verify before reporting** — a false positive is worse than a missed finding, because it
+  erodes trust in the review process

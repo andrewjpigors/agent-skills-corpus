@@ -1,0 +1,784 @@
+---
+name: code-reviewer
+description: >-
+  Issue-aware code review workflow for working diffs, commits, branches, and pull
+  requests. Use when: reviewing implementation against a tracker ticket (Jira, GitHub
+  issue, GitLab issue, etc.), bug report, feature request, task description, acceptance criteria, or general engineering
+  quality bar. Applies two layers: issue/ticket alignment first, then general engineering
+  quality. Reuses issue-investigator when expected behavior, root cause, or issue context
+  is unclear, and reuses software-engineer for architecture, implementation quality,
+  testability, and production-risk judgment.
+license: MIT
+compatibility: >-
+  Works with any agent that supports the Agent Skills format (Claude Code, Cursor,
+  Windsurf, Continue, GitHub Copilot Chat, ChatGPT, etc.). Two execution modes —
+  `local-workspace` (multi-repo, setup.init + .env) and `in-repo` (single-repo,
+  .agent-skills.yml). See docs/execution-modes.md.
+metadata:
+  author: wamalalawrence
+  version: "0.35.0"
+  homepage: "https://github.com/wamalalawrence/agent-skills"
+argument-hint: >-
+  optional: mode inner|outer, base branch, issue key/URL, PR URL, or task description
+user-invocable: true
+disable-model-invocation: false
+---
+
+# Code Reviewer
+
+Use this skill to review code changes with both issue awareness and general engineering judgment.
+
+The reviewer must not behave like a generic lint bot. If issue context exists, review the change
+against the real requested behavior first, then review the engineering quality of the
+implementation.
+
+## ⚠️ PREFLIGHT — Execute before ANY other action
+
+This skill participates in the [Company Brain](../../../../docs/company-brain.md)
+self-improving loop. Before context discovery, diff review, or verdict, run this
+ONE command. No arguments are required; the script detects the project and task
+id from config, GitHub environment, branch, or cwd:
+
+```bash
+bash scripts/start-task.sh --skill code-reviewer=0.35.0
+```
+
+If detection is wrong, rerun with explicit values:
+
+```bash
+bash scripts/start-task.sh <project> <issue-key> --skill code-reviewer=0.35.0
+```
+
+If `scripts/start-task.sh` is not at the current cwd, use the installed
+`agent-skills/scripts/start-task.sh` or `.agent-skills/scripts/start-task.sh`
+path. If you cannot run the wrapper after locating it, run the three individual
+steps:
+1. `python3 scripts/org-memory.py read` (non-fatal if missing)
+2. `python3 scripts/project-memory.py read <project>` (init the skeleton if missing)
+3. `python3 scripts/blackboard.py init <issue-key> --project <project>`
+
+**The output IS your starting context.** Do not re-discover facts already
+recorded in project memory. Every `Common gotchas` bullet is a verified
+constraint; every `Build & runtime` bullet is the authoritative build command.
+
+After the task, run:
+
+```bash
+bash scripts/finish-task.sh --skill code-reviewer --summary "<one sentence outcome>"
+```
+
+For blocked or needs-context runs, pass `--status blocked` or
+`--status needs-context`; the finish wrapper preserves scratch in those states.
+See
+[`docs/project-memory.md`](../../../../docs/project-memory.md) for the full contract.
+
+> Skipping these steps is the #1 failure mode. Task size does not waive them:
+> a small staged diff review and a full PR review both start and finish through
+> the lifecycle wrappers.
+
+> **Safety floor.** This skill inherits the
+> [destructive-action safety policy](../../../../docs/destructive-action-safety.md). The
+> reviewer must surface — as a `blocker` — any diff that: invokes a credential read from
+> repository files, ships a destructive cloud-provider / orchestrator / database command
+> against production, weakens IAM / role / network / secret / backup controls, or proposes
+> "fix by deletion" against live data. Discovered hardcoded secrets in the diff are also a
+> `blocker` finding with a recommendation to rotate. The reviewer must not approve a diff
+> that violates the safety floor regardless of how the PR description frames it.
+
+## Purpose
+
+- Verify that a code change solves the actual issue, ticket, bug report, feature request, or task
+  description.
+- Check implementation quality, maintainability, correctness, security, performance, observability,
+  test coverage, compatibility, and regression risk.
+- Produce evidence-based findings with severity, confidence, blocking/advisory status, and concrete
+  suggested fixes.
+- Avoid low-value style comments that formatters, linters, or static analysis tools should handle.
+
+## When To Use
+
+- Before opening or updating a pull request.
+- During the [`software-engineer`](../../SKILL.md) inner-loop review after implementation is staged.
+- During the [`software-engineer`](../../SKILL.md) outer-loop review after QA has run.
+- When reviewing a PR, branch, commit range, staged diff, or uncommitted working diff.
+- When a change needs issue-aware review against a tracker ticket (Jira, GitHub Issues, GitLab
+  Issues, etc.), a support ticket, incident,
+  feature request, task description, acceptance criteria, or linked documents.
+
+## When Not To Use
+
+- Do not use to implement fixes unless the user explicitly asks for code changes; this skill
+  reviews and recommends.
+- Do not use for issue-aware approval when issue context, expected behavior, or root cause cannot be
+  read or supplied; use [`issue-investigator`](../issue-investigator/SKILL.md) first.
+- Do not use as a formatter, linter, or broad style-policing tool.
+- Do not review a generated summary without the actual diff, files, or PR context needed to verify
+  the claim.
+
+## Related And Reused Skills
+
+- [`issue-investigator`](../issue-investigator/SKILL.md): use when ticket context, expected
+  behavior, issue type, root cause, reproduction status, or acceptance criteria are unclear. Do not
+  guess issue intent during review.
+- [`software-engineer`](../../SKILL.md): use for implementation quality, architecture, testability,
+  build validation, maintainability, security, and production-risk judgment.
+- [`product-owner`](../../../product-owner/SKILL.md): use when product value, scope, acceptance
+  criteria, or UX expectations are unclear.
+- [`manual-tester`](../../../manual-tester/SKILL.md): use when review needs manual validation
+  scenarios, exploratory findings, or defect evidence.
+- [`test-automation-engineer`](../../../test-automation-engineer/SKILL.md): use when review needs
+  automation-level judgment, flaky test analysis, or regression test design.
+
+Code review does not rewrite code directly unless the user explicitly asks for implementation
+changes. It identifies risks and recommends fixes.
+
+## Required Inputs
+
+Accept any of these review targets:
+
+- Staged diff, working diff, branch diff, commit range, or pull request URL.
+- Base branch or comparison target. If absent, derive it from `${PROJECTS_JSON}` or
+  `${GITHUB_DEFAULT_BRANCH}`.
+- Issue context: tracker ticket (Jira key, GitHub issue URL, GitLab issue URL, etc.), bug report,
+  acceptance criteria, or linked documents.
+- Repository path or enough context to identify the project in `${PROJECTS_JSON}`.
+- Optional standards: engineering handbook, architecture notes, coding standards, API guidelines,
+  security rules, or URLs provided by the user.
+
+If a review target is missing, stop and ask. If issue context is available but inaccessible or
+ambiguous, use [`issue-investigator`](../issue-investigator/SKILL.md) or ask the user before
+producing a final verdict.
+
+## Stopping Conditions
+
+Stop and return `final verdict: NEEDS_CONTEXT` or `NOT_REVIEWABLE` when:
+
+- The review target, base branch, or changed files cannot be determined.
+- Issue-aware review is requested but expected behavior, acceptance criteria, or root-cause evidence
+  is missing.
+- The diff is too large or truncated enough that high-confidence findings would be misleading.
+- Required repository setup, build metadata, or supplied standards are inaccessible and the user did
+  not request a manual partial review.
+- A finding depends on private/company standards that were not provided.
+
+## Required Environment
+
+Run this setup preflight before reviewing.
+
+**Detect execution mode** ([docs/execution-modes.md](../../../../docs/execution-modes.md)): if
+`AGENT_SKILLS_MODE` is set to `local-workspace` or `in-repo`, use it; else if
+`${WORKSPACE_ROOT}/.env` is present → `local-workspace`; else if `.agent-skills.yml` exists at the
+repo root → `in-repo`; else stop.
+
+If the resolved configuration is missing, unreadable, or lacks enough project metadata to identify
+the review target, warn and stop for local branch/PR review. Manual review of a user-supplied diff
+may continue only when the output clearly states that repository setup, build commands, and
+issue-system access were not verified.
+
+If issue-aware review is requested or an issue key/URL is present, usable issue context is required.
+Tracker host metadata (Jira, GitLab, etc.) can come from `.env` or `.agent-skills.yml`; the
+credential (`JIRA_API_TOKEN` or equivalent) always comes from environment variables.
+`.jira-config.yml` (or equivalent tracker config) is optional. If the issue cannot be read
+and the user did not provide the ticket summary, acceptance criteria, and key comments directly,
+stop or ask for that context before producing a verdict.
+
+**Auth discovery before recording the tracker/document-store as unavailable.** Before listing
+the issue tracker or linked document store under `Review Limitations / Unavailable Context`,
+walk the documented [discovery order](../../../../docs/auth-discovery.md#discovery-order):
+`.agent-skills.yml` → `.jira-config.yml` (or equivalent tracker config) → `.env` /
+`.env.local` → process env → `scripts/auth-preflight.py`. If config
+exists but `${VAR}` placeholders are unresolved, record the limitation as **"tracker config
+incomplete — unresolved placeholder X"**, not "no tracker access". The reviewer must not give a
+bare `PASS` when issue alignment could not be checked because of an avoidable auth-discovery
+miss; if the preflight has not been run and the tracker is in scope, the correct verdict is
+`NEEDS_CONTEXT`.
+
+**Locate config files before declaring any missing.** Run
+`python3 scripts/locate-config.py` — `.env` / `.jira-config.yml` (or equivalent tracker
+config) live in the parent workspace
+folder, not the repo cwd. A `Review Limitations` line that reads "`.env` not present in the
+repo" without naming every directory the locator searched is itself a finding the reviewer
+must correct, not surface.
+
+**GitHub access.** If the review needs to fetch the PR, related PRs, or issue history and
+`gh` reports a 404, walk the [GitHub access ladder](../../../../docs/github-access.md)
+(`scripts/github-access.sh <owner>/<repo>`) before listing GitHub as unavailable. Switching
+the active account is often the fix on multi-account laptops.
+
+**Project memory.** Before computing the verdict, run `python3 scripts/project-memory.py
+read <project>` for the project under review. Recorded gotchas (Testcontainers profile flag,
+required generators, runtime version) often explain why a CI step that looks broken is
+actually correct — and avoid `NEEDS_CONTEXT` verdicts that the recorded fact resolves.
+
+**Auth-discovery failure during issue-aware review is not a Note.** If issue-aware review was
+requested and the credential resolves empty, the config has unresolved `${VAR}` placeholders,
+or `jira issue view <KEY>` / the equivalent fetch fails, the verdict **must** be
+`NEEDS_CONTEXT`. The reviewer must not emit `PASS_WITH_NOTES` and bury the auth failure as
+a Note alongside actual findings; the ticket was not read, so issue alignment was not
+verified, so the review's headline conclusion is unsupported. The only exception is when
+the user supplied the ticket summary, expected behavior, and acceptance criteria directly
+in the prompt — the review then proceeds as `partial` issue-awareness with the verbatim
+user-supplied context recorded in `Issue/Ticket Alignment`.
+
+Review setup variables:
+
+- `WORKSPACE_ROOT`: required in `local-workspace` mode. Resolves repos and cache paths. In
+  `in-repo` mode, the repository root is used.
+- `PROJECTS_JSON`: required in `local-workspace` mode. Provides project identity, stack, base
+  branch, build, and format commands. In `in-repo` mode, the single `project:` block in
+  `.agent-skills.yml` replaces this.
+- `GITHUB_DEFAULT_BRANCH`: required. Defaults to `main`; used as the base branch fallback.
+- `CODE_REVIEWER_BLOCKING`: optional. Defaults to `false`; when `true`, blocker findings stop the
+  calling workflow.
+- `CODE_REVIEWER_MAX_FILES`: optional. Defaults to `80`; warns when non-trivial changed files
+  exceed this.
+- `CODE_REVIEWER_MAX_DIFF_CHARS`: optional. Defaults to `60000`; sets the diff character budget per
+  review pass.
+- `CODE_REVIEWER_SHOW_SEVERITIES`: optional. Defaults to `blocker,major,minor,nit`; controls
+  severities surfaced in outer-loop mode.
+- `CODE_REVIEWER_INNER_LOOP_SEVERITIES`: optional. Defaults to `blocker,major`; controls severities
+  surfaced in inner-loop mode.
+- `CODE_REVIEWER_MAX_ROUNDS`: optional. Defaults to `3`; maximum engineer-reviewer iteration rounds
+  before escalation.
+- `CODE_REVIEWER_CACHE_DIR`: optional. Defaults to
+  `${AGENT_SKILLS_CACHE_DIR:-${WORKSPACE_ROOT:-$REPO_ROOT}/.cache/code-reviewer}`; caches fetched
+  issue-context summaries.
+- `CODE_REVIEWER_CACHE_TTL_HOURS`: optional. Defaults to `24`; cache TTL.
+- `JIRA_HOST`, `JIRA_API_TOKEN`, `JIRA_AUTH_TYPE`: required only for Jira issue-aware review.
+  For other trackers (GitLab, Azure DevOps, etc.), the equivalent tracker-specific variables apply.
+- `CONFLUENCE_HOST`, `CONFLUENCE_API_TOKEN`: required only when linked docs require them.
+- `SHARED_LIBRARY_NAMES`: optional. Used for cross-project impact detection.
+- `API_MODULE_PATTERNS`: optional. Used for API and contract risk detection.
+- `SECURITY_CONFIG_PATTERNS`: optional. Used for security-sensitive file detection.
+- `MIGRATION_PATH_PATTERNS`: optional. Used for migration risk detection.
+
+If required setup is missing, output:
+
+> Missing required setup: `<NAME or file>`. I will not continue with issue-aware or repository-aware
+> review because the result would be based on incomplete context. Add/update
+> `${WORKSPACE_ROOT}/.env` (local-workspace) or `.agent-skills.yml` at the repo root (in-repo — see
+> `agent-skills/.agent-skills.example.yml`), provide the missing issue/project details directly, or
+> explicitly ask for a non-issue-aware manual review.
+
+## Required Workflow
+
+### 0. Requirement Understanding Gate
+
+Before reviewing the diff, run the shared
+[requirement-understanding workflow](../../../../docs/requirement-understanding.md) against the
+**review target**, not the diff. The reviewer's job is to verify that the change solves the right
+problem; that requires the reviewer to know what the right problem is. Emit the
+`Requirement Understanding` block (twelve fields) above the rest of the review output and use it
+to answer five review-specific questions:
+
+- Does the diff solve the actual requirement, or a different one?
+- Was the requirement clear enough to review against, or did the engineer have to invent intent?
+- Does the diff solve only part of the issue and silently leave the rest open?
+- Does the diff introduce behavior beyond what the requirement asked for, without justification?
+- Are the acceptance criteria observable in the diff (tests, error messages, log lines, API
+  contract) or only asserted in the PR description?
+
+When the engineer's evidence pack already contains the gate output (written by
+[`software-engineer`](../../SKILL.md) or
+[`issue-investigator`](../issue-investigator/SKILL.md)), reuse it and verify it against the diff
+rather than re-deriving from scratch. The reviewer must not weaken a gate decision the engineer
+correctly made; if the engineer left it `low` and shipped anyway, that is itself a `blocker`
+finding.
+
+Binding rules:
+
+- **`unknown` / `low`** understanding of the requirement — do **not** issue a bare `PASS`. Use
+  `NEEDS_CONTEXT` when issue context is missing, or `PASS_WITH_NOTES` /
+  `REQUEST_CHANGES` depending on the diff risk. Hand off to
+  [`issue-investigator`](../issue-investigator/SKILL.md) when expected behavior, root cause, or
+  reproduction status are missing.
+- **`medium`** — may complete the review with the gate's load-bearing assumptions visible in the
+  `Review Limitations / Unavailable Context` section. A bare `PASS` requires every gate item to
+  be `none` or explicitly waived by the user.
+- **`high`** — may produce any verdict, including `PASS`, when the diff matches the understood
+  requirement and no other limitations remain.
+
+This gate is the precondition for the layered review in steps 2-3 below; it is not a substitute
+for them.
+
+### 1. Resolve review target
+
+- Verify local setup is sufficient for the requested review mode before deriving base branch,
+  project identity, or issue context.
+- Confirm the current directory is inside a git working tree when reviewing local changes.
+- Identify repo, branch, base branch, changed files, and review mode.
+- For issue-aware Jira review, extract issue keys from branch name, PR title/body, commits, and diff
+  text. Exactly one primary Jira key may own the PR. Multiple independent Jira keys in one branch or
+  PR are a `blocker` unless the PR is explicitly a mechanical dependency update with no ticket
+  scope expansion and the user supplied a written waiver. Linked parent/duplicate keys may be
+  listed as context but must not expand the review scope.
+- Supported modes:
+  - `inner`: staged diff, intended for implementation checkpoint review.
+  - `outer`: branch diff against base, intended for pre-PR or final review.
+  - `pr`: pull request diff and metadata.
+  - `manual`: user-supplied diff or code excerpt. Use the `test-quality` profile when the diff is
+    test code (e.g., `test-automation-engineer` or `manual-tester` outputs) and focus findings on
+    selector stability, deterministic data, condition-based waits (no fixed sleeps), assertion
+    meaningfulness, and isolation.
+
+#### Hard handoff contract from the engineer
+
+When invoked from [`software-engineer`](../../SKILL.md) (inner or outer loop), read
+`${AGENT_SKILLS_CACHE_DIR:-${WORKSPACE_ROOT:-$REPO_ROOT}/.cache/agent-skills}/<issue-key>/evidence-pack.yml`
+per the [evidence-pack schema](../../references/evidence-pack.md) and expect every required field.
+Surface a `major` finding when any of the following is missing or empty:
+
+- `project` block (name, stack, base_branch, build_command).
+- `issue_url`, `summary`, `expected_behavior`, `acceptance_criteria`.
+- `investigation.root_cause_status` and `investigation.confidence`, when the change is a bug fix or
+  regression. Stop and invoke [`issue-investigator`](../issue-investigator/SKILL.md) when these are
+  absent.
+- `plan` (the engineer's 5-line plan: problem · hypothesis · smallest change · risk · validation).
+- `risk_areas`.
+- For bug fixes: a referenced **failing-regression-test commit** that fails on the commit's parent
+  and passes on HEAD (`--repro-verify` mode). Cross-check with `repro-recipe.yml` if present.
+- For outer-loop or PR review:
+  `${AGENT_SKILLS_CACHE_DIR:-${WORKSPACE_ROOT:-$REPO_ROOT}/.cache/agent-skills}/<issue-key>/definition-of-done.json`
+  per the [Definition of Done schema](../../references/definition-of-done.md). Any `false` flag
+  without a written waiver is itself a `blocker`.
+- **`safety_acknowledgement` block in `definition-of-done.json` whenever the diff touches a
+  deployed environment, credentials, IAM, secrets, backups, monitoring, or network policy.**
+  The reviewer must refuse to advance — surface a `blocker` finding — when any of:
+  the block is missing on a diff that obviously requires it (changes to IaC, CI deployment,
+  IAM, secret stores, migrations, or any cloud-provider command);
+  `safety_acknowledgement.applies: true` but `no_discovered_credentials_invoked: false` or
+  `no_in_repo_tokens_invoked: false`;
+  `destructive_command_used: true` without a populated `destructive_command_authorization`
+  (approver + ticket + runbook_path);
+  `execution_path: agent` for a destructive / IAM / secret / backup change;
+  `monitoring_unchanged: false` / `iam_unchanged: false` /
+  `network_policy_unchanged: false` without an explicit waiver in `waivers[]`;
+  `environment: production` with `execution_path: agent`;
+  `backup_restore_tested` is `null` or older than 90 days when the runbook depends on
+  restoring from backup. See the
+  [destructive-action safety policy](../../../../docs/destructive-action-safety.md).
+- Inner-loop only: `--since-last-review` delta so the reviewer focuses on changes since the previous
+  round, not the whole staged diff again.
+
+If the evidence pack is missing entirely, the reviewer must not re-derive context silently — it
+surfaces the missing handoff as a `major` finding and asks the engineer to produce it before the
+loop continues.
+
+### 2. Build issue-aware context first
+
+- Look for issue keys or URLs from user input, branch name, PR title/body, commit messages, and diff
+  text.
+- Fetch or summarize tracker tickets (Jira, GitHub Issues, etc.), task descriptions, support tickets, incidents,
+  feature requests, comments, acceptance criteria, linked docs, screenshots, logs, and related tickets
+  where available.
+- If expected behavior, root cause, issue type, or acceptance criteria remain unclear, invoke
+  [`issue-investigator`](../issue-investigator/SKILL.md) before final review. If issue access is
+  unavailable and the user has not supplied enough issue details directly, stop instead of downgrading
+  silently to non-issue-aware review.
+- Record whether the review is issue-aware, partially issue-aware, or non-issue-aware.
+
+Layer 1 review questions:
+
+- Does the change solve the real requested problem?
+- Does it match expected behavior, acceptance criteria, business rules, comments, linked docs, and
+  related tickets?
+- Does it miss edge cases, users, roles, environments, data states, or workflows described by the
+  issue?
+- Does the implementation address the confirmed root cause, or only a symptom?
+- Does it introduce scope creep beyond the ticket?
+- Does the branch/PR bundle another independent tracker task that should have been a separate branch
+  and PR?
+
+### 3. Review general engineering quality
+
+Apply [`software-engineer`](../../SKILL.md) and its reference checklists for engineering quality.
+Focus on findings that materially affect correctness or maintainability.
+
+Layer 2 review areas:
+
+- Correctness and edge cases.
+- Maintainability, readability, and complexity.
+- Error handling and recovery.
+- Test coverage and meaningful assertions.
+- Security and privacy.
+- Performance and resource usage.
+- Observability: useful logs, metrics, traces, and correlation ids.
+- Backwards compatibility, API contract risk, migration risk, and rollout safety.
+- Regression risk in affected or downstream components.
+
+Use provided company-specific standards, architecture guidance, or engineering URLs as additional
+context when the user provides them. Do not hard-code private standards into this public skill.
+
+#### Date-gated / phased-rollout check (binding)
+
+If the diff, PR description, ticket, or commit messages reference a future cutover date, a
+feature-flag flip, an environment cutover, an upstream rename rolling out at a specific time,
+or behavior that differs **before vs after** a date / version / flag, the reviewer must
+verify both states explicitly:
+
+- **Pre-cutoff path.** What does the system do today, before the cutover, with the new code
+  deployed? If today's production input still uses the legacy value/format and the new code
+  no longer recognizes it, that is at minimum a `major` finding — a `blocker` when the
+  cutover date is in the future and current production traffic depends on the legacy path.
+- **Post-cutoff path.** What does the system do after the cutover, with the new code
+  deployed? Tests must demonstrate the new behavior.
+- **Either-state strategy.** Acceptable answers are: (a) the code accepts both
+  values/formats during the transition window with a documented sunset; (b) deployment is
+  strictly date-gated / flag-gated and the gating mechanism is in the diff (not "we'll
+  remember to deploy on the right day"); or (c) the upstream change has already happened in
+  production and the legacy value can no longer occur — stated explicitly with evidence,
+  not assumed.
+
+A diff that supports only the post-cutoff state, with no gating mechanism in the change and
+no evidence the legacy state has already been retired, must not receive `PASS` or
+`PASS_WITH_NOTES`.
+
+#### Fixture-replacement / label-rename check (binding)
+
+When tests are updated by **replacing** a value with another (`old-label` → `new-label`,
+`v1` → `v2`, old-enum → new-enum, old-error-code → new-error-code, etc.) rather than by
+**adding** new tests alongside the existing ones, surface a `major` finding. Replacement
+proves only the new happy path; it deletes the regression coverage that proved the legacy
+path used to work. The expected fix is one of:
+
+- Keep both fixtures and assert the code handles each (transition coverage); or
+- Add an explicit test for the cutoff / rename behavior (what happens at the boundary); or
+- A short note in the PR (and ideally the test file) stating the legacy value can no longer
+  occur in any environment the diff is responsible for, with the evidence that justifies
+  deleting the legacy assertions.
+
+This rule applies to test fixtures, snapshot files, recorded HTTP responses, golden files,
+and inline expected-value constants.
+
+### 4. Filter noise and prioritize evidence
+
+- Ignore formatter-only style preferences, unless they hide a real bug or readability risk.
+- Do not report issues already handled by normal lint, format, or static-analysis tools unless the
+  finding has product or production impact.
+- Prioritize production code, APIs/contracts, migrations, security config, tests, and
+  release/configuration files before docs-only changes.
+- For large diffs, review a high-signal slice first and clearly report what was not reviewed.
+
+### 5. Produce findings
+
+Each finding must include:
+
+- Severity: `blocker`, `major`, `minor`, or `nit`.
+- Finding title.
+- Affected file or area.
+- Evidence from code, issue context, tests, logs, or linked docs.
+- Why it matters.
+- Suggested fix.
+- Confidence: `high`, `medium`, or `low`.
+- Blocking status: `blocking` or `advisory`.
+
+Use the shared [severity and confidence definitions](../../../../docs/severity-and-confidence.md)
+for severity, confidence, and blocking/advisory decisions.
+
+#### Targeted test failures are blocking (binding)
+
+If the reviewer ran (or the engineer's evidence pack reports) any targeted test, build, or CI
+job for this change and the run **did not pass cleanly**, the failure is at minimum a `major`
+finding and the verdict cannot be `PASS` or `PASS_WITH_NOTES` until either the failure is
+resolved or the reviewer documents — with evidence — that the failure is unrelated to the
+diff and unrelated to the area the diff touches.
+
+The reviewer must not rationalize a failure away with phrases like "not an assertion failure
+in the changed area", "Spring context startup error, not a tariff assertion", "looks like an
+H2 / database / flake / environment issue", or "pre-existing failure on `main`". Each of
+those is a hypothesis, not evidence. To dismiss a failure the reviewer must show at least
+one of:
+
+- The same test fails on the parent commit (run it; record the SHA), **and** the diff does
+  not touch the failing component or its dependencies.
+- A linked open ticket / known-flaky-test entry that pre-dates the diff.
+- A clean rerun on a clean checkout of the diff (recorded with command + result), proving
+  the failure was transient.
+
+If none of those is available, the failure stands as a `major` (or `blocker` when the
+failing component is in the diff's blast radius) and the verdict is `REQUEST_CHANGES` or
+`NEEDS_CONTEXT`.
+
+### 6. Enforce blocking behavior
+
+- If `${CODE_REVIEWER_BLOCKING}` is `true` and any blocker finding exists, the calling workflow must
+  stop until the finding is fixed or explicitly waived with a written reason.
+- If blocking is disabled, still label blockers clearly and explain the risk.
+
+### 7. Enforce iteration convergence
+
+When this skill is invoked iteratively in the engineer↔reviewer pair-programming loop:
+
+- The reviewer owns `evidence-pack.yml.review`. On each invocation, before emitting the verdict,
+  the reviewer: (a) snapshots the previous round into `review.history` as `{round, blocker_count,
+  major_count, verdict}`, mapping the top-level `open_blocker_count` → `blocker_count` and
+  `open_major_count` → `major_count`; (b) increments `review.round` by 1 (or initialises it to `1`
+  if absent); (c) writes the new top-level `open_blocker_count`, `open_major_count`, and `verdict`
+  for this round. The engineer must not mutate this block — it only re-stages the fix and
+  re-invokes the reviewer. This avoids double-increments and stale counts.
+- Track the round number in the evidence pack (`round: 1`, `round: 2`, ...).
+- **Round 1 has no prior round.** Strict-decrease is not applicable on round 1 — there is no
+  baseline to compare against. A round-1 result with actionable findings always produces
+  `Loop: continue`. Never emit `Loop: not-converging` on round 1.
+- **From round 2 onward,** the number of `blocker` + `major` findings **must strictly decrease**
+  between consecutive rounds. If round N (N ≥ 2) has the same or more blocker/major findings as
+  round N-1, emit `Loop: not-converging` with the recurring findings highlighted and surface the
+  summary to the user.
+- After `${CODE_REVIEWER_MAX_ROUNDS}` (default `3`) rounds, emit `Loop: max-rounds` regardless of
+  finding counts: report the unresolved blockers, the engineer's responses, and ask the user how to
+  proceed. Do not loop indefinitely or silently downgrade blockers to advisory.
+
+**Signal taxonomy.** Each invocation of this skill in iteration mode ends with exactly one of the
+following signals in the review output:
+
+*Action signals — the loop continues:*
+- `Loop: continue` — findings exist but the round-1 baseline has been set, or round N count
+  decreased; the engineer addresses findings and invokes the reviewer again.
+- `Loop: needs-context` — the review cannot advance without output from a named follow-up skill
+  (e.g. `issue-investigator`, `product-owner`). The engineer invokes that skill; once context is
+  available the reviewer is invoked again. Upgrades to `Loop: needs-user` if the named follow-up
+  skill itself returns `needs-context` or `blocked`.
+
+*Terminal signals — the loop stops:*
+- `Loop: converged` — no `blocker` or `major` findings remain; the engineer may advance to the next
+  phase.
+- `Loop: not-converging` — round N ≥ 2 and the blocker/major count did not decrease; escalate to
+  the user with the recurring findings highlighted.
+- `Loop: max-rounds` — `${CODE_REVIEWER_MAX_ROUNDS}` rounds exhausted; escalate to the user
+  regardless of finding count.
+- `Loop: needs-user` — resolution requires a human decision (scope change, waiver, architectural
+  call, or access grant) that the agent cannot make unilaterally; surface clearly and stop.
+
+#### `Loop:` control signal (binding)
+
+The reviewer is the engineer's loop oracle: the engineer's auto-iteration depends on a single
+unambiguous instruction per round. Every review invoked from `software-engineer` (inner or outer
+loop) must emit a one-line `Loop:` signal as the last line of the output, immediately after
+`## Final Verdict` and any `Follow-up:` line.
+
+For one-shot review modes (`pr`, `manual`, or any user-facing review not invoked from
+`software-engineer`), the `Loop:` line is omitted — those reviews terminate at the verdict.
+
+The reviewer must not bury a stop-the-loop decision inside prose. If the engineer's auto-loop cannot
+find an unambiguous `Loop:` line, it must treat the round as `Loop: needs-user` and escalate.
+
+### 8. Devil's-advocate self-rebuttal (before final verdict)
+
+Before producing a `PASS` verdict, write one paragraph attacking your own conclusion: _"Here is the
+most credible scenario in which I am wrong about this diff being safe."_ Cover at least one of:
+silent data loss, lost-update / race condition, auth bypass or missing authorization check, secret
+or PII leakage, broken or non-reversible migration, breaking API contract change, regression in a
+previously-fixed defect. If the rebuttal surfaces a credible risk, downgrade the verdict to
+`PASS_WITH_NOTES` or add a `blocker`/`major` finding and return `REQUEST_CHANGES`.
+
+### 9. Record review limitations explicitly
+
+Before producing the final verdict, list what could not be reviewed and why. The reviewer must
+never produce a confident verdict without disclosing the gaps that bound that confidence. Cover at
+least:
+
+- Issue context not accessed (Jira/GitHub issue unreachable, comments/linked docs not fetched,
+  acceptance criteria supplied verbally rather than from the source of truth).
+- Code paths not inspected (large diff truncation, files skipped because of the configured budget,
+  generated files, vendored dependencies, binary assets).
+- Tests, builds, or CI runs not executed or not observed (state explicitly when results were
+  reported by the engineer rather than verified directly).
+- Standards or guidelines referenced but not supplied (private architecture docs, security rules,
+  API guidelines, style guides). Do not invent their content.
+- Runtime, deployment, observability, or data evidence that would have changed confidence (logs,
+  metrics, feature-flag rollouts, migration dry-runs).
+
+A review with significant unavailable context must use `PASS_WITH_NOTES` or `NEEDS_CONTEXT`, never
+a bare `PASS`. The unavailable items appear in the `Review Limitations` section of the output
+contract below.
+
+## Expected Output Contract
+
+Follow [Output Discipline](../../../../docs/output-discipline.md). The contract below is
+a **menu of available sections, not a checklist**. **Omit empty sections** — render only
+the sections you have content for. The single required-even-if-empty section is the
+one-line `## Final Verdict` at the bottom.
+
+Always include a lifecycle receipt:
+`Lifecycle: start-task=<ran|blocked>; finish-task=<ran|pending|skipped-blocked>;
+memory=<updated|blocked>; skill=code-reviewer@0.35.0`. Do not claim a wrapper
+or memory write ran unless it actually ran.
+
+```markdown
+## Code Review — <repo> @ <branch>
+
+<one line each, in this order, dropped if obvious or empty>
+- Lifecycle: start-task=<ran|blocked>; finish-task=<ran|pending|skipped-blocked>; memory=<updated|blocked>; skill=code-reviewer@0.35.0
+- Mode: inner | outer | pr | manual · Issue awareness: issue-aware | partial | none
+- Base: <base> · Files reviewed: <kept>/<total>
+- Standards used: <repo docs / supplied URLs / none>
+
+## Issue/Ticket Alignment
+
+<2–4 lines max: ticket key + summary, expected behavior, alignment verdict
+(aligned | partially aligned | not aligned | unclear). Drop entirely for
+non-issue-aware review.>
+
+## Engineering Quality
+
+<bullet list, only the dimensions that actually have a finding-worthy observation:
+correctness, tests, security, performance, observability, compatibility/regression
+risk. Drop the section if every dimension is clean — the absence of findings IS
+the signal.>
+
+## Findings
+
+<group by severity in descending order: blocker, major, minor, nit. Each finding is
+ONE bullet using the Output Discipline finding format:>
+- **<severity>: <title>** — <evidence in 1 sentence>. Why it matters: <1 sentence>.
+  Fix: <1 sentence>. (confidence: high|medium|low; blocking|advisory)
+
+## Devil's-Advocate Self-Rebuttal
+
+<one short paragraph; required only before a PASS verdict. Drop for any other verdict.>
+
+## Insightful Simplification
+
+<Optional. 1–3 bullets, ≤ 35 words each, anchored to a concrete
+file/layer/state/contract/boundary observed in the diff. Omit the section
+entirely when no qualifying insight exists. See
+[Insightful Simplifications](../../../../docs/insightful-simplifications.md).>
+
+- ...
+
+## Review Limitations
+
+<one short paragraph or one line "Review Limitations: none." Do NOT render a
+six-bullet block where every item says "none". List only what actually limited the
+review (issue context not accessed, code paths not inspected, tests/builds not run,
+standards not supplied, runtime evidence not available) and the net effect on
+confidence.>
+
+## Final Verdict
+
+<VERDICT> — <one-sentence reason>.
+Follow-up: <one-sentence list, or omit the line if there is no follow-up>.
+Loop: converged | continue | not-converging | max-rounds | needs-user | needs-context
+```
+
+`<VERDICT>` is one of `PASS`, `PASS_WITH_NOTES`, `REQUEST_CHANGES`, `NEEDS_CONTEXT`,
+`NOT_REVIEWABLE`. A bare `PASS` requires that nothing belonged in the `Review
+Limitations` section, the Requirement Understanding Gate ended at `high`, and the
+Devil's-Advocate paragraph surfaced no credible risk. Otherwise downgrade.
+
+The `Loop:` line is required when the review is invoked from `software-engineer` (inner or outer
+loop) and omitted for one-shot user-facing modes (`pr`, `manual`). It is the deterministic
+instruction the engineer's auto-iteration consumes — see [§ 7 `Loop:` control signal](#loop-control-signal-binding)
+for the per-value semantics.
+
+### Output Style (binding)
+
+- **Omit empty sections.** Do not print a heading just to write `none` underneath it.
+- **One bullet per finding.** Do not expand findings into the seven-line
+  `Severity:` / `Title:` / `Affected file:` / `Evidence:` / `Why it matters:` /
+  `Suggested fix:` / `Confidence:` / `Blocking decision:` skeleton. That is the
+  shape of the data, not the shape of the output.
+- **No workflow recap.** Do not narrate which steps the skill ran. The result of
+  each step is the only thing the user wants.
+- **No template echo.** Do not paste the contract block above as your output.
+- **No banners or status decorations** around the verdict line.
+- See [Output Discipline](../../../../docs/output-discipline.md) for the full rule
+  set; the eval [`code-reviewer-concise-output`](../../../../evals/code-reviewer-concise-output.md)
+  pins the expected shape with a worked example.
+
+## Behavior Checklist
+
+- [ ] `start-task.sh` ran before context discovery and `finish-task.sh` is reflected in the final
+  lifecycle receipt, or the final verdict explains the blocker.
+- [ ] Review target, base, changed files, review mode, and issue-awareness level are resolved or the
+  verdict is `NEEDS_CONTEXT` / `NOT_REVIEWABLE`.
+- [ ] Issue/ticket alignment is checked before generic engineering quality when context exists.
+- [ ] Jira-aware reviews verify that the PR has one primary Jira key and does not bundle independent
+  tasks that should be separate branches/PRs.
+- [ ] Auth-discovery failure during issue-aware review is escalated to `NEEDS_CONTEXT`, not buried
+  as a Note alongside other findings.
+- [ ] Date-gated / phased-rollout check ran when the change references a future date, flag, or
+  cutover; both pre-cutoff and post-cutoff paths are accounted for or surfaced as a finding.
+- [ ] Fixture-replacement / label-rename check ran when tests were updated by replacing values;
+  legacy regression coverage is either preserved, replaced by a cutoff test, or explicitly
+  justified as no-longer-reachable.
+- [ ] Any failed targeted test, build, or CI job is surfaced as `major`/`blocker` and forbids
+  `PASS` / `PASS_WITH_NOTES` unless dismissed with evidence (parent-commit rerun, known-flaky
+  ticket, or clean rerun).
+- [ ] Findings include severity, evidence, impact, suggested fix, confidence, and blocking/advisory
+  decision **as inline content of one bullet, not as a seven-line skeleton**.
+- [ ] Output follows [`docs/output-discipline.md`](../../../../docs/output-discipline.md):
+  empty sections are dropped, the verdict is one line, and the contract template is not echoed.
+- [ ] Missing evidence, skipped files, unverified tests, and review limits are disclosed in
+  `Review Limitations` (one paragraph or one line — never a six-bullet `none` block).
+- [ ] Final verdict uses only `PASS`, `PASS_WITH_NOTES`, `REQUEST_CHANGES`, `NEEDS_CONTEXT`, or
+  `NOT_REVIEWABLE`.
+- [ ] When invoked from `software-engineer` (inner or outer loop), the output ends with a `Loop:`
+  line whose value is exactly one of `converged`, `continue`, `not-converging`, `max-rounds`,
+  `needs-user`, or `needs-context`. Omit the line for one-shot `pr` / `manual` reviews.
+
+## Quality Standards
+
+- Findings must be actionable and evidence-based.
+- Review must use issue context when available.
+- Review must call out uncertainty instead of inventing missing facts.
+- Review must distinguish blocking risks from advisory improvements.
+- Review must avoid style-only noise that belongs to automated tools.
+- Suggested fixes must be concrete and minimal.
+- Large-diff truncation or skipped files must be disclosed.
+- Final verdict must use only `PASS`, `PASS_WITH_NOTES`, `REQUEST_CHANGES`, `NEEDS_CONTEXT`, or
+  `NOT_REVIEWABLE`.
+
+## Guardrails
+
+- Do not emit `Loop: not-converging` on round 1; round 1 sets the baseline and must produce
+  `Loop: continue` when actionable findings exist.
+- Do not invent issue details, logs, code behavior, acceptance criteria, or company standards.
+- Do not produce issue-aware verdicts when the issue context could not be read or supplied.
+- Do not approve a PR that bundles independent tracker tasks into one branch/PR. Surface it as a
+  `blocker` because it prevents focused review and clean rollback.
+- Do not recommend broad rewrites unless the evidence shows the current approach is materially
+  unsafe or unmaintainable.
+- Do not rewrite the diff during review unless the user explicitly asks for implementation help.
+- Do not store secrets or private customer data in cache or output.
+- Do not claim tests, builds, or issue-system checks were verified unless they were actually run or
+  inspected.
+- Do not treat formatter, linter, or static-analysis preferences as meaningful review findings
+  unless they affect behavior or maintainability.
+- Do not approve a diff that violates the
+  [destructive-action safety policy](../../../../docs/destructive-action-safety.md). Surface
+  any of the following as `blocker` findings: discovered hardcoded credentials,
+  invocations of credentials read from repository files, destructive cloud / orchestrator /
+  database commands targeting production, IAM / role / network / secret / backup-control
+  weakening, "fix by deletion" of live resources, removal of audit logging or monitoring.
+- Do not produce a bare `PASS` verdict when the
+  [Requirement Understanding Gate](#0-requirement-understanding-gate) ended at `unknown` /
+  `low`, when issue context is missing, or when any item in `Review Limitations / Unavailable
+  Context` is non-`none` and unwaived. The correct verdict is `NEEDS_CONTEXT` or
+  `PASS_WITH_NOTES`.
+- Do not emit `PASS` or `PASS_WITH_NOTES` when issue-aware review was requested and the
+  Jira/GitHub issue could not actually be read (auth-discovery failure, unresolved `${VAR}`
+  placeholder, empty credential, fetch error). The correct verdict is `NEEDS_CONTEXT`. The
+  only exception is when the user supplied the ticket summary, expected behavior, and
+  acceptance criteria verbatim in the prompt.
+- Do not rationalize away targeted test failures (`Spring context startup`, `H2 rollback`,
+  `flake`, `unrelated component`, `pre-existing on main`) without evidence: parent-commit
+  rerun showing the same failure, a linked known-flaky ticket, or a clean rerun of the diff.
+  Hypotheses about why a test failed do not unblock a `PASS` verdict.
+- Do not approve a date-gated / phased rollout (future cutover date, flag flip, upstream
+  rename) that supports only the post-cutoff state when the gating mechanism is not in the
+  diff and there is no evidence the legacy state has already been retired.
+- Do not approve a fixture-replacement diff (test fixture / snapshot / golden file values
+  swapped from old to new) without either preserved transition coverage, an explicit cutoff
+  test, or a documented justification that the legacy value can no longer occur.
+
+## Example Prompts
+
+- "Review my staged diff against this tracker ticket."
+- "Review this PR for issue alignment and engineering risk."
+- "Run an outer-loop review before I open a PR."
+- "Review this bug fix and tell me if it actually addresses the root cause."
+- "Review this change using the linked architecture guidelines as extra standards."
+
+See [the code-reviewer PR review example](../../../../docs/examples/code-reviewer-pr-review.md) and
+[starter prompts](../../../../docs/starter-prompts.md).

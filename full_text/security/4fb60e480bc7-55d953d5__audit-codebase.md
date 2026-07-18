@@ -1,0 +1,659 @@
+---
+name: audit-codebase
+description: Phase 1 of security review prep. Runs the autonomous multi-agent white-box audit of the partner's own codebase across the applicable threat dimensions — find, adversarially verify, synthesize — maintaining a findings ledger that makes every re-run incremental. Use after scope-submission, after fixing findings, or after a failed review to sweep for a vulnerability class.
+allowed-tools: Read Grep Glob Write(**/.security-review/scope-input.json) Write(**/.security-review/target-map.json) Write(**/.security-review/audit-ledger.json) Write(**/.security-review/run-log.md) Write(**/.security-review/pass-*/**) Write(**/.security-review/runs/**) Write(**/.security-review/recurrence-confidence.json) Write(**/.security-review/deterministic-dispositions.json) Write(**/docs/security-review/**) Bash(ls *) Bash(find *) Bash(git log *) Bash(git status*) Bash(git diff*) Bash(cat *) Bash(sha256sum *) Bash(shasum *) Bash(node *harness/gate-spec.mjs *) Bash(node *harness/record-consent.mjs *) Bash(node *harness/recurrence-confidence.mjs *) Bash(node *harness/render-target-map.mjs *) Bash(node *harness/finding-clusters.mjs *) Bash(node *harness/merge-ledger.mjs *) Bash(node *harness/render-recap.mjs *) Bash(node *harness/ingest-scanner-findings.mjs *) Bash(node *harness/reconcile-provenance.mjs *) Bash(node *harness/seed-auto-dispositions.mjs *) Bash(node *harness/apply-dispositions.mjs *) Bash(node *harness/rerender-runlog.mjs *) Bash(node *harness/verify-report-headline.mjs *) Bash(node *harness/inject-report-headline.mjs *) Bash(node *harness/build-audit-engine.mjs *) Bash(node *harness/injection-check.mjs *) Task AskUserQuestion
+---
+
+# Audit Codebase
+
+Execute the audit engine specified in
+`${CLAUDE_PLUGIN_ROOT}/methodology/audit-methodology.md` against the partner's
+repo. That spec is binding — pipeline, schemas, severity taxonomy, ledger
+mechanics, pass planning, and honesty constraints all live there; this skill is
+the operating procedure that runs it. The output is a verified findings report
+under `docs/security-review/` plus an updated ledger under `.security-review/`.
+**This is static code review by LLM agents reading source — never DAST, never a
+pen test** (CONVENTIONS §2); Salesforce performs its own penetration testing
+regardless of anything this engine produces.
+
+## When to use
+
+- After `/sf-security-review-toolkit:scope-submission` wrote a scope manifest
+- Re-audit after remediation — cheap, because the ledger digest suppresses
+  everything already found (the re-run loop, step 8)
+- After a failed review: ingest the failure report into the ledger as
+  confirmed findings, then sweep the codebase for the same *class* — the
+  remediation flow expects ALL instances of a flagged pattern fixed, not just
+  the cited ones (baseline: `process-failure-remediation-flow`)
+- NOT for scanning packaged Apex — CRUD/FLS and the structured package pass
+  belong to Code Analyzer in `/sf-security-review-toolkit:run-scans`
+- NOT a substitute for the authenticated DAST scan the review requires, and
+  NOT for first-time architecture detection (`/sf-security-review-toolkit:scope-submission`)
+
+## Prerequisites
+
+- `<target>/.security-review/scope-manifest.json` — **refuse to run without
+  it** (audit-methodology §1.1) and route to scope-submission. Dimension
+  selection keys off the manifest; an audit of the wrong surface set is wasted
+  spend
+- The dimension files in `${CLAUDE_PLUGIN_ROOT}/methodology/dimensions/`
+- Baseline currency: read the baseline entries this skill leans on
+  (`process-failure-remediation-flow`; the severity table in
+  audit-methodology §4 points at `process-review-fee` and
+  `process-review-timeline`) and warn if their `last_verified` is older than
+  90 days (CONVENTIONS §4)
+- A clean-enough working tree that file:line citations and ledger dedup keys
+  stay meaningful across the run
+
+## Steps
+
+1. **Load the manifest — and check it is still true.** A manifest is stale
+   when the repo has outgrown it: an `sfdx-project.json` that appeared since,
+   a changed MCP tool count, a new route tree or worker queue. Warn and offer
+   `/sf-security-review-toolkit:scope-submission` re-scoping before fanning
+   out — auditing yesterday's architecture produces today's false confidence.
+
+2. **Declare the token tier before launching anything** (CONVENTIONS §5,
+   audit-methodology §7), and get an explicit go-ahead:
+
+   | Tier | What runs | Approx. agents | Honest cost note |
+   |---|---|---|---|
+   | `quick` | Top-failure dimensions, one pass | ~9–11 | Triage only. Catches the auto-fail classes; says nothing about the rest — never present its output as review readiness |
+   | `standard` | All applicable dimensions, one pass | ~20–30 | The default. Each finder reads tens of files; expect millions of tokens and an hour-plus of wall clock on a real codebase |
+   | `exhaustive` | Multi-pass per audit-methodology §6 until two consecutive dry passes | ~50–80 across passes | Several times `standard`; spread across work sessions — the ledger makes resumption incremental |
+
+   The verify fan-out scales with what the finders find, so a target-rich
+   codebase costs more at every tier — report the live agent count as the run
+   progresses. **Do not run `exhaustive` on a first pass.** A never-audited
+   codebase yields its first batch of critical/high findings to `standard`;
+   burning the multi-pass budget before those are fixed pays verifiers to
+   re-walk code that is about to change. Field sequence that works: `standard`
+   → fix → re-run (step 8) → `exhaustive` once the ledger is quiet.
+
+   **FULL-AUTO fast-path — the journey's batched consent screen already asked this;
+   do NOT stop (WO-108).** When BOTH hold — the recorded run-mode is Full-auto (read
+   `.security-review/consent/run-mode.json`; its `answer` names the elected mode) AND
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --verify --gate audit-tier --target <target>`
+   exits 0 (the launch authorization token from the journey's batched screen is
+   recorded) — this stop is already satisfied: skip the `AskUserQuestion`, state the
+   locked tier in the run output, record the confirmation instead of prompting —
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --gate audit-tier --decision affirm --question "<the launch confirm question>" --answer "Authorize the <tier> launch — auto-recorded: full-auto run, token recorded at the journey batched consent screen" --target <target>`
+   — and proceed to Step 3. GUIDED mode, or ANY missing/negative token, keeps the
+   mandatory stop below: the batching changed how many screens ask, never whether the
+   token is recorded, and `build-audit-engine.mjs` still fails closed without it.
+
+   **Otherwise this is a MANDATORY `AskUserQuestion` stop — not a printed line, and never a
+   silence-is-yes inference. The option set is PINNED by `gate-spec.mjs`; render its
+   `options[].label/description` VERBATIM and pipe the chosen option's `decision` straight
+   to `record-consent` — never improvise the option set (the engine owns it).** Get the
+   gate from the engine WITH the resume facts so a tier already chosen in the journey is
+   CONFIRMED, not re-litigated:
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/gate-spec.mjs --gate audit-tier --target <target>`.
+
+   - **The journey already collected the tier** (a recorded `audit-tier` token exists) →
+     gate-spec emits the CONFIRM-and-authorize variant `{Authorize the <locked> launch,
+     Change tier, Cancel}` — it does NOT re-offer the election (WI-02; this kills the
+     redundant tier re-ask). **Frame this stop to the operator as authorizing the LAUNCH —
+     the fan-out token spend, and the target-map approval that immediately follows — NOT a
+     tier re-election** (so it never reads as "why are you asking my tier again"); the
+     tier is reused from the journey, gate-spec's confirm-variant question already says so.
+     On **Authorize**, record the LAUNCH authorization (it reuses
+     the prior tier token, cross-referenced via `verifyConsent`):
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --gate audit-tier --decision affirm --question "<the launch confirm question>" --answer "<the Authorize option>" --target <target>`.
+     On **Cancel**, the same call with `--decision deny`, then STOP. Only **Change tier**
+     re-opens the full menu — re-run `gate-spec --gate audit-tier` without `--target` (or with
+     `--facts <file>` where the file contains `{"reelect":true}`) and record the newly chosen tier.
+   - **Standalone (no prior token)** → gate-spec emits the full first-pass menu (`standard`
+     default, `exhaustive` offered but **never pre-selected**, `quick` triage — identical
+     every run). The operator's SELECTION IS the consent — record it with the controlled
+     `--decision` token (do NOT rely on the option label containing "yes"; `--decision deny`
+     for Cancel):
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --gate audit-tier --decision affirm --question "<the tier + go-ahead question>" --answer "<the option they picked>" --target <target>`.
+
+   The fan-out **physically cannot launch** without `audit-tier` recorded: `build-audit-engine.mjs`
+   verifies `audit-tier` (and `audit-targetmap`, below) and refuses to assemble the engine —
+   exit non-zero, nothing written — when either is missing. **Consent is written ONLY by
+   `record-consent.mjs`** (its grant is in `allowed-tools`, so recording a yes is the
+   least-friction path); the `Write` tool is path-scoped and CANNOT target
+   `.security-review/consent/` — never hand-author a consent file.
+
+3. **Resolve the target map** (audit-methodology §1.3). Select dimensions per
+   the §1.2 applicability matrix × the manifest × the pass band (§6) — every
+   inapplicable dimension gets an explicit `na_reason`, never a silent skip.
+   Then run each applicable dimension's detection heuristics (§3 of its file)
+   against the real repo and write
+   `<target>/.security-review/target-map.json`. Three rules with teeth:
+
+   - **Show the map to the user BEFORE any agent launches.** This is the one cheap
+     moment to correct course — let them edit paths, add the module the heuristics
+     missed, or veto a dimension. A wrong target map silently audits the wrong code for
+     the entire run. Render the resolved map with
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/render-target-map.mjs --target
+     <target>` and show its stdout VERBATIM — the fixed
+     `{dimension | applicable | targets | why | confidence | unresolved}` table, applicable
+     rows first, with UNRESOLVED dimensions flagged. Never hand-rebuild, reorder, drop a
+     column, or flip it to prose.
+
+     **FULL-AUTO fast-path — no stop (WO-108).** When the recorded run-mode is
+     Full-auto AND
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --verify --gate audit-targetmap --target <target>`
+     exits 0 (the map approval rode the launch authorization on the journey's batched
+     consent screen — the map is COMPUTED, not authored), print the rendered map
+     VERBATIM as a NOTE the operator can interrupt to correct, record the approval
+     instead of prompting —
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --gate audit-targetmap --decision affirm --question "<the show-map approval question>" --answer "Approve the computed target map — auto-recorded: full-auto run, token recorded at the journey batched consent screen" --target <target>`
+     — and continue. GUIDED mode, or ANY missing/negative token, keeps the MANDATORY
+     `AskUserQuestion` stop: show the map INSIDE the `AskUserQuestion`, ask for
+     approval/corrections, and on approval RECORD it — the operator's SELECTION of the
+     approve option IS the consent (do NOT rely on the label containing "yes"); use
+     `--decision deny` if they declined:
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/record-consent.mjs --gate audit-targetmap --decision affirm --question "<the show-map approval question>" --answer "<the option they picked>" --target <target>`.
+     `build-audit-engine.mjs` verifies BOTH `audit-tier` and `audit-targetmap` before it
+     will assemble the engine — a skipped show-map physically cannot fan out (it is not a
+     silence-is-yes input; the architecture was detected, but the MAP is an approval you
+     record — asked at the batched screen in full-auto, asked HERE in guided).
+   - **`applicable: true` with no targets = `unresolved: true`**, surfaced as
+     "couldn't map dimension X — point me at the code or confirm N/A." A
+     skipped dimension is false coverage, worse than no audit.
+   - **Exclude generated and vendored code from targets**: `node_modules/`,
+     `vendor/`, `dist/`, `build/`, virtualenvs, minified bundles, lockfiles,
+     generated API clients and protobuf stubs. Finders that wade into
+     third-party or machine-written code burn their context on findings the
+     partner cannot act on — defects in dependencies are the dependency
+     scanner's job (`/sf-security-review-toolkit:run-scans`, baseline:
+     `scan-dependency-vulnerabilities`), and for generated code the right
+     target is the generator's template, not its output. One exception:
+     committed credential material is in scope wherever it lives — a real key
+     in a vendored config is still a finding.
+
+   `stack_notes` carries the partner's *claimed* security model, labeled as
+   claims — the single most productive finder instruction in the field runs
+   was "verify the claimed model against the actual code, do not assume it."
+
+4. **Deterministic pass FIRST — the engines seed the ledger before the digest
+   is compiled and before the LLM fan-out** (Phase 1 of
+   `docs/roadmap-deterministic-findings.md`). A 5-run cold
+   campaign proved the LLM-generated CRUD/FLS band is unstable run-to-run
+   (high·high·ABSENT·high·high on identical code), while Code Analyzer (PMD/SFGE)
+   and the permission-set metadata scan find those exact classes
+   DETERMINISTICALLY. Run them NOW — before Step 4b's digest compile and Step 5's
+   LLM fan-out — so a
+   `provenance:'deterministic'` finding already exists in the ledger when the
+   digest is compiled and when the
+   verifier defers to it (the Slice-2 "defer to the engine ONLY when it actually
+   ran" rule in `apex-exposed-surface.md` §5/§6 keys off exactly this evidence).
+   On a journey run, the static-scan substrate has ALREADY populated
+   `.security-review/evidence/` before this phase launches — a populated
+   `evidence/` dir is the NORMAL first-journey-run case, and this pass is what
+   turns it into the first-pass deterministic band:
+
+   - **One deterministic pass — `--all` — ingests every recognized scanner output
+     present.** It ALWAYS runs the metadata source scan (no `sf`, no network — it
+     greps the repo's `*.permissionset-meta.xml` for ViewAll/ModifyAll over-grants on
+     custom objects), then recognizes and ingests every OTHER scanner output sitting
+     under `<target>/.security-review/evidence/` by CONTENT SHAPE (never filename, which
+     is heterogeneous and ambiguous across runs) — Code Analyzer (the CRUD/FLS + sharing
+     track), plus the OSS SAST (Semgrep / Bandit / njsscan), secret (gitleaks /
+     detect-secrets), dependency-CVE (OSV / npm-audit), and IaC-misconfig (Checkov /
+     Trivy) families that `/sf-security-review-toolkit:run-scans` produced on a prior
+     pass (or that the owner ran `sf code-analyzer` to land):
+     `node ${CLAUDE_PLUGIN_ROOT}/harness/ingest-scanner-findings.mjs --all --target <target>`.
+     Each recognized violation becomes a `provenance:'deterministic'` finding carrying
+     its `engine` + `ruleId`, severity READ FROM the requirement class (or, for the
+     class-less SAST / dependency-CVE families, the tool/CVSS band) — relayed verbatim,
+     never re-judged or re-severitied by the LLM. An unrecognized evidence file is
+     skipped with a named note, never guessed. Keep this BEFORE Step 5's LLM fan-out.
+   - **`sf`/Code Analyzer absent → PENDING-OWNER-RUN, never LLM-fill, never drop.**
+     When no `code-analyzer-*.json` is present in `evidence/` — on a journey run
+     that means the scanner-install consent was declined or the tool was absent;
+     standalone with no prior scans it is simply the not-yet case — Code Analyzer
+     has not run, so `--all` reports the CRUD/FLS + sharing classes as
+     **PENDING-OWNER-RUN** (prompt the owner to install `sf` + the Code Analyzer
+     plugin and run `/sf-security-review-toolkit:run-scans` to make these
+     deterministic). The LLM
+     fan-out still audits those classes and **KEEPS its findings as `llm-inferred`** —
+     it is NOT licensed to defer to an engine that never ran (that phantom hand-off,
+     dropping a real FLS blocker to a scanner with no output, is the fixrun4 failure the
+     Slice-2 methodology fix closed). The metadata scan is unconditional; only the
+     Code-Analyzer-owned classes go PENDING.
+
+   Read-only on the partner source except the ledger it seeds. Re-ingest is
+   idempotent (a deterministic id is stable from `engine+ruleId+file:line`), so
+   running this on every pass never duplicates — and Step 6's reconcile, after the
+   merge, is what demotes any co-located LLM finding the engine now owns. When you
+   report WHICH Code Analyzer version produced the evidence, read it from the
+   scanner-install manifest's `code-analyzer` record (`plugin.installed`, sourced
+   deterministically from the plugin's `package.json`), never from an ad-hoc
+   `sf plugins` listing (a cold run misreported the version that way).
+
+4b. **Compile the ledger digest — AFTER the deterministic pass** — from
+   `<target>/.security-review/audit-ledger.json`: one line per entry,
+   `[state] title — file (one-line resolution or refute reason)` (§5.3).
+   First run: empty digest is fine. Include `refuted` entries (they stop
+   finders re-raising the same non-issue) and `fixed` entries (re-report only
+   if regressed). A `provenance: 'deterministic'` entry that carries a
+   `reachabilityPath` attribute appends its machine-verified path to its digest
+   line, rendered by `renderReachabilityPath` from
+   `${CLAUDE_PLUGIN_ROOT}/harness/finding-clusters.mjs` (a node one-liner over
+   the ledger JSON is enough) — the line becomes
+   `[state] title — file (…) [path: source <file>:<line> → … → sink <file>:<line>
+   — machine-verified; the path is proven, the open judgment is whether the
+   source is attacker-controlled]`. That hands the finders the engine's
+   substrate, not just the title, so their attention lands on source-trust
+   instead of re-deriving the path. This stays mechanical digest compilation:
+   the helper renders the path text — never paraphrase or re-word it. The
+   digest is compiled AFTER Step 4 on purpose: that is what
+   puts the freshly-seeded `provenance:'deterministic'` band INTO the digest the
+   fan-out reads, so the finders defer to the engine findings on the FIRST pass
+   instead of re-reporting them and leaving Step 6's reconcile to clean up after
+   the fact. Skipping the digest is the expensive mistake: every pass
+   re-discovers the same top findings and pays the verify fan-out for them
+   again. Never let an LLM rewrite ledger entries — the merge is mechanical
+   (step 6) or the dedup keys corrupt.
+
+5. **Run the engine.** Preferred substrate: the Workflow tool with a project-local
+   copy of `${CLAUDE_PLUGIN_ROOT}/harness/workflow-template.mjs`, assembled by the
+   shipped `build-audit-engine.mjs` (next). You do NOT hand-extract prompts or
+   hand-inject run-args — you supply your scoping as data and the engine assembles
+   the runnable script deterministically (the §4 finder prompt + §5/§6 verifier notes
+   per dimension are pulled by the engine, both load-bearing as detailed below).
+
+   **Then — via the shipped assembler, never by hand — build and run a
+   project-local copy.** You write your SCOPING as DATA; the deterministic engine
+   does the assembly (this is the P2 discipline — "engine code, never an LLM" — and
+   it retires the marker-slice fragility G5 hardened):
+
+   1. Write `<target>/.security-review/scope-input.json` — the scoping output that
+      is legitimately yours (tier, pass, runDate, the step-4b `ledger` digest —
+      compiled AFTER the step-4 deterministic pass, so the deterministic band is
+      in it — the
+      `context` block assembled from the scope manifest, the `applicable` dimensions
+      with their per-dimension `targets` + `stackNotes`, and the `na` list with
+      reasons). The schema is in `${CLAUDE_PLUGIN_ROOT}/harness/build-audit-engine.mjs`'s
+      header.
+   2. Run the assembler:
+      `node ${CLAUDE_PLUGIN_ROOT}/harness/build-audit-engine.mjs --plugin ${CLAUDE_PLUGIN_ROOT} --repo <target> --input <target>/.security-review/scope-input.json`.
+      **It FAILS CLOSED (exit 3, nothing written) unless both `audit-tier` (Step 2) and
+      `audit-targetmap` (Step 3) consents are recorded** — the durable coupling: a skipped
+      stop = no engine = nothing for the Workflow tool to run, and the assembled engine
+      itself refuses to fan out unless this gate stamped `consentVerified`. It then
+      DETERMINISTICALLY extracts, per dimension, the §4 threat-focus paragraph
+      (`finderPrompt`) AND the §5/§6 Verifier-guidance + false-positive-patterns block
+      (`verifierNotes`) from the dimension file — **both load-bearing**: the verifier
+      only sees generic skepticism unless it gets `verifierNotes`, and without the
+      dimension's own refute rules it over-refutes declaration-level metadata
+      violations (an exposed message channel, an `http://`/wildcard trusted host,
+      `position:absolute` in component CSS, an unenclosed prompt template) on a "no
+      live caller / dead-code artifact" rationale the Salesforce static review — which
+      flags whatever the package SHIPS — does not apply. It injects the run-args into
+      `<target>/.security-review/audit-engine.mjs` (a project-local copy of the
+      template — reproducible + committable) and writes `target-map.json`. It aborts
+      LOUD on a missing/malformed dimension file rather than emitting an empty prompt.
+   3. Pre-launch check:
+      `node ${CLAUDE_PLUGIN_ROOT}/harness/injection-check.mjs <target>/.security-review/audit-engine.mjs`
+      (exit 0 = the injected `INJECTED` parses and carries `repoRoot`). Do NOT
+      `node --check` the assembled file — it reports the template's top-level
+      `return {…}` as `SyntaxError: Illegal return statement`, which is **expected**
+      (the Workflow runtime wraps the body in an async scope where top-level `return`
+      is legal); injection-check validates only the injected object.
+   4. Invoke the Workflow tool with `scriptPath` pointing at the produced
+      `audit-engine.mjs`. **Do NOT pass run-args through the Workflow `args`
+      parameter** — they arrive as a JSON *string*, `args.repoRoot` is undefined, and
+      the run fails fast (*"run args missing or incomplete"*, 0 agents). The
+      `args`-binding branch in the template is only a safety net; the assembler-written
+      `INJECTED` is the load-bearing path, every time.
+
+   The assembler writes the full run-args object (`repoRoot`, `scopeManifestPath`,
+   `tier`, `passNumber`, `runDate`, `reportPath`, `ledger`, `context`, and a
+   `dimensions[]` where each entry additionally carries the engine-extracted
+   `finderPrompt` + `verifierNotes`) into `audit-engine.mjs`. You author only the
+   `scope-input.json` from step 1, never this object by hand.
+
+   Without the Workflow tool, degrade to
+   `${CLAUDE_PLUGIN_ROOT}/harness/sequential-fallback.md`: same prompts, same
+   schemas, one dimension at a time with every stage persisted under
+   `.security-review/pass-<N>/` before the next starts, verifiers in small
+   parallel batches, schema enforcement by instruct-validate-retry, resume
+   from the last persisted dimension. Token cost is comparable; wall clock
+   roughly doubles — say so when offering it. The non-negotiables that survive
+   either substrate: **the recorded consent gate (`audit-tier` + `audit-targetmap`),
+   `verifyConsent`'d + FAILED CLOSED before the first finder** — on the Workflow path
+   `build-audit-engine.mjs` enforces it, on the sequential path the orchestrator runs
+   the same `record-consent` verify (sequential-fallback.md §3 step 1); read-only
+   finder/verifier agents (the audit never mutates the repo it audits), fresh-context
+   verifiers that never see the finder's reasoning, and **findings that skip
+   verification are never reported** (§3.3) — a verifier that fails twice sends its
+   finding to the run log as `unverified — re-run`, not to the report.
+
+6. **Merge mechanically; let synthesis write the report.** The synthesis agent
+   writes `<target>/docs/security-review/audit-report-<date>-pass<N>.md` from
+   confirmed/partial findings only, with the §9 contract: (1) executive
+   summary — blocking vs hardening, stated plainly, and headed by the
+   deterministic cluster view printed VERBATIM from
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/finding-clusters.mjs --target <target> --headline`
+   (the fixed block: raw confirmed counts FIRST, then the clustered distinct-file
+   headline — never hand-rebuilt, reordered, dropped a column, or flipped table↔prose;
+   Step 7's `verify-report-headline.mjs` gate enforces this mechanically, so a skipped
+   or hand-rewritten block HALTS the run instead of shipping).
+   `merge-ledger.mjs` (the merge run below) now ALSO emits that verbatim cluster block to
+   `<target>/.security-review/report-headline.md` — byte-identical to the stdout of
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/finding-clusters.mjs --target <target> --headline`
+   over the just-merged ledger, and refreshed post-disposition by Step 7's re-render — so
+   the synthesis agent leaves a `<!-- SRT:CLUSTER-HEADLINE -->` placeholder where the
+   exec-summary headline goes (or includes that file's content verbatim) and writes its
+   blocking/hardening prose AROUND it, never restating a critical/high count that could
+   contradict it — Step 7 then INJECTS the current block at that placeholder deterministically
+   (`inject-report-headline.mjs`), so a forgotten paste no longer hard-stops the run.
+   This is the SAME block the journey's blocker gate prints, so the failure verdict reads
+   identically at both sites, and the per-dimension fan-out re-finding one root cause under
+   several lenses is never presented as that many distinct problems; (2) prioritized findings
+   table sorted by the verifier's `adjusted_severity` (the finder's severity
+   is provenance only); (3) a short, concrete remediation plan per
+   critical/high finding; (4) **strong controls observed** — written for reuse
+   in the reviewer-facing artifacts; (5) **coverage and residual risk** —
+   which dimensions ran, which were N/A and why, which were unresolved, and
+   the white-box-static caveat (a report without this section is dishonest by
+   omission); (6) readiness-tracker mapping. Then run the shipped merge engine —
+   mechanical, deterministic, never an LLM (a synthesis agent paraphrasing entries
+   corrupts the dedup keys). The Workflow tool already writes its run to a TASK-OUTPUT
+   FILE as an envelope (`{summary, result, workflowProgress}`); use the exact path the
+   tool returned. Point `merge-ledger --result` DIRECTLY at that task-output file — the
+   engine unwraps `.result` automatically (`merge-ledger.mjs:63`). Do NOT probe the file,
+   hand-extract `.result` into a separate file, or re-parse the envelope. Exact form:
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/merge-ledger.mjs --repo <target> --result <workflow-task-output-file> --date <date> --pass <N> --report <report-path> --tier <tier>`.
+   It computes the dedup ids (16 hex of SHA-256 over normalized file path + `\n` +
+   normalized title — never the description, never line numbers; exact normalization
+   in `${CLAUDE_PLUGIN_ROOT}/templates/audit-ledger.schema.json`), maps
+   `confirmed_real`/`partially_real` → `confirmed` and `false_positive` → `refuted`,
+   flips a re-found `fixed` entry back to `confirmed` with `regression: true`, redacts
+   any credential value in an evidence snippet (CONVENTIONS §6), tracks first/last-seen
+   across passes, merges INTO the existing ledger (never an overwrite), stamps the pass
+   `audited_commit` with the target's `git rev-parse HEAD` (the resumption fingerprint —
+   without it a later resume cannot tell whether the code behind a finding moved since
+   the audit; step 7 / `harness/ledger-staleness.mjs`), and appends the pass entry to
+   `.security-review/run-log.md`. Surface the unverified list from the run. Do NOT
+   hand-edit ledger entries.
+
+   **Then reconcile provenance — the LAST step of the merge phase.** After
+   `merge-ledger.mjs` has folded the LLM findings into the ledger, run
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/reconcile-provenance.mjs --target <target>`.
+   A `provenance:'deterministic'` finding from Step 4 that owns a class, sitting in
+   the SAME owned class at the SAME locus as an `llm-inferred` finding, demotes that
+   LLM finding to `status:'superseded'` (`superseded_by` → the deterministic id) — so
+   the LLM never re-reports or re-judges what an engine already determined. It runs
+   AFTER the merge because both the deterministic findings (Step 4) and the LLM
+   findings must be in the ledger first; it is conservative (only an OWNED class at
+   an overlapping locus supersedes — a different class, a non-overlapping locus, or
+   an unmapped deterministic finding leaves the LLM finding untouched) and it MARKS,
+   never deletes (pure + idempotent, so a re-run supersedes nothing new). Because
+   `merge-ledger.mjs` already printed its operator recap BEFORE this supersession,
+   Step 7 RE-RENDERS the recap so the headline + band reflect the reconciled state.
+
+   **Then SEED the heuristic priors — the overridable pre-adjudication you review.**
+   Run `node ${CLAUDE_PLUGIN_ROOT}/harness/seed-auto-dispositions.mjs --target
+   <target>` (on a journey run the early run-scans substrate already ran it; running
+   it here is a pure + idempotent no-op that re-seeds nothing already present). It
+   pre-clears the exact known-safe scanner-noise shapes — a migration-directory
+   `avoid-sqlalchemy-text`/`B608` (server-authored schema SQL), an npm CVE for a
+   package present ONLY in the adjacent package.json's `devDependencies`, and a
+   `gitleaks` hit whose file is absent from git HEAD (rotation debt, not a shipped
+   artifact) — as entries in
+   `<target>/.security-review/deterministic-dispositions.json`, each marked
+   `disposition_source:'heuristic'` with its `heuristic_id` + concrete `evidence`.
+   These are an OVERRIDABLE PRIOR, not a verdict: **review each `heuristic` entry.**
+   You override it TWO ways — (1) if your dimension analysis finds a REAL issue at a
+   heuristic-cleared locus (e.g. injection-xss finds user interpolation at a migration
+   file), raise your OWN `llm-inferred` confirmed finding there; apply-dispositions
+   structurally NEVER touches an llm-inferred finding, so your confirmation is
+   immune to the prior — that is the durable re-open; (2) strike or replace the
+   `heuristic` entry in the file before apply runs. The seeder is CONSERVATIVE by
+   design (a text()/B608 outside a migration dir, a production/transitive dep CVE, and
+   a secret present in HEAD are all left OPEN for you) — it clears the mechanical
+   noise so the headline is honest by default, and leaves the code-analysis calls (a
+   bound-parameter false positive in an admin route, say) to you.
+
+   **Then apply deterministic-band dispositions — the NEXT deterministic ledger
+   step.** When this pass's verification ADJUDICATES a whole deterministic scanner
+   class as a false positive (or an accepted risk) — the same reasoning it writes
+   into the FP dossier — record that adjudication as STRUCTURED data in the SAME
+   `<target>/.security-review/deterministic-dispositions.json` (APPEND to the
+   heuristic priors already seeded there — keep the ones you agree with, do not blindly
+   overwrite the file):
+
+   ```json
+   { "dispositions": [
+     { "engine": "semgrep", "ruleId": "<the exact rule that fired>",
+       "disposition": "refuted",
+       "reason": "<the same one-line justification the FP dossier row carries>",
+       "accepted_risk_justification": "<REQUIRED iff disposition is accepted_risk>",
+       "scope": { "files": ["<the exact loci you read>"] } }
+   ] }
+   ```
+
+   A `scope` is MANDATORY, in exactly ONE of two forms: `files: [...]` — the loci
+   you actually read and adjudicated (PREFER this whenever you enumerated them,
+   which your `reason` usually proves you did) — or `as_of_pass: <N>` — rule-wide
+   but bounded in time: "I reviewed every instance of this rule present at pass
+   N; they are all false positives", applied only to findings whose `first_seen
+   <= N`. An unbounded (scope-less) refutation is NOT offered, because
+   apply-dispositions re-runs on every pass: it would auto-refute a finding of
+   the same rule first discovered LATER, at a locus nobody has looked at. A
+   finding that matches a rule-wide adjudication but post-dates it stays
+   `confirmed` with a `pending_readjudication` note — re-adjudicate it (add its
+   locus to a `files` scope, or bump `as_of_pass` after actually reviewing it).
+
+   Then run `node ${CLAUDE_PLUGIN_ROOT}/harness/apply-dispositions.mjs --target
+   <target>`. **A non-zero exit is a HARD STOP.** The engine is all-or-nothing at
+   the file level: ANY invalid entry rejects the WHOLE dispositions file — it
+   prints every offender (`REJECTED entry #N: …`), applies NOTHING, and leaves the
+   ledger unchanged, so the adjudication you just wrote has NOT happened. The
+   remedy is to add the mandatory `scope.files` or `scope.as_of_pass` to the
+   NAMED entries and re-run ONCE. NEVER hand-edit `audit-ledger.json` to apply a
+   rejected adjudication, NEVER proceed past the failure (the recap and the
+   blocker gate would read an un-adjudicated band), and NEVER loop re-running an
+   unchanged file. On exit 0 it flips the matching `provenance:'deterministic'` findings
+   `confirmed → refuted` (or `accepted_risk`, carrying the required justification)
+   with an auditable `disposition_reason`, KEEPING provenance/engine/ruleId/class/
+   severity intact — the flip is a lifecycle layer on top, never a rewrite, so the
+   finding stays reviewer-reproducible. Safety properties (all engine-enforced):
+   it NEVER flips an `llm-inferred` finding (a disposition cannot hide an
+   LLM-confirmed blocker — the LLM's own confirmed findings are untouchable here);
+   the match is EXACT engine+ruleId (never fuzzy); it never moves anything INTO
+   the open band and never sets `fixed`; protected states (`fixed` /
+   `accepted_risk` / `superseded`) are never overwritten; it is pure + idempotent;
+   an absent dispositions file is a clean no-op. Because the SAME `reason` feeds
+   both the dossier prose and the ledger flip, the dossier FP row and the ledger
+   refutation share one source and can never diverge. Run it AFTER
+   `reconcile-provenance.mjs` and BEFORE Step 7 re-renders the recap, so the recap
+   and the blocker gate read the dispositioned band — the headline counts the REAL
+   blockers, and the recap's deterministic-band line surfaces how many findings
+   the adjudication dispositioned, how many of those were rule-wide, and how many
+   are pending re-adjudication (the drop is visible, never a silent shrink). The
+   CLI also prints the blast radius per disposition — `<engine>/<ruleId> →
+   refuted: N matched, N flipped, N pending (K files)` — READ those lines: one
+   entry silencing a three-digit count deserves a second look at its scope.
+   Do NOT auto-refute a class without a real adjudication: a rule that is usually
+   noise can be a real bug in some code — the adjudication is the LLM/human call,
+   the application is deterministic.
+
+7. **Print the recap, then gate and route.** `merge-ledger.mjs` (Step 6) emits a
+   FIXED operator recap block to stdout via `harness/render-recap.mjs` — LED BY the
+   same finding-cluster headline as the exec summary, then dimensions-ran ·
+   candidate/confirmed/refuted/unverified counts · the PROCEED/HALT verdict · the
+   not-covered caveat lines. **Because Step 6's `reconcile-provenance.mjs` and
+   `apply-dispositions.mjs` ran AFTER `merge-ledger.mjs` printed its recap, RE-RENDER
+   the recap so it reflects the reconciled + dispositioned band** —
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/render-recap.mjs --target
+   <target>` — and print THAT stdout block VERBATIM; never paraphrase, reorder, or
+   hand-rebuild it. (A superseded finding carries `status:'superseded'` and a
+   dispositioned deterministic finding carries `refuted`/`accepted_risk` + a
+   `disposition_reason`, so both drop out of the open band the headline and
+   PROCEED/HALT verdict read — the re-render is what propagates the supersession and
+   the dispositions to the operator-facing recap, whose deterministic-band line
+   surfaces the dispositioned count.) This same re-render ALSO REFRESHES
+   `<target>/.security-review/report-headline.md` — the deterministic headline sidecar
+   `merge-ledger.mjs` emitted PRE-disposition in Step 6 — to the post-disposition
+   cluster block, and the report's exec-summary headline must equal the CURRENT
+   `.security-review/report-headline.md` before `verify-report-headline.mjs` runs
+   (the gate recomputes the same block from the same ledger, so a report still
+   carrying the stale Step-6 copy over a changed band fails it).
+
+   **Re-derive the durable run-log the same way.** The recap re-render fixes only
+   the transient stdout block; `.security-review/run-log.md` — the committed,
+   partner-visible record — still carries the pre-disposition
+   `Open confirmed (all passes)` line merge-ledger appended in Step 6. Run
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/rerender-runlog.mjs --target <target>`.
+   It recomputes that line from the CURRENT ledger and rewrites ONLY it, ONLY in
+   the final `## Pass N` block (earlier pass blocks are historical record and stay
+   byte-identical; idempotent — a second run is a byte no-op), and prints the
+   correction (`run-log: open confirmed 441 → 86 (…)`) so the fix is visible,
+   never silent. On a missing ledger or a run-log with no `## Pass` block it exits
+   non-zero and touches nothing — it never invents a count.
+
+   **Then INJECT the mandated headline block deterministically — its PRESENCE no
+   longer depends on the synthesis agent pasting it.** Run
+   `node ${CLAUDE_PLUGIN_ROOT}/harness/inject-report-headline.mjs --target <target>
+   --report <report-path>`. It recomputes the cluster block from the CURRENT
+   (post-disposition) ledger — the same `renderClusterHeadline` the gate uses, so the
+   two cannot drift — and splices it into the report at the
+   `<!-- SRT:CLUSTER-HEADLINE -->` placeholder (or, absent one, right after the
+   exec-summary heading), replacing any stale prior injection. Idempotent; it fails
+   closed (exit 2) on an unreadable ledger or a missing report. This makes the next
+   check pass its block-presence test BY CONSTRUCTION, closing the cold-run hard-stop
+   where a synthesis agent skipped the block; the gate below still catches a
+   contradicting critical/high claim in the surrounding prose.
+
+   **Then verify the report headline against the ledger — a HARD STOP, not a
+   warning.** Run `node ${CLAUDE_PLUGIN_ROOT}/harness/verify-report-headline.mjs
+   --target <target> --report <report-path>`. It recomputes the deterministic
+   cluster block from the ledger (the same `renderClusterHeadline` every other
+   surface prints — imported, never reimplemented) and exits 2 when the report is
+   missing the verbatim block Step 6 mandates, or when a stated critical/high
+   claim contradicts the ledger (e.g. `Blocking items (critical/high): none` over
+   a ledger holding a confirmed critical). Any non-zero exit HALTS the run: fix
+   the report — re-paste the verbatim block, correct the claim — and re-run the
+   check before gating. Exit 0 prints a one-line confirmation. It parses only
+   demonstrable claim shapes and stays silent on anything ambiguous, so
+   legitimate prose never trips it.
+
+   Then gate: open
+   `critical`/`high` findings
+   halt the journey: fix
+   before `/sf-security-review-toolkit:generate-artifacts`, because the
+   AuthN/AuthZ artifact would otherwise document the vulnerable flow.
+   Quiet ledger → proceed. Two phrasings are banned everywhere — "secure" and
+   "clean": a dry pass means *this method found nothing new within the audited
+   dimensions*, never that nothing is there. Verification bounds false
+   positives; nothing here bounds false negatives except dimension coverage
+   and more passes (§11).
+
+8. **The re-run loop** — how fixes become a quiet ledger:
+
+   1. The partner fixes a finding. Mark the ledger entry `fixed` with a
+      `fix_commit` only after verifying the fix actually landed in the code —
+      never on the partner's word alone (CONVENTIONS §2). A real defect the
+      partner chooses not to fix becomes `accepted_risk` with a written
+      justification and a named owner — that is an owner decision, never
+      agent-made.
+   2. Re-run **dirty dimensions only**: the dimensions whose entries changed
+      state since the last pass, plus any dimension whose target files moved
+      per `git diff`. Same tier, same prompts, full digest — the finders
+      re-probe the fixed paths (regression check) and the adjacent code the
+      fix may have disturbed, while the digest keeps everything else quiet.
+      This is what makes pass N+1 a fraction of pass 1's cost.
+
+      **A targeted re-run still assembles the always-on trio — without
+      improvisation.** `build-audit-engine.mjs` force-injects
+      `sessionid-egress`, `secrets-credentials`, and `error-handling-disclosure`
+      into *every* `scope-input.json`, even a re-run that lists only the one
+      dirty dimension (e.g. `resource-consumption-abuse`). Carry their **pass-1
+      `targets` forward** in the re-run's `scope-input.applicable` when you have
+      them (a precise scope beats a fresh full-tree scan); if you omit them, the
+      engine auto-injects each with the deterministic **full-tree target (`.`)**
+      and the template scopes that finder to the entire repo. Either way the
+      re-run assembles and launches with **no empty-targets crash** — the
+      pre-0.8.44 failure where an auto-injected always-on dimension arrived with
+      empty `targets`, tripped the template's `!d.targets` validation, and killed
+      the whole fan-out (so a legitimate re-run only survived by hand-writing a
+      one-off `build-rerun.mjs` to re-supply the always-on targets — exactly the
+      LLM improvisation the shipped engine now makes unnecessary).
+   3. Escalate to `exhaustive` only now, if the submission warrants it, and
+      run until the §6 stop rule: two consecutive dry passes, the second a
+      full-band pass — one dry pass may only mean the band missed where the
+      bugs live.
+
+9. **Run-to-run stability of the contestable band (optional; independent
+   re-runs).** A cold-at-exhaustive test refuted the idea that the audit calls
+   the contestable-severity band reliably in a single run: across three runs of
+   *identical* code the confirmed set drifted (pairwise Jaccard 0.44–0.67) and
+   individual findings flipped status/severity. The unambiguous blockers recur;
+   the contestable band is an unstable *sample*. This step makes that variance
+   visible — it is **NOT** part of the stop rule and never gates anything.
+
+   **Sharply distinct from step 8.** Step 8 is fix → re-run: the code *changes*
+   between passes (remediation), and a finding that disappears is a fix landing.
+   This step is **independent re-runs on the SAME unchanged code** — nothing is
+   fixed between them — so a finding that appears in one run and not the next is
+   *run-to-run instability*, the thing the human must adjudicate.
+
+   1. **Snapshot a completed run.** After a run reaches its stop rule, copy the
+      final `<target>/.security-review/audit-ledger.json` to
+      `<target>/.security-review/runs/run-<k>/audit-ledger.json` (k = the next
+      integer index; start at 1). Do this for each independent run you choose to
+      perform. **Do NOT auto-orchestrate N runs** — each is a deliberate,
+      operator-initiated audit; you only archive what was actually run.
+   2. **Classify once ≥2 snapshots at the SAME `audited_commit` exist.** The
+      stability read is only meaningful across runs of identical code, so
+      confirm the snapshots share an `audited_commit` (the engine reports
+      `commit_consistency`; `mixed` means a code change crept in and the result
+      conflates a fix with instability). Then run the deterministic engine:
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/harness/recurrence-confidence.mjs \
+        --ledger <target>/.security-review/runs/run-1/audit-ledger.json \
+        --ledger <target>/.security-review/runs/run-2/audit-ledger.json \
+        [--ledger <target>/.security-review/runs/run-N/audit-ledger.json ...] \
+        --repo-root <target> \
+        --out <target>/.security-review/recurrence-confidence.json
+      ```
+
+      Surface `summary.bucket_counts`, `summary.reliably_recurring_blockers`
+      (the all-runs + status/severity-stable set), and `summary.by_file`. The
+      engine is pure/deterministic and never writes outside
+      `<target>/.security-review/`.
+   3. **The honest contract — state it to the operator.** No fixed run-count is
+      "complete"; the reliably-recurring blockers are what the toolkit finds
+      dependably; everything outside that set — appearing in only some runs, or
+      flipping status/severity — is the contestable band that a **human
+      adjudicates**, run by run. More runs sharpen the picture; they never
+      certify it. **Never imply "run N times and you're safe."** Salesforce
+      pen-tests the surface regardless. The artifact surfaces (informational
+      only, never altering the readiness gate) in
+      `/sf-security-review-toolkit:compile-submission`.
+
+## Automated vs. manual recap
+
+Automated: manifest staleness check, dimension selection, target-map
+resolution, the find → verify → synthesize fan-out, the mechanical ledger
+merge, report and run-log writing. Manual: tier choice, target-map
+confirmation and pruning, every remediation, the `fixed`/`accepted_risk`
+dispositions, and the judgment call on what a finding means for the business.
+The run recap is the FIXED `harness/render-recap.mjs` block (emitted by
+`merge-ledger.mjs`, printed verbatim at Step 7): it states which dimensions ran,
+candidates vs confirmed vs refuted vs unverified counts, the PROCEED/HALT verdict, and
+what was NOT covered: packaged Apex CRUD/FLS belongs to Code Analyzer, dynamic behavior
+belongs to DAST, and this was white-box static review by LLM agents — Salesforce
+pen-tests the surface regardless. If any dimension's **finder crashed** this pass
+(`coverage_failed`), the recap surfaces a loud **Coverage INCOMPLETE — re-run X**
+caveat and the verdict is never a clean PROCEED over the crashed dimension (a crashed
+finder is a hole in the audit, not "no findings"); re-run those dimensions (step 8).
+
+## What feeds the next skill
+
+The report's "strong controls observed" section is mined by
+`/sf-security-review-toolkit:generate-artifacts` for the controls narrative;
+the ledger gates `/sf-security-review-toolkit:compile-submission` (zero
+undispositioned critical/high, and the readiness verdict records which tier
+and how many passes produced it); refuted entries' verifier reasoning
+pre-classifies scanner false positives for the dossier in
+`/sf-security-review-toolkit:run-scans`.

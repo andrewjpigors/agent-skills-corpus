@@ -1,0 +1,825 @@
+---
+name: sprint-execution
+description: "Use when executing sprint stories, implementing features, or working through sprint backlog items"
+---
+
+# Sprint Execution — Subagent 驅動開發
+
+## 1. 概述
+
+Sprint 執行的核心 Skill。從 Sprint Backlog 逐個取出 Story，透過 **Subagent 驅動開發模式** 完成實作與審查。
+
+每個 Story 派遣一個全新的 Developer subagent 進行 TDD 開發，完成後經過**雙階段審查**（Spec Compliance + Code Quality）確保品質，最終更新 PROJECT_BOARD 並進入下一個 Story。
+
+---
+
+## 2. 核心原則
+
+**Story-Lifecycle Subagent 封裝 = context 隔離 + 自審閉環 + 高品質迭代**（ADR-007 選項 B）
+
+- **隔離性**：每個 Story 派遣一個全新的 Story-Lifecycle subagent，整個生命週期（Dev + Review + 修復循環）在 subagent 內部閉環，主 session 僅收摘要，避免 context overflow
+- **TDD 強制**：所有功能實作必須先寫測試再寫代碼（subagent 內部執行）
+- **三階段自審**：Spec Compliance → Code Quality → Security（條件觸發），由 Story-Lifecycle subagent 自審，補償機制見 ADR-007 §AC3
+- **小步快跑**：每個小步驟一個 commit，保持可追溯性
+
+---
+
+## 2.1 Provider 路由（多模型派遣）
+
+<!-- US-177 CLI Adapter 簡化 — Sprint 67 -->
+<!-- US-180 Developer Provider 路由 Fallback 自動化 — Sprint 69 -->
+<!-- US-181 Provider 路由預設值宿主平台偵測 — Sprint 70 -->
+
+Sprint 執行支援**雙軌派遣機制**：由環境變數 `SHIKIGAMI_MODEL_PROVIDER` 和 `SHIKIGAMI_ROLE_PROVIDER_MAP` 控制路由。解析順序：`SHIKIGAMI_ROLE_PROVIDER_MAP[role]` → `SHIKIGAMI_MODEL_PROVIDER` → 宿主平台自動偵測 → `claude`（ultimate fallback）。Gemini CLI 失敗時自動 fallback 至 Claude Agent tool，輸出 `[FALLBACK]` 告警。
+
+> 詳見 `references/provider-routing.md`
+
+---
+
+## 2.1.1 API Error Fallback 策略
+
+<!-- #995 Subagent API Error Fallback — opus 529/500 自動降級或退避 — Sprint 182 -->
+<!-- #1003 / ADR-046 升級為「策略 + 偵測 + 限制」三段式 — Sprint 183 -->
+
+Sprint Execution 中 subagent 呼叫 LLM API 遇到錯誤時，依下列三類路徑處理。**不降級至 haiku**（haiku 不在 fallback 路徑中）。
+
+### 驗證狀態圖例（ADR-046）
+
+| 標記 | 意義 |
+|------|------|
+| 🟢 已驗證 | 框架自有實作，由 `scripts/dispatch-with-fallback.sh` 提供 |
+| 🟡 防禦性假設 | 假設 Claude Code Agent tool 不自動 fallback，主 session 派遣層自行處理 |
+| 🔴 依賴外部 | 取決於 Claude Code 實際行為，無法在框架側驗證 |
+
+> 偵測 pattern 的單一來源在 `scripts/dispatch-with-fallback.sh`（ADR-046 D3）。本節僅描述決策樹，不重複 pattern 字面以避免 drift。
+
+### (a) HTTP 429（Rate Limit）路徑
+
+🟡 防禦性假設：Claude Code Agent tool 是否內建 retry 不可驗證，主 session 自行偵測並重試。
+
+指數退避重試**同模型**，耗盡後降級 sonnet：
+
+| 步驟 | 行為 |
+|------|------|
+| 第 1 次 | 等待 30s → 重試同模型 |
+| 第 2 次 | 等待 60s → 重試同模型 |
+| 第 3 次 | 等待 120s → 重試同模型 |
+| 3 次全失敗 | 降級至 sonnet 重試 1 次 |
+| sonnet 亦失敗 | → `[API-FALLBACK-EXHAUSTED]`，Story=BLOCKED |
+
+### (b) HTTP 500 / HTTP 529（Server Error / Overload）路徑
+
+🟡 防禦性假設：同 (a)。
+
+立即降級至 sonnet，不重試原模型：
+
+| 步驟 | 行為 |
+|------|------|
+| 立即降級 | 立即降級至 sonnet 重試 1 次 |
+| sonnet 失敗 | 指數退避 sonnet：30s → 60s → 120s，最多 3 次 |
+| 3 次全失敗 | → `[API-FALLBACK-EXHAUSTED]`，Story=BLOCKED |
+
+### (c) Usage Policy Refusal 路徑（#1003 / ADR-046 新增）
+
+🟢 已驗證偵測 / 🟡 重試動作為防禦性
+
+與 (a)(b) 不同，subagent **正常完成**但回傳內容是拒答字樣（如 `I can't help with that`、`against my guidelines`）。try-catch 抓不到，必須**比對輸出內容**：
+
+| 步驟 | 行為 |
+|------|------|
+| 主 session 收到 subagent result | 呼叫 `bash scripts/dispatch-with-fallback.sh detect-refusal --input-file <result>` |
+| 偵測到 → 換 sonnet 重試 1 次 | 同樣 prompt 改派 sonnet（policy 較寬鬆） |
+| 仍拒答 | → `[POLICY-REFUSAL] story_id=#N` 並轉人工確認 |
+
+> Sprint 182 Planning 期間 Architect + QA 同時遭此情境，主 session 手動降級。本路徑將該手動行為自動化。
+
+### 終止條件
+
+所有重試耗盡後（429/5xx 路徑）或政策性拒答 sonnet 仍失敗（refusal 路徑）：
+1. stdout 輸出：`[API-FALLBACK-EXHAUSTED]` 或 `[POLICY-REFUSAL]`
+2. 將 Story 標記為 `BLOCKED`（在 sprint checkpoint 記錄原因）
+
+### 偵測與紀錄 helper（#1003 / ADR-046 D1）
+
+主 session 派遣 subagent 後依結果判斷：
+
+```bash
+# 1) 例外訊息偵測（429/5xx）
+bash scripts/dispatch-with-fallback.sh detect-error --input-file /tmp/agent-stderr.txt
+# exit 0 + 輸出建議動作；exit 1 = 不需 fallback
+
+# 2) 正常輸出偵測（policy refusal）
+bash scripts/dispatch-with-fallback.sh detect-refusal --input-file /tmp/agent-stdout.txt
+
+# 3) 紀錄事件
+bash scripts/dispatch-with-fallback.sh record-event \
+  --story 1003 --from opus --to sonnet --reason POLICY_REFUSAL --retry-count 0
+```
+
+注意：實際的 Agent tool 重新派遣只能由主 session（LLM）執行。Wrapper 提供**判斷與紀錄**功能，不替代派遣動作。
+
+### 降級 Log（AC-4）
+
+每次降級事件寫入 `docs/cruise-logs/model-fallback-<date>.jsonl`（每日一檔）：
+
+```jsonc
+{
+  "timestamp": "2026-04-10T12:00:00Z",  // ISO 8601 UTC
+  "story_id": "#995",                    // GitHub Issue 號碼
+  "from_model": "opus",                  // 原始模型
+  "to_model": "sonnet",                  // 降級目標模型
+  "reason": "HTTP529",                   // HTTP429 | HTTP500 | HTTP529
+  "retry_count": 0                       // 本次為第幾次重試（0-based）
+}
+```
+
+stdout 格式：`[MODEL-FALLBACK] #N from=opus to=sonnet reason=HTTP529`
+
+### 靜態例外 Agent（不參與動態路由，AC-5）
+
+下列 agent 固定使用 opus，但遇到 API 錯誤時仍依 fallback 路徑降級：
+
+| Agent | 正常模型 | 429 fallback | 500/529 fallback | 耗盡後 |
+|-------|---------|-------------|-----------------|--------|
+| Architect | opus | 退避 opus → sonnet 1次 | 立即 sonnet → 退避 sonnet | BLOCKED |
+| QA | opus | 退避 opus → sonnet 1次 | 立即 sonnet → 退避 sonnet | BLOCKED |
+| Security | opus | 退避 opus → sonnet 1次 | 立即 sonnet → 退避 sonnet | BLOCKED |
+
+> 靜態例外 agent 降級為 sonnet 時必須在降級 log 記錄，並在 Story 完成摘要中標注「降級執行」。
+
+---
+
+## 2.2 平行執行安全防護（共用文件保護）
+
+<!-- US-188 平行 subagent 禁止直接修改共用文件 — Sprint 72 -->
+<!-- US-255 SHIKIGAMI_MAX_PARALLEL 平行數量上限控制 — Sprint 93 -->
+<!-- #537 Worktree 唯一性檢查（重複派遣防護 Gate） — Sprint 129 -->
+<!-- #712 動態記憶體感知調整機制 — Sprint 153 -->
+<!-- #722 parallel-safety 全自動化 — 消除人工決策 — Sprint 154 -->
+
+<HARD-GATE>
+**平行 Story-Lifecycle subagent 禁止直接修改 `docs/PROJECT_BOARD.md` 和 `docs/sprints/sprint_N.md`**（競態條件防護）。所有平行 subagent 完成後，主 session 統一批次更新。`SHIKIGAMI_MAX_PARALLEL` 環境變數控制最大平行數量（**預設值 2**，未設定時視為 2，OOM 防護，#536）。派遣前必須：(1) 執行 **Worktree 唯一性檢查**：以 `git worktree list --porcelain` 確認同 Story ID 的 worktree 不存在，若已存在則輸出 `[DISPATCH-SKIP]` 跳過（#537）；(2) **自動執行 memory-aware-dispatch.sh** 取得 FINAL_MAX，超限時輸出 `[OOM-WARN]` 並等待釋放（#536 / #712）。Git Worktree 隔離（`isolation: "worktree"`）消除大部分並發衝突。
+
+<!-- #775 DM-4 Write Gateway 系統化 — Sprint 159 -->
+
+**Coordinator-only 檔案清單**（#775 AC1）：subagent 禁止直接寫入下列檔案，所有寫入須透過主 session 批次更新：
+
+| 檔案 | 說明 |
+|------|------|
+| `docs/PROJECT_BOARD.md` | Sprint 看板狀態（coordinator-only） |
+| `docs/sprints/sprint_N.md` | Sprint Backlog 與結果文件（coordinator-only） |
+| `docs/sprints/sprint-checkpoint.json` | Sprint 進度 checkpoint（coordinator-only） |
+</HARD-GATE>
+
+### Worktree Branch Base 隔離檢查（#968）
+
+<!-- #968 worktree 平行執行時確保 branch 從乾淨 base 建立 — Sprint 178 -->
+
+平行派遣 worktree subagent 前，必須確保所有 worktree branch 都從乾淨的 `origin/main` 起點建立，防止 commit 交叉污染（Sprint 177 Retro Action）。
+
+**主 session 派遣準備清單**：
+
+1. **執行全局 fetch**：`git fetch origin main`（一次性準備）
+2. **記錄 epoch commit**：`EPOCH_COMMIT=$(git rev-parse origin/main)` — 記錄派遣時刻的 main 版本
+3. **派遣各 Story subagent**，各自執行：
+   - 建立 worktree 時使用 `worktree-setup.sh`（自動建立 `app/node_modules` symlink）：`bash scripts/worktree-setup.sh <path> -b <branch> origin/main`（#2286 Sprint 215）
+   - **禁止**直接使用 `git worktree add <path> -b <branch> origin/main`（缺少 node_modules symlink，vitest/eslint/tsc 無法執行）
+   - 驗證初始 commit：`WORKTREE_HEAD=$(git rev-parse HEAD)` 應等於 EPOCH_COMMIT
+4. **平行完成後**：主 session 驗證所有 PR 的 commit 歷史無污染（PR review 時檢查）
+
+詳細流程見 `references/parallel-safety.md` **Worktree Branch Base 隔離檢查（#968）**
+
+### 自動記憶體感知派遣（#712 / #722）
+
+派遣 subagent 前，**自動**執行 `scripts/memory-aware-dispatch.sh` 取得動態安全並行上限，無需人工決策：
+
+```bash
+# 自動派遣決策（無需人工介入）
+source scripts/memory-aware-dispatch.sh
+FINAL_MAX=$(get_dispatch_decision | jq -r '.final_max')
+# FINAL_MAX = min(DYNAMIC_MAX, SHIKIGAMI_MAX_PARALLEL)
+# DYNAMIC_MAX = floor(available_mb / 512)
+# 若 FINAL_MAX < SHIKIGAMI_MAX_PARALLEL → 自動輸出 [OOM-WARN]，採用 FINAL_MAX
+```
+
+| 情境 | 自動行為 |
+|------|---------|
+| 記憶體充足（available_mb ≥ 512 × N） | 採用靜態上限 N，無警告 |
+| 記憶體受限（available_mb < 512 × N） | 自動降級至 FINAL_MAX，輸出 `[OOM-WARN]` |
+| 偵測失敗（/proc/meminfo 不可讀等） | 靜默降級至靜態值 2，無警告 |
+
+> 詳見 `references/parallel-safety.md`、`docs/sdd/sdd-004-parallel-execution-auto.md`
+
+---
+
+## 2.8 Sprint 開始時 API 文件版本驗證（US-221）
+
+<!-- US-221 知識老化偵測 — Sprint 84 -->
+
+Sprint Execution 第一個 Story 取出之前，自動驗證已內化的關鍵 API 文件版本新鮮度（知識老化偵測「事件觸發」層）。HIGH 優先條目 FRESH（≤30 天）→ `[KS-PASS]`；STALE（31–90 天）→ `[KS-WARN]` 不阻塞；EXPIRED（>90 天）→ `[KS-FAIL]` 要求確認。檔案不存在則 `[KS-SKIP]` 靜默略過。
+
+> 詳見 `references/knowledge-staleness.md`
+
+---
+
+## 2.8.5 Context Engineering JIT Skill 載入策略（#793）
+
+<!-- #793 Context Engineering JIT Loading — Sprint 160 -->
+
+**目標**：減少 Sprint Execution 啟動時的 context 壓力，改用 Just-in-Time（按需）載入模式取代全量預載。
+
+### JIT vs 預載入分類
+
+| 載入時機 | 文件 | 說明 |
+|---------|------|------|
+| **Session 啟動時預載入（必要）** | `CLAUDE.md` | 框架全域規則，必須立即可用 |
+| **Session 啟動時預載入（必要）** | `.claude/shikigami.local.md` | 專案配置，必須立即可用 |
+| **JIT — Sprint Planning 觸發時才載入** | `skills/sprint-planning/SKILL.md` | 僅 Sprint Planning 期間需要 |
+| **JIT — Sprint Execution 觸發時才載入** | `skills/sprint-execution/SKILL.md` | 僅 Sprint Execution 期間需要 |
+| **JIT — Story 取出後才載入** | `docs/sprints/sprint_N.md` | 含 Story AC，取出 Story 時按需載入 |
+| **JIT — Story 取出後才載入** | `related_adrs`、`related_sdds` | 依 Story 輸入契約按需載入 |
+| **JIT — Cruise 觸發時才載入** | `skills/cruise/SKILL.md` | 僅 Cruise 模式需要 |
+
+### session-start hook 載入原則（AC2）
+
+`hooks/session-start` 僅執行以下最小載入：
+1. 寫入 attendance checkin 紀錄
+2. 偵測 cruise flag / sprint checkpoint（用於 compact 後恢復提示）
+3. **不預載入任何 Skill SKILL.md 文件**（JIT 模式）
+
+### JIT 載入觸發機制
+
+```
+Sprint Execution 啟動時（on-demand）：
+  → 主 session 讀取 skills/sprint-execution/SKILL.md（本文件）
+  → 取出每個 Story 後，subagent 自行讀取 sprint_N.md 取得 AC
+  → related_adrs / related_sdds 作為輸入契約傳入，subagent 自行讀取
+```
+
+**NFR1**：JIT 載入不得破壞既有 Skill 注入路徑。所有 Skill 文件仍可透過 Read tool 按需讀取，僅調整「何時讀取」（按需 vs 預載），不調整「讀取內容」。
+
+---
+
+## 2.9 合約載入（US-204）
+
+<!-- US-204 統一合約位置 — Sprint 82 -->
+
+Sprint Execution 開始前，依 Story AC 載入相關共用交付合約：
+
+| 情境 | 須載入的合約 |
+|------|------------|
+| Story AC 涉及 SOW 文件建立或審查 | `contracts/sow-delivery-contract.md` |
+| Story AC 涉及 Metrics、Points、Velocity 等數值修改 | `contracts/numerical-consistency-contract.md` |
+| 不確定適用哪份合約 | 先讀取 `contracts/README.md` 查閱合約清單 |
+
+合約載入為 Story 實作前的必要步驟（取出 AC 後、開始 TDD 前執行）。若合約與 AC 有衝突，以 AC 為準。
+
+---
+
+## 2.10 前端 Story 設計資訊 Pre-check（US-244）
+
+<!-- US-244 前端 Story 設計資訊 Gate — Sprint 88 -->
+
+取出 FEATURE type Story 後，若識別為前端 Story（AC 含 UI 元件詞語、前端技術詞語、或標題含前端意圖），執行設計資訊 Pre-check：確認 Design Spec / Figma Prototype / Design Token / 凍結 DESIGN Contract 至少一項存在。缺失時輸出 `[FE-PRECHECK-WARN]`（不阻塞），標記「需 UIUX 介入」。
+
+> 詳見 `references/frontend-precheck.md`
+
+---
+
+## 2.11 多 Session 並行協調 — Claim/Release 機制（US-312）
+
+<!-- US-312 多 Session 並行開發 Issue/Story 級別協調機制 — Sprint 101 -->
+
+三層協調防止多 session 重複領取 Story：本地 `flock` + 遠端 `git push refs/claims/<id>` + GitHub Issue assignee/label 展示層。`[CLAIM-OK]` → 繼續；`[CLAIM-BLOCKED]` → 跳至下一 Story；SessionEnd hook 自動 release。
+
+> 詳見 `references/claim-release.md`
+
+---
+
+## 2.12 Sprint 進度 Checkpoint（US-313）
+
+<!-- US-313 Sprint 進度 Checkpoint 機制 — Sprint 102 -->
+
+每個 Story 完成後，主 session 自動寫入 `docs/sprints/sprint-checkpoint.json`（狀態文件豁免，允許直推 main，ADR-023 決策 4）。寫入失敗靜默略過（`[CHECKPOINT-WRITE-WARN]`），不阻塞主流程。
+
+> 詳見 `references/checkpoint.md`
+
+---
+
+## 2.13 Sprint Task List — compact 後進度恢復（#469 / #538）
+
+<HARD-GATE>
+**Task List 強制建立（#538 AC7）**：Sprint Execution 啟動時，必須為每個 in-sprint Story 建立對應 Task（格式：`{repo}/sprint-{N}-execution`）。若 TaskList 中缺失本 Sprint 的 Task，必須立即補建再繼續。任何跳過 Task 建立的行為均屬流程違規。hook 腳本 `hooks/task-gate.sh` 可協助驗證（Sprint Execution 啟動時自動呼叫）。
+</HARD-GATE>
+
+<!-- #469 Cruise/Sprint 執行時建立 Task List — 防止 compact 後跳步 -->
+<!-- #538 Task 命名改為 repo/sprint-N-phase 格式，取代 SESSION_ID 後綴 -->
+
+Sprint Execution 啟動時建立 Task List，以 `{repo}/sprint-{N}-{phase}` 格式命名，記錄三個主要 phase。compact 後查詢 TaskList，以 `{repo}/sprint-{N}-` 為前綴匹配，恢復進度跳過已完成 phase，防止跳步。
+
+> 詳見 `references/checkpoint.md`（含 Task 命名格式、舊 Sprint 殘留清理、compact 恢復流程）
+
+---
+
+## 2.14 Crash Recovery — Side Effect Idempotency Guard（#405 / ADR-041）
+
+<!-- #405 Temporal-style Crash Recovery — Sprint 140 -->
+
+Session crash 後重啟時，Sprint Execution 自動偵測未完成 checkpoint，並透過 Side Effect Log 防止不可逆操作被重複執行。**[RECOVERY-TRIGGER] 條件**：`sprint-checkpoint.json` 存在且有 `status=in-progress` 的 Story。
+
+> 詳見 `references/crash-recovery.md`（Side Effect Guard 使用方式、Recovery 觸發腳本）
+
+---
+
+## 3. 執行流程
+
+<!-- #983 Task List 初始化改為 short-lived step subagent 派遣 — Sprint 180 -->
+
+```
+Task List 初始化（§2.13，#469 AC1/AC3，#538 AC2，#983 ADR-045 落地）
+  # ── Step Subagent 派遣模式（#983 AC-1）──
+  # 此節點改為派遣 short-lived step subagent 執行，遵循 ADR-045 §3 契約
+  # 契約文件：references/step-subagent-contract.md
+  # 派遣 SOP：references/execution-flow-details.md §Step-Subagent-SOP
+  #
+  # 主 session 執行步驟：
+  # 1. 生成 prompt（規則佔比需 >= 10%，由 rule-ratio-measure.sh 驗證）
+  #    bash scripts/state-machine/step-subagent-poc.sh generate-prompt task-list-init <SPRINT_NUM>
+  #
+  # 2. 使用 Agent tool 派遣 short-lived subagent：
+  #    Agent tool prompt = 讀取 .state-machine/poc-output/prompt-task-list-init.md 內容
+  #    subagent 完成後輸出結果 JSON（格式見 references/step-subagent-contract.md §2）
+  #
+  # 3. 驗證結果 JSON 契約（status = "completed"，output_artifacts 非空）
+  #
+  # 4. 更新 progress tracker
+  #    bash scripts/state-machine/state-machine.sh complete task-list-init
+  #
+  # ── 退化模式（claude CLI 不可用時）──
+  # 若環境不支援 Agent tool 派遣，可降級為模擬模式：
+  #    bash scripts/state-machine/step-subagent-poc.sh simulate task-list-init <SPRINT_NUM>
+  #
+  # ── 原有 Task List 建立邏輯（subagent 內部執行）──
+  # Sprint 啟動時建立 Task List，記錄三個主要 phase
+  # 從 git remote 解析 OWNER_REPO（如 kctw-dev/shikigami）
+  OWNER_REPO=$(git remote get-url origin | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##; s#\.git$##')
+  # 從 sprint_N.md 讀取 SPRINT_NUM
+  SPRINT_NUM=<N>  # 從 sprint file 路徑解析
+
+  # 清理舊 Sprint 殘留 Task（#538 AC5）
+  # 若 TaskList 中存在前一 Sprint 的 Task（status 非 completed），標記為 completed
+  OLD_SPRINT_TASKS=$(TaskList | filter subject starts_with "${OWNER_REPO}/sprint-" AND subject NOT contains "/sprint-${SPRINT_NUM}-" AND status != "completed")
+  for OLD_TASK in OLD_SPRINT_TASKS:
+    TaskUpdate id=OLD_TASK.id status="completed"
+
+  TaskCreate tasks：
+    - "${OWNER_REPO}/sprint-${SPRINT_NUM}-planning"   status=pending
+    - "${OWNER_REPO}/sprint-${SPRINT_NUM}-execution"  status=pending
+    - "${OWNER_REPO}/sprint-${SPRINT_NUM}-review"     status=pending
+  # compact 後恢復進度（#538 AC4）：以 "{repo}/sprint-{N}-" 為前綴查詢 TaskList，從第一個非 completed 的 task 繼續
+  |
+  v
+# ── Task List 狀態更新：sprint-execution 開始（#469 AC2）──
+TaskUpdate id="${OWNER_REPO}/sprint-${SPRINT_NUM}-execution" status=in-progress
+  |
+  v
+Sprint Checkpoint 偵測（AC-2 斷點續跑，§2.12）
+  |-- docs/sprints/sprint-checkpoint.json 不存在
+  |     → [CHECKPOINT-NEW] 正常開始（無先前 checkpoint）
+  |-- 存在且所有 Story status = "completed"
+  |     → [CHECKPOINT-DONE] 所有 Story 已完成，觸發 sprint-review
+  +-- 存在且有未完成 Story（status = "in-progress" 或 "pending"）
+        → [CHECKPOINT-RESUME] 偵測到未完成 checkpoint，從斷點繼續
+        → 跳過所有 status = "completed" 的 Story（已完成，不重做）
+  |
+  v
+Issue 快掃（gh issue list --state open --limit 10）
+  |-- gh 失敗 --> 靜默略過，繼續下一步（不阻塞）
+  +-- 成功 --> 篩出需回覆的 issue
+              → **Security Gate 掃描（#393，ADR-006 Security Gate 擴充）**
+                規則檔：[`docs/definition/SECURITY_RULES.md`](../../docs/definition/SECURITY_RULES.md)
+                |-- HIGH_RISK  → [SECURITY-GATE-HIGH] 暫停，通知 Stakeholder，ESCALATE: SECURITY_CRITICAL
+                |-- MEDIUM_RISK → [SECURITY-GATE-MEDIUM] 附 warning 繼續，寫入 trace log
+                +-- PASS → 繼續
+              → PO 草稿 → QA 審核 → 發布
+  |
+  v
+CI 狀態快掃（gh run list --limit 3 --json name,status,conclusion,url）
+  |-- gh 失敗 / UNKNOWN --> 靜默略過，繼續下一步（不阻塞）
+  |-- CI PASS --> 繼續執行
+  +-- CI FAIL --> 輸出 [CI-SOFT-GATE]（含 workflow 名稱與 run URL），要求確認是否繼續
+        |-- 使用者確認繼續 --> 繼續 Story 開發
+        |-- 同一 workflow 連續 3 次 FAIL --> 升級為 Hard Gate，阻塞 Story 開發
+        +-- 使用者拒絕繼續 --> 中止本次 Sprint 執行，等待 CI 修復
+  |
+  v
+API 文件版本驗證（§2.8，知識老化偵測事件觸發層）
+  |-- [KS-SKIP] 檔案不存在或讀取失敗 --> 靜默略過，繼續執行（不阻塞）
+  |-- [KS-PASS] 所有 HIGH 條目均 FRESH --> 繼續執行
+  |-- [KS-WARN] 有 STALE 條目 --> 輸出告警，繼續執行（不阻塞）
+  +-- [KS-FAIL] 有 EXPIRED 條目 --> 要求確認是否繼續
+  |
+  v
+Injection Scan 前置檢查（#776，AC2）
+  # 每次 Story dispatch 開始前，對 Story body 執行 prompt injection 掃描
+  # 將 Story body 寫入臨時檔案，傳入 injection-scan.sh
+  STORY_BODY_TMP=$(mktemp)
+  echo "${STORY_BODY}" > "$STORY_BODY_TMP"
+  INJECTION_RESULT=$(bash scripts/injection-scan.sh "$STORY_BODY_TMP" 2>/dev/null | tail -1)
+  rm -f "$STORY_BODY_TMP"
+  if [[ "$INJECTION_RESULT" == "BLOCK" ]]; then
+    echo "[INJECTION-GATE] Story #${STORY_ID} body 偵測到高風險 prompt injection 模式，停止 dispatch"
+    echo "  請人工確認 Story body 後重新執行 Sprint Execution"
+    # 不 exit，跳過此 Story 繼續下一個
+    skip_story=true
+  elif [[ "$INJECTION_RESULT" == "WARN" ]]; then
+    echo "[INJECTION-WARN] Story #${STORY_ID} body 含可疑模式，附警告繼續執行"
+  fi
+  # injection-scan.sh 不存在時靜默跳過（降級容錯）
+  |-- scripts/injection-scan.sh 不存在 → 靜默跳過，輸出 [INJECTION-SCAN-SKIP]，繼續執行
+  |-- BLOCK → [INJECTION-GATE]，跳過此 Story，取下一個 Story 繼續
+  |-- WARN  → 附警告繼續執行
+  +-- PASS  → 繼續執行
+  |
+  v
+Kill Switch 前置檢查（#783，AC2）
+  # 每次 Story dispatch 開始前，檢查 kill-switch sentinel
+  # Session ID 來源：$SESSION_ID 環境變數，或 .claude/shikigami.local.md session_id 欄位
+  SENTINEL="/tmp/shikigami-kill-${SESSION_ID}.flag"
+  if [[ -f "$SENTINEL" ]]; then
+    echo "[KILL-SWITCH-ACTIVATED] Kill switch 已啟動，安全停止 Sprint 執行"
+    echo "  Sentinel: $SENTINEL"
+    echo "  在完成當前 Story 後停止（NFR1：不強制中止已派遣的 subagent）"
+    echo "  Active worktrees（NFR2）："
+    bash scripts/kill-switch.sh --list "$SESSION_ID" 2>/dev/null || git worktree list 2>/dev/null
+    # 寫入 checkpoint 記錄 kill-switch 停止點
+    # 然後清潔退出 Sprint Execution
+    exit 0
+  fi
+  |
+  v
+Sprint Backlog 中取出 Story
+  |
+  v
+Parallel Conflict Prediction 靜態衝突分析（#395 #780）
+  # 取出所有 pending Story 後，靜態比對檔案重疊，分為 Group A（可平行）和 Group B（序列）
+  # 輸出 [CONFLICT-PREDICTION] dispatch plan：Group A（平行）| Group B（序列）
+  # 詳細分組規則與重評估邏輯：references/conflict-prediction.md
+  #
+  # [#780] Run predict-conflicts.sh before dispatching; use output to pre-arrange batches:
+  #   CONFLICT_JSON=$(bash scripts/predict-conflicts.sh ${story_id_list})
+  #   parallel_stories=$(echo "$CONFLICT_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(str(x) for x in d['groups']['parallel']))")
+  #   sequential_stories=$(echo "$CONFLICT_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(str(x) for x in d['groups']['sequential']))")
+  #   # 先派遣 parallel_stories（可平行），再序列執行 sequential_stories
+  |
+  v
+前端 Story 設計資訊 Pre-check（§2.10，story_type=FEATURE 時）
+  |-- [FE-PRECHECK-SKIP] 非前端 Story --> 繼續執行
+  |-- [FE-PRECHECK-PASS] 設計資訊完整 --> 繼續執行
+  +-- [FE-PRECHECK-WARN] 設計資訊缺失 --> 輸出告警，標記「需 UIUX 介入」，繼續執行
+  |
+  v
+Worktree 唯一性檢查（§2.2，重複派遣防護，#537）
+  git worktree list --porcelain | grep -E "branch refs/heads/sprint-[0-9]+/${story_id}-"
+  |-- 找到對應 worktree → [DISPATCH-SKIP] 跳過此 Story，取出下一個 Story 繼續
+  |-- git worktree 指令失敗 → 靜默忽略，繼續執行（不阻塞）
+  +-- 未找到 → 繼續 OOM 上限檢查與 Claim 流程
+  |
+  v
+Claim Story（§2.11，多 Session 並行協調）
+  bash hooks/claim-issue.sh <story_id>
+  |-- [CLAIM-OK]      --> 繼續執行（已取得 story 鎖）
+  |-- [CLAIM-BLOCKED] --> 輸出告警，跳至下一個 Story（本 Story 由他人執行）
+  +-- git push 失敗   --> 輸出 [WARN]，繼續執行（保守策略：不阻塞）
+  |
+  v
+Phase Checkpoint 讀取（#781 AC2，story-lifecycle-prompt.md §12.4）
+  # 在派遣 subagent 前，檢查是否有 Phase-level checkpoint 可供恢復
+  PHASE_CP_FILE="docs/sprints/subagent-results/${story_id}-phase-checkpoint.json"
+  if [[ -f "$PHASE_CP_FILE" ]]; then
+    LAST_PHASE=$(python3 -c "import json; d=json.load(open('${PHASE_CP_FILE}')); print(d.get('phase',''))" 2>/dev/null)
+    LAST_STATUS=$(python3 -c "import json; d=json.load(open('${PHASE_CP_FILE}')); print(d.get('status',''))" 2>/dev/null)
+    if [[ "$LAST_STATUS" == "completed" ]]; then
+      echo "[PHASE-RESUME] Story #${story_id} 上次已完成 Phase: ${LAST_PHASE}，從下一 Phase 繼續"
+      PHASE_CONTEXT="resume from phase after ${LAST_PHASE}"
+    fi
+  else
+    echo "[PHASE-RESUME-FALLBACK] 無 Phase checkpoint，從 analysis 開始"
+    PHASE_CONTEXT=""  # fallback: 從頭開始（NFR2）
+  fi
+  |
+  v
+  **[MANDATORY] PREFLIGHT 強制檢查 — rule-ratio 派遣前把關**（#990 AC-1/AC-2/AC-3）
+  ├─ **量測對象**：主 session 組裝完成的完整 dispatch prompt（含所有規則、輸入、契約）
+  ├─ **執行**：
+  │     FULL_PROMPT_FILE="/tmp/dispatch-prompt-${story_id}-$$.md"
+  │     # 組裝 full prompt（包含 story-lifecycle-prompt.md 的規則 + 當前 story 的輸入）
+  │     bash scripts/state-machine/dispatch-preflight.sh \
+  │       --prompt "$FULL_PROMPT_FILE" \
+  │       --story-id "#${story_id}"
+  │     PREFLIGHT_EXIT=$?
+  ├─ **三段式硬性門檻**：
+  │  |-- ratio >= 0.10  → PASS（繼續派遣）
+  │  |-- 0.05 ≤ ratio < 0.10 → WARN（記錄告警，繼續派遣）
+  │  +-- ratio < 0.05   → BLOCK（拒絕派遣，exit != 0，停止 Story）
+  ├─ **Fail-safe**：若 rule-ratio-measure.sh 不存在或執行失敗 → BLOCK（不 silent skip）
+  ├─ **記錄**：所有結果自動寫入 docs/cruise-logs/dispatch-rule-ratio-<date>.jsonl
+  │           （schema：timestamp、story_id、prompt_size_chars、rule_tokens、total_tokens、ratio、threshold、action）
+  └─ **升級動作**：若 PREFLIGHT_EXIT != 0 → Story=BLOCKED，暫停 Sprint，通知 Architect 人工介入
+  |
+  v
+派遣 Story-Lifecycle subagent（story-lifecycle-prompt.md）
+  Agent tool / Gemini CLI 雙軌派遣
+  model: "sonnet" | isolation: "worktree"（#379）
+  ※ 模型選擇（#976 AC-1）：依 ADR-039 風險評分路由，可派遣 haiku（Tier 1）執行 doc-only Story
+  subagent 內部閉環：TDD → Spec Compliance → Code Quality → Security → **必須開 PR（不 merge）**
+  ※ PR 建立是必要交付物（#976 AC-1）：所有 Story 無論大小或複雜度，包括 doc-only 修改，均**必須**執行 `gh pr create`
+  ※ 派遣 prompt 明確要求（#976 AC-1）：在 story-lifecycle-prompt.md 角色定義中明確指示 subagent 必須建立 PR
+  回傳：PASS/FAIL/ESCALATE + PR_URL（PR_URL 為必要欄位，無 PR 時回傳 ESCALATE）
+  （詳細派遣參數與雙軌路徑：references/execution-flow-details.md）
+  |
+  v
+接收 Story-Lifecycle subagent 回傳
+  |-- context 中無回傳結果（context compaction 導致丟失）
+  |     → [CACHE-RECOVERY] 掃描 docs/sprints/subagent-results/{story_id}.md
+  |           |-- 檔案存在 → 讀取暫存結果，繼續處置（輸出 [CACHE-RECOVERY-OK]）
+  |           +-- 檔案不存在 → 輸出 [CACHE-RECOVERY-FAIL]，視同 ESCALATE: CONTEXT_OVERFLOW
+  |-- ESCALATE --> 依升級類型處置（見 references/execution-flow-details.md 升級表）
+  |-- FAIL     --> 記錄失敗原因，更新看板，繼續下一 Story
+  +-- PASS（含 PR_URL，PR 尚未 merge）
+        |
+        v（#989 AC-1：[MANDATORY] POST-EXECUTION PR 強制驗證 — 見 §5 Hard Gates）
+
+  **[MANDATORY] POST-EXECUTION PR 強制驗證**（主 session 必須強制執行，不可省略）
+  ├─ 取出 subagent 回傳的 BRANCH_NAME（或從 story_id 推導：feat/#<N>-<slug>）
+  ├─ **強制執行以下 bash 指令**（實際指令，非流程圖語意）：
+  │     BRANCH_NAME="<subagent 回傳的 branch name>"
+  │     bash scripts/state-machine/post-execution-pr-verify.sh --branch "$BRANCH_NAME"
+  │     VERIFY_EXIT=$?
+  ├─ 升級動作矩陣（根據腳本輸出標記）：
+  │  |-- 輸出 [POST-EXEC-PR-MISSING]   → PR_COUNT==0
+  │  │     → 拒絕 PASS，Story=BLOCKED，暫停 Sprint，通知人工介入
+  │  |-- 輸出 [POST-EXEC-PR-WRONG-BASE]→ baseRefName != "main"
+  │  │     → 拒絕 PASS，不自動補救
+  │  |-- 輸出 [POST-EXEC-PR-NOT-OPEN]  → state != "OPEN"
+  │  │     → 拒絕 PASS，不自動補救
+  │  +-- 輸出 [POST-EXEC-PR-PASS]      → base=main, state=OPEN
+  │        → VERIFY_EXIT==0，繼續下一步
+  ├─ **不得自動補救**（不自動建 PR、不自動 push、不自動 merge）
+  ├─ 多 PR 邊界：取 base=main + state=OPEN 的第一個（腳本自動處理）
+  └─ 驗證完成後輸出 [POST-EXEC-PR-PASS] 或對應錯誤標記
+        |
+        v（#988 AC-1：[MANDATORY] L2 delivery-completion-check step subagent — 僅在 L1 PASS 後執行）
+
+  **[MANDATORY] L2 delivery-completion-check Step Subagent**（L1 [POST-EXEC-PR-PASS] 通過後才執行）
+  ├─ **前置條件**：L1 inline bash 驗證已輸出 [POST-EXEC-PR-PASS]；若 L1 BLOCKED 則跳過此步
+  ├─ **派遣方式**：使用 step-subagent-poc.sh dispatch delivery-completion-check
+  │     bash scripts/state-machine/step-subagent-poc.sh dispatch delivery-completion-check \
+  │       <sprint_number> <story_id> <branch_name> <claimed_pr_url>
+  ├─ **model**：haiku（短任務 + 高規則佔比，model-route step=delivery-completion-check tier=haiku reason=short-task-high-ratio）
+  ├─ **結果三態處置**：
+  │  |-- status=completed → 繼續下一步
+  │  |-- status=failed    → Story=BLOCKED，記錄失敗原因，暫停等待人工介入
+  │  +-- status=escalate  → PR_MISMATCH_SUSPECTED_FABRICATION，立即升級 Architect，停止 Sprint
+  └─ **不得跳過**：即使 L1 已驗證通過，L2 仍為必要步驟（雙軌驗證）
+        |
+        v
+  Checkpoint 重讀流程定義（§3.1 / references/execution-flow-details.md）
+  輸出 [CHECKPOINT-PASS] 或 [CHECKPOINT-FAIL]
+        |
+        v
+  外部獨立審查（#958 修正：100% 全量，不再抽樣）
+  所有 PASS Story 必須接受獨立 QA subagent 審查 PR diff
+  （詳見 references/external-sampling.md）
+        |
+        v
+  派遣獨立 QA subagent【model: "sonnet"】審查 PR diff（`gh pr diff <PR_URL>`）
+        |-- CONFIRM → 主 session 執行 `gh pr merge <PR_URL>` → 記錄結果，更新 PROJECT_BOARD
+        |-- DISPUTE → subagent push fix to PR branch → 強制二審 → CONFIRM 後 merge
+        |             （見 references/external-review-dispute.md §4.2）
+        +-- 無回傳 / crash / timeout → [QA-REVIEW-RECOVERY] 重新派遣 QA subagent（最多 2 次）
+                      仍無回傳 → ESCALATE: QA_SUBAGENT_FAILURE，PR 保持未合併，升級 Architect
+  |
+  v（CONFIRM + merge 完成後）
+  Story Completion Checklist（#368 方向3，每個 Story 完成後）
+  0. [ ] **Worktree Cleanup**（#969 AC-1/AC-2/AC-3）：PR merge 後、步驟 1 前執行
+         bash scripts/worktree-cleanup.sh <branch_name>
+         若 cleanup 失敗，輸出 [WORKTREE-CLEANUP-WARN] 但繼續步驟 1（不阻塞）
+  1. [ ] git checkout main && git pull
+  2. [ ] 更新 PROJECT_BOARD.md + sprint_N.md 狀態（以 Issue ID 定位列，取代最後一欄值）；git commit + push（豁免直推 main，ADR-023 決策 3）
+  3. [ ] 寫入 sprint-checkpoint.json（§2.12，豁免直推 main）
+  4. [ ] release claim：bash hooks/release-issue.sh <id>
+  5. [ ] 檢查 Sprint Backlog 是否清空
+         |-- 有剩餘 Story → 取出下一個 Story 繼續
+         +-- 全部完成 → 立即 invoke shikigami:sprint-review
+  ※ 步驟 0-4 任一失敗不阻塞，輸出 WARN 後繼續步驟 5
+```
+
+> 完整步驟詳解（CI 快掃判定、派遣參數、PR 合併流程、Push Retry、升級類型處置表、Subagent 結果暫存）：`references/execution-flow-details.md`
+
+---
+
+## 4. 外部獨立審查結果處理（CONFIRM / DISPUTE）
+
+CONFIRM → 主 session merge PR → 記錄結果，更新品質指標，繼續下一 Story（#960 修正：審查通過才 merge）。
+DISPUTE → PR 保持未合併、傳入缺陷清單至 Story-Lifecycle subagent push fix to PR branch、強制第二輪外部審查；第二輪 CONFIRM → merge；第二輪 DISPUTE → 升級至 Architect。Circuit Breaker：連續 3 Sprint DISPUTE 率 > 20% → 通知 Architect。
+
+> 詳見 `references/external-review-dispute.md`
+
+---
+
+## 4.5 DESIGN Type Story 執行路徑（ADR-016）
+
+DESIGN type Story 派遣 UI/UX Designer subagent（非 Developer），走 Vision Critic 自審 + QA Contract Testability Review，輸出 Figma Prototype Contract。TDD 豁免。
+
+> 詳見 `references/design-sprint-rules.md`
+
+---
+
+## 4.6 DESIGN ↔ FEATURE Sprint 內排序規則（ADR-016 OQ-2）
+
+DESIGN Story 優先執行，依賴其 Contract 的 FEATURE Story 須等 Contract 凍結後執行。無依賴的 FEATURE Story 可平行。DESIGN blocker 未解除時依賴 FEATURE Story 禁止進入開發（HARD-GATE）。FAIL 預設方案 A（回流 Backlog）。
+
+> 詳見 `references/design-sprint-rules.md`
+
+---
+
+## 4.7 Delivery Phase 雙 Team 視覺對比 Gate（#385 / ADR-034）
+
+<!-- #385 GAD Delivery Phase 視覺對比 Gate — Sprint 133 -->
+
+**適用條件**：Story 為 frontend FEATURE（AC 含有 Figma Prototype URL），Code Review 通過後、建立 PR 之前觸發（#960 修正）。**跳過條件**：後端 / Infra / DESIGN / RESEARCH Story（AC 或 issue body 中無 Figma Prototype URL），輸出 `[VISUAL-GATE-SKIP]`。
+
+> 詳見 `references/visual-gate.md`（執行流程、判定規則、降級機制）
+
+---
+
+## 5. Hard Gates
+
+<HARD-GATE>
+每個 Story 必須通過雙階段審查（Spec Compliance + Code Quality）才能標記為完成。
+不得跳過任何一個審查階段。
+
+> 歷史案例：Sprint 7 因跳過此步驟列為 Retro Problem（Issue #14），導致品質門禁失效。
+</HARD-GATE>
+
+> **Bypass 豁免：** 標記為 `[BYPASS]` 的 Story 豁免雙階段審查。豁免條件與 `skills/scrum-master/SKILL.md` §10.3 Bypass 保護清單對齊——涉及 Framework Document Change、外部 API、安全相關的 Story 不得適用豁免。
+
+<HARD-GATE>
+所有功能實作必須遵循 TDD：先寫失敗測試 → 最小實作讓測試通過 → 重構。
+例外：標注為 [SPIKE] 的探索性任務可豁免，但進入正式開發時必須補測試。
+</HARD-GATE>
+
+<HARD-GATE>
+**所有 Story（含 test-only Story）交付必須透過 Pull Request，不得直推 main。**
+Sprint Review 時將逐一確認每個 Story 是否有對應 PR；若無，標記 `[PROCESS-VIOLATION]`。
+此規則自 Sprint 166 起強制生效（Sprint 165 Retro Action #853）。
+</HARD-GATE>
+
+<HARD-GATE>
+**[MANDATORY] POST-EXECUTION PR 強制驗證 Hard Gate（#989 L1 止血）**：
+Story-Lifecycle subagent 回傳 PASS 後，主 session **必須強制執行**：
+  bash scripts/state-machine/post-execution-pr-verify.sh --branch "$BRANCH_NAME"
+升級動作矩陣：
+  [POST-EXEC-PR-MISSING]    → Story=BLOCKED，拒絕 PASS，暫停 Sprint
+  [POST-EXEC-PR-WRONG-BASE] → 拒絕 PASS，不自動補救
+  [POST-EXEC-PR-NOT-OPEN]   → 拒絕 PASS，不自動補救
+  [POST-EXEC-PR-PASS]       → 繼續外部 QA 審查
+不得自動補救（不建 PR、不 push、不 merge）。
+此 Hard Gate 為 §3 流程強制嵌入點，跳過等同 PROCESS-VIOLATION。
+（#989 修正：取代 #976 軟性流程圖語意，升級為強制 bash 指令）
+</HARD-GATE>
+
+<HARD-GATE>
+**外部獨立審查 Hard Gate（Sprint Execution）**：所有 Story-Lifecycle subagent 回傳 PASS 的 Story，
+必須接受 100% 外部獨立 QA subagent 審查。不得跳過、不得降級。
+DISPUTE → 強制二審；二審 DISPUTE → 升級 Architect。
+（#958 修正：自審不可替代獨立 QA，與 /shoot 100% 外部審查對齊）
+</HARD-GATE>
+
+<HARD-GATE>
+**Prompt Template Integrity（派遣指令不可變）**：主 session 派遣 Story-Lifecycle subagent 時，
+僅允許傳入 story-lifecycle-prompt.md 定義的 YAML 契約欄位（§輸入格式）。
+禁止追加任何自然語言指示（如「快速處理」「跳過 QA」「簡化審查」）覆寫 Hard Gate。
+違反此規則等同流程違規（Process Violation），Sprint Review 時標記 [PROMPT-INTEGRITY-VIOLATION]。
+（#959 修正：主 session 不得追加 ad-hoc 指令覆寫 subagent Hard Gate）
+</HARD-GATE>
+
+Story Type 對 TDD 豁免與 Review 策略的影響（FEATURE 必須 TDD；DESIGN 豁免；INFRA 條件性；SECURITY 強制；INTEGRATION 必須；RESEARCH 豁免）。doc-only Story 優先判定 TDD 豁免，但雙階段 Review 維持必要。
+
+> 詳見 `references/hard-gates-tdd.md`（L-size 審查增強、§8.1 安全審查觸發條件）
+
+---
+
+## 6. DoD 自檢
+
+每個 Story 完成前，Developer 必須逐項檢查 Definition of Done。DoD 條件定義請參照 `skills/scrum-master/SKILL.md` §8。
+
+> DoD checkbox 格式與 §6.1 Checkpoint 檢查項：`references/dod-checklist.md`
+
+---
+
+## 7. Systematic Debugging 觸發指引（CI FAIL / Deploy 後 / Bug 修復後）
+
+以下時機均為**建議，非強制**，觸發方式統一為 `invoke shikigami:systematic-debugging`。
+
+> 詳見 `references/systematic-debugging.md`（觸發時機表：CI FAIL / Deploy 後 / Bug 修復後）
+
+---
+
+## 8. 審查失敗處理
+
+當任一審查階段不通過時：
+
+1. Reviewer 產出具體問題清單（含嚴重度分級）
+2. 同一個 Developer subagent 接收問題清單進行修復
+3. 修復完成後，重新執行該審查階段
+4. 同一審查階段連續失敗 3 次，升級至 Architect 評估是否有設計問題
+
+> L-size Story 審查增強（觸發條件：Story Size = L）與 §8.1 安全審查觸發條件：`references/hard-gates-tdd.md`
+
+---
+
+## 9. 與其他 Skill 的關係
+
+| 情境 | 觸發 |
+|------|------|
+| 發現需求不清 | 暫停，升級至 PO 釐清 → 回到 sprint-execution |
+| 發現需要架構決策 | 暫停，觸發 `architecture-decision` → ADR 定案後回到 sprint-execution |
+| 所有 Story 完成 | 觸發 `sprint-review` 進行驗收與回顧 |
+| 發現安全問題 | 觸發 `security-review` 進行深度安全審查 |
+
+### 9.1 角色決策指引
+
+Sprint Execution 中各角色的具體決策標準請參閱以下文件：
+
+- **Architect 決策指引**（估點策略、ADR 需求判斷、平行分群策略）：[`skills/architect/SKILL.md`](../architect/SKILL.md)
+- **QA Engineer 決策指引**（AC 驗證策略、Spec Compliance review 決策、Code Quality review 策略）：[`skills/qa-engineer/SKILL.md`](../qa-engineer/SKILL.md)
+
+---
+
+<!-- ADR-007 Phase 2 外部獨立審查機制已於 Sprint 24 US-41 完成實作並通過 QA 驗收，詳見 `docs/adr/ADR-007-story-lifecycle-subagent.md`。 -->
+
+---
+
+## 9.2 Sprint Live Log（演示模式 — US-269）
+
+<!-- US-269 演示模式 Live Log Streaming — Sprint 99 -->
+
+Sprint Execution 支援 Live Log Streaming，讓使用者在另一個 terminal 即時觀看 Story-Lifecycle subagent 工作進度。每個 session 寫入獨立 `.log` 檔案（`logs/live/YYYY-MM-DD-session-<SESSION_ID>.log`）。日誌寫入為可選機制，失敗時靜默忽略，不影響主流程。
+
+> 詳見 `references/live-log.md`
+
+---
+
+## 10. Developer Refinement 職責
+
+<!-- US-203 角色 Refinement 職責定義 — Sprint 77 -->
+
+Developer 在 Refinement 中負責提供技術實作面的輸入，協助 Architect（Refinement Chair）識別實作風險與依賴，確保 Story 進入 Sprint 後不因技術細節阻塞開發。Developer 在 Refinement 中為**諮詢（Consulted）**角色，不主持、不輸出正式報告。
+
+> 詳見 `references/developer-refinement.md`（職責說明表、Refinement 輸出定義）
+
+---
+
+## 11. Compliance Audit（強制輸出）
+
+<HARD-GATE>
+每個 Story 的 Story-Lifecycle subagent 結束前，以及所有 Stories 完成後的主 session 彙總，都必須輸出 [COMPLIANCE-AUDIT] 區塊。不得省略。
+</HARD-GATE>
+
+### 11.1 Story 層級 Audit（每個 Story 結束時）
+
+Story-Lifecycle subagent 完成後，回傳摘要必須包含：
+
+```
+[COMPLIANCE-AUDIT] sprint-execution Story #N
+✅ TDD Red    — 失敗測試已寫（N 個 tests）
+✅ TDD Green  — 最小實作通過
+✅ TDD Refactor — 重構完成（N commits）
+✅ Spec Compliance Review — 通過（N 個 AC 全部覆蓋）
+✅ Code Quality Review    — 通過
+⏭ Security Review        — 跳過（非外部輸入 Story）
+✅ PR 建立   — PR #N 已開啟
+
+Artifact: PR #N ✅ / 未開啟 ❌
+```
+
+### 11.2 Sprint Execution 彙總 Audit（所有 Stories 完成後）
+
+主 session 在所有 Stories 執行完畢後輸出：
+
+```
+[COMPLIANCE-AUDIT] sprint-execution Sprint N 彙總
+Stories 完成：N 個
+✅ #XXX「Story Title」→ PR #N
+✅ #XXX「Story Title」→ PR #N
+❌ #XXX「Story Title」→ 失敗（原因）
+
+整體結果：N/N 通過 ✅ / 有失敗項目 ❌
+```
+
+**符號規則**：
+- `✅` 已執行且 artifact 可驗證
+- `⏭` 跳過，必須附上原因
+- `❌` 應執行但失敗，必須附上原因

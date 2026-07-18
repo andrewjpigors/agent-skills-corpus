@@ -1,0 +1,432 @@
+---
+name: ac-writing-blog-posts
+description: Write blog articles and generate social media posts to promote them. Use when user says "blog", "article", "write post", "blog post", or wants to create/update a blog article or generate social media content.
+compatibility: Any agent that can read/write files.
+metadata:
+  version: 0.0.1
+  subagent_safe: true
+---
+
+# Blog Post
+
+Write blog articles and generate promotional social media content.
+
+## Dependencies
+
+Standalone. No dependencies on other skills.
+
+## Rules
+
+### This Skill Is Generic (Non-Negotiable)
+
+This skill is published in a public repository. It must **never** contain user-specific details: repo names, directory layouts, secret names, org names, or infrastructure specifics. Use `<user>`, `<repo>`, or similar placeholders in examples. Project-specific details belong in the agent's memory or a private overlay — not here.
+
+### Never Invent Anything on the Author's Behalf (Non-Negotiable)
+
+**Never state anything in the author's name that isn't explicitly provided by the author or sourced from verifiable project files (README, SKILL.md, code, commit history, memory entries, etc.).** The rule is broader than biographical detail — it covers every load-bearing claim attributed to the author. Forbidden without an explicit source:
+
+- Life events, career history, motivations, or emotional experiences
+- Time estimates ("I spent 15 minutes...", "after months of...", "two days of green CI")
+- Habits or workflow descriptions ("I always...", "every morning I...", "I run two prompts periodically")
+- Opinions or preferences not explicitly stated
+- **Quantitative claims about the author's experience** ("fifteen percent of my reads", "ten worktrees, half stale", "the hook is twenty lines"). Either come from a measurement the agent ran in this session, or from a user-supplied number, or they're deleted.
+- **Experiments the author did not run** ("when I disabled X for an A/B test", "the first time I ran with metrics", "I tried briefly to give both lanes the same lease"). Fabricated experimental evidence is the highest-stakes invention — it makes a post sound rigorously empirical when it isn't.
+- **Past states of the author's system** ("the file used to be 600 lines", "my first version had X", "after a few weeks I had ten of them"). Verify against `git log -S` / `git blame` / the actual current state of the file before claiming a "before" picture, or ask.
+- **Code snippets attributed to the author's codebase.** Copy from the actual file via `Read`. Never reconstruct from a remembered description of what the function does — the reconstruction will be plausible-shaped and wrong.
+
+When biographical or experiential context would improve the article, **ask the user** with a specific question. Example: "The intro would benefit from context about how you noticed the bug — can you share a sentence or two about what tipped you off?"
+
+Save user-provided biographical details as a `user` type memory with a descriptive title for reuse in future articles.
+
+**Pre-publish source audit (Non-Negotiable):** before assembling the final draft, walk every paragraph and identify, per load-bearing claim, the evidence source — `file:line` reference, commit hash, memory entry, or user-supplied detail in this conversation. Claims without a source are deleted or sent back to the user with a question. This applies to claims of any kind, not just biographical, and runs **before** the "Review Against Source Material" step in the workflow. The earlier review catches missing citations and limitations; this audit catches the silent fabrications that look like personal voice.
+
+### Humble, Non-Pretentious Tone (Non-Negotiable)
+
+- Never position the author as smarter or more insightful than others.
+- Present learnings as personal takeaways, not corrections of others' work.
+- "I found that..." over "The right way to..."
+- "This works well for my workflow" over "This is the best approach"
+- Acknowledge limitations and experimental status honestly.
+- Avoid superlatives and marketing language.
+- The purpose is **sharing, not showing off.** The author is exploring and has
+  much left to learn — write from a learner's stance ("here's what I tried and
+  what I'm still figuring out"), never from a position of authority or mastery.
+- Never imply the author knows everything or has it all figured out. "I'm
+  scratching the surface" is closer to the truth than "here's how to do it."
+- It is fine — encouraged — to show unfinished thinking, dead ends, and open
+  questions. That is what makes the post worth reading and worth trusting.
+
+### Straight and Short, Not Prosaic (Non-Negotiable)
+
+You are not writing a book. The first draft is roughly twice as long as it
+should be — write it, then cut it in half before showing the user.
+
+- **Every sentence carries information or gets cut.** Throat-clearing,
+  scene-setting, and "beautiful" sentences that exist for rhythm rather than
+  content are deleted. If cutting a sentence loses no fact, cut it.
+- **No story-telling for its own sake.** A one-line concrete anecdote that makes
+  a technical point earns its place; a narrative arc wrapped around the point
+  does not. State the point, show the evidence, move on.
+- **Plain words over elegant ones.** Reflective asides and rhetorical flourishes
+  are voice tics — keep at most one or two per post, not one per section. (An
+  author's own recurring asides, if any, belong in their `styles/` voice
+  profile, not in this generic rule.)
+- **Get to the point in the first two sentences.** Don't warm up. The opener
+  says what the post is about and why it's worth reading; the body delivers it.
+- **Tighten before you assemble.** After the sections are drafted, do one
+  explicit compression pass: per paragraph, ask "what does this add?" — merge or
+  delete anything that fails. Compare word count before and after; if it didn't
+  drop meaningfully, you didn't tighten.
+
+### Match the Author's Voice (Non-Negotiable When a Profile Exists)
+
+**Where profiles live.** The skill reads voice profiles from the directory set as `styles_dir` in `~/.ac-writing-blog-posts.yml` — an absolute or `~`-relative path, so profiles can live in a separate repo (e.g. the author's dotfiles) rather than in this public skill. If `styles_dir` is unset, fall back to this skill's bundled `styles/` directory.
+
+In that directory, profiles are layered on top of this skill:
+
+- **This skill** holds the universal rules (humble, honest, straight, sound-human, off-by-default) — they apply to every author and every voice, and are never repeated in a profile.
+- **A base profile** `<author>.md` holds the traits common to *all* of that author's voices — register, sentence mechanics, structural habits, dos and don'ts. It is derived from **real samples of the author's own writing** (their published work, not AI-assisted drafts), and is the concrete instance of the universal rules; where a profile and a universal rule both apply, the profile's specifics win.
+- **Optional voice variants** `<author>-<voice>.md` hold **only the deltas** for a topic or audience (e.g. a drier reference voice, a punchier opinion voice). A variant extends its base and never repeats base traits.
+
+**Ask which voice first (before Phase A).** Resolve `styles_dir`, then scan it. If a single base profile exists, confirm it. If variants exist, ask the user which voice fits this post's topic and audience, then load the base **plus** the chosen variant. If no profile exists, offer to derive one from samples.
+
+**Verify each sample is the author's own writing before using it.** A file in the author's drive, repo, or blog folder is not proof of authorship — it may be a collaborator's, a received document, or boilerplate. Watch for third-person self-references ("X and I"), co-author names, or received-document markers, and confirm with the author when authorship is ambiguous. A misattributed sample poisons the profile with someone else's voice.
+
+Every profile encodes *how the author writes*, not *what they write about*, and obeys "Off by Default" (below): never the author's private life, emotions, or opinions. If a sample reveals something personal, it stays out of the profile unless the author approved it — when unsure, ask.
+
+### Sound Human, Not AI-Generated (Non-Negotiable)
+
+The post must read as written by a person, not produced by a model. Reviewers
+and readers should never get the "this is AI slop" feeling.
+
+- No formulaic scaffolding: avoid "In this post, we'll explore…", "Let's dive
+  in", "In conclusion", "Here are N key takeaways", section-ending summaries that
+  restate the section.
+- Vary sentence and paragraph length. Allow short, blunt sentences. Avoid the
+  even, list-heavy, every-paragraph-same-shape cadence that signals generation.
+- Cut hedging filler ("it's worth noting", "it's important to remember",
+  "essentially", "fundamentally") and triadic flourishes ("fast, reliable, and
+  scalable") unless each adjective earns its place.
+- Concrete specifics over abstract claims: a real command, a real diff, a real
+  number the agent measured — not "significantly improved performance".
+- Keep contractions and a natural first-person voice. Let opinions be opinions;
+  do not neutralize them into balanced both-sides prose.
+- Em-dash and emoji discipline: sparingly, as a human would, not as decoration.
+- Final self-check before assembly: read it aloud in your head — if a paragraph
+  sounds like a model being helpful rather than a person thinking, rewrite it.
+
+### Honest and Trustworthy Content (Non-Negotiable)
+
+Content must be accurate, verifiable, and down-to-earth. The goal is to share genuinely useful information, not to impress.
+
+- **No over-selling.** Don't exaggerate what a tool or project does. Describe capabilities plainly — let the reader decide if it's useful.
+- **No false paternity.** Don't claim to have invented concepts, patterns, or terms that exist independently. If the author built on existing ideas, acknowledge that.
+- **No inflated language.** Avoid "open standard" (unless formally standardized), "framework" (for what's really a collection of scripts), "enables" (marketing speak), "game-changer", "revolutionary", etc.
+- **Verify claims before publishing.** Count the files, check the versions, test the commands. Don't write "15 scripts" without counting. Don't say "supported across most agents" without evidence.
+- **Acknowledge limitations prominently.** Every tool has rough edges. State them near the beginning, not buried at the end.
+- **No "insight" or "key takeaway" framing.** Just state what works and what doesn't. The reader can draw their own conclusions.
+
+### The Author's Private Life and Feelings: Off by Default (Non-Negotiable)
+
+What happened to the author and how the author felt about it are **private by default** — they appear in a post only when the author explicitly says to publish them. Hearing it in conversation, in Slack, or in a retro is not authorization to publish it.
+
+This is about the author's personal and emotional life, not the technical work. The work, the findings, and the author's technical opinions are the subject of the post and belong there. What stays out unless the author explicitly clears it:
+
+- **Feelings and emotional states** — frustration, anger, being "pissed", relief, excitement, burnout. Out even when true, even when the author said it to you. ("Every day I have to manually fix it" → publish the recurring failure mode, not the exasperation.)
+- **Personal and life circumstances** — career or employment plans, money, health, relationships, location, what the author is going through.
+- **Costly incidents** (money / security / data-loss) get the strongest form of this rule: publish the failure mode as a pattern others can hit ("X *can* drain your credits — here's why, and how to prevent it"), never as a confession it happened to the author, and never a dollar amount lost, unless the author opts in.
+
+When personal context would genuinely strengthen the post, **ask** — quote the exact sentence you'd add and let the author approve or decline it. Default to leaving it out.
+
+### No Repeated Disclaimers (Non-Negotiable)
+
+When a caveat or qualification is already stated in one place (e.g., "tested most with Claude Code" in the intro), do not add variations of it elsewhere (prerequisites, Get Started, etc.). State it once, trust the reader, stop. When the user gives iterative feedback to simplify, apply the simplification fully in one pass rather than introducing a new hedge that needs another correction round.
+
+### Source-Grounded Claims Only (Non-Negotiable)
+
+Every technical claim in the article must be verifiable against the actual codebase, documentation, or skill files. Before writing about a tool or project:
+
+1. Read the source files (README, SKILL.md, scripts, config).
+2. Base descriptions on what the code actually does, not what it might do.
+3. When unsure about a feature's status or behavior, ask the user.
+
+### Respect Repository AGENTS.md (Non-Negotiable)
+
+Before writing or editing files in a blog repository, read its `AGENTS.md` (or `CLAUDE.md`) if one exists. These files define which directories are generated and must not be touched. Common patterns:
+
+- `output/`, `assets-manifest.json` — generated by CI or build scripts. **Never create, edit, or delete files there.**
+- Only edit source files in `posts/` and `posts/assets/`.
+
+### Draft Status
+
+Blog posts should include `draft: true` in their frontmatter until the user explicitly marks them as published. Published posts (`draft: false`) must not be modified — they are snapshots in time.
+
+## Workflow
+
+### 1. Interactive Authoring Dialogue (Non-Negotiable)
+
+A blog post is the user's voice on the page — not yours. Writing runs as a conversation where **the user drives intent, structure, and voice, and you help formalize and propose phrasings**. Never produce a full draft from a single upfront prompt — that produces articles that don't sound like the user and don't express what they actually wanted to say.
+
+**Rules of the dialogue**
+
+- **One question per turn.** Ask exactly one question, wait for the answer, then ask the next. Each answer changes what the next question should be — you cannot know the right next question until the prior answer lands. Never batch.
+- **Every question has 4 to 8 options.** Always a numbered menu, tailored to the conversation so far. Options must span a real range, not near-duplicates. The last option is always "none of these — I'll describe it myself".
+- **Always run this dialogue.** Run it for every post, even when the user provides a clear topic or source material. The topic is the starting point of the dialogue, not a shortcut past it. Only skip if the user explicitly says something like "skip the dialogue, just draft it".
+- **Suggest actual prose at paragraph level.** When drafting a section, propose 4-8 *written paragraphs* — not outlines or bullets. The user picks, edits, or asks for more variants. (Analogous to how slides propose the actual words on the slide; blog posts propose the actual paragraphs.)
+- **The user owns the story.** You help formalize, suggest phrasings, and catch inconsistencies. You do not decide the narrative arc, the stance, or the voice.
+
+**If the user rejects all options in a turn**, the options missed the real axis. Do not simplify to a binary, and do not re-paraphrase the same set. Ask what dimension was missed, then regenerate along that dimension.
+
+#### Phase A — Intent & frame
+
+One turn per bullet, in this order:
+
+- **What the post *does* for the reader** (introduces a tool, walks through a technique, reflects on a failed experiment, compares approaches, pushes back on a common view, answers a recurring question, documents a working pattern, retrospective on a longer effort, etc.).
+- **Target audience** (peers on the same stack, newcomers needing step-by-step, skeptics, a named community, the user's future self as reference, mixed with a primary target, etc.).
+- **User's stance on the topic** (enthusiast / cautious / critical / undecided / curious observer / ambivalent / other).
+- **Tone calibration** (dry-factual, warm-personal, technical-narrative, conversational-brief, reflective, polemical, etc. — tie options to short example phrasings when useful).
+- **The single sentence the reader should walk away with**: generate 4-8 candidate takeaway sentences built from the prior answers. User picks or reshapes.
+
+Before Phase A, run the voice check from "Match the Author's Voice": pick the voice (ask the user which one when more than one exists) and load its base profile plus any chosen variant. Also check the agent's memory for stored author bio / style preferences. Ask only for what's missing. Save new answers as `user` type memories with descriptive titles, and fold durable voice observations back into the base profile (or the relevant variant) so the next post reuses them.
+
+#### Phase B — Structure
+
+One turn per bullet:
+
+- **Outline**: offer 4-8 *full outlines*, each a short list of sections with a one-line description per section. Each outline should embody a real structural choice (chronological / problem-solution / thesis-and-evidence / compare-and-contrast / Q&A / walkthrough / annotated example / retrospective timeline / how-I-got-here / etc.), not just reshuffled titles.
+- **Title**: 4-8 title candidates derived from the chosen outline and takeaway sentence.
+- **Opening paragraph**: 4-8 actual prose openers spanning real angles (anecdote / direct thesis / question / scene-setting / quote / definition / observation / confession), not outlines.
+
+#### Phase C — Drafting, section by section
+
+For each section in the chosen outline:
+
+1. Restate the section's job in one sentence (from the outline).
+2. Offer 4-8 *full draft paragraphs* (or multi-paragraph blocks) for the section. Drafts must span real angles — one might open with an anecdote, another with a definition, another with a direct claim, another with a question, another with a code example and minimal framing.
+3. User picks, edits inline, asks for more variants, or asks you to merge two. Iterate until they accept.
+4. Move to the next section.
+
+When every section is accepted, assemble the full draft with frontmatter:
+
+```yaml
+---
+title: "Article Title"
+date: YYYY-MM-DD
+draft: true
+---
+```
+
+Use first person when sharing personal experience, short paragraphs (3-5 sentences max), code blocks with language annotations, and links to source repos and referenced projects.
+
+### 2. Review Against Source Material
+
+After assembling the draft, verify:
+
+- [ ] Every technical claim matches the actual codebase (counts, versions, commands)
+- [ ] No biographical details were invented
+- [ ] No undisclosed personal events or feelings (see "Off by Default")
+- [ ] Tightened — roughly half the natural draft length, no filler sentences
+- [ ] Tone is humble and non-pretentious
+- [ ] No over-selling, inflated language, or false paternity claims
+- [ ] All links are valid
+- [ ] Code examples are correct and runnable
+- [ ] Limitations are honestly stated (near the beginning, not buried)
+
+### 3. Final Full-Draft Review
+
+Phase C iterates section by section. This step reads the *assembled* article as a whole and checks what turn-by-turn review can't catch:
+
+- Cross-section coherence (does section 3 still make sense after the user changed section 1?)
+- Redundancy across sections
+- Pacing (too much setup, rushed ending, etc.)
+- Consistency of tense, voice, and level of detail
+- Length — is every paragraph load-bearing? Run the compression pass from "Straight and Short" and confirm the draft is meaningfully shorter than the natural first version.
+
+Present the assembled draft to the user and ask what to adjust. If changes touch the structure, loop back into Phase B/C for the affected sections rather than rewriting inline.
+
+### 3b. Reviewing an Existing Draft Together (Non-Negotiable Protocol)
+
+When the user asks to review an already-assembled draft "together" (or to apply their change requests to one), do not paste the whole article and wait. Walk it:
+
+1. **Print one section at a time** in the conversation — the actual prose, not a summary — and wait for the user's verdict on that section.
+2. **When the user requires a change, apply it, then re-check every FOLLOWING section for fit** before printing the next one. A changed claim in section 1 routinely invalidates a transition, a callback, or a metaphor later — update those follow-on sections as part of the same change, not as a separate round. Tell the user which later sections you touched and why.
+3. **Show the diff.** After any edit pass on an existing post, show the `git diff` of the post file before pushing or syncing. The user reviews changes as diffs, not as re-pasted prose.
+4. A change request phrased as a direction ("this feels weak, say X instead") is a rewrite instruction for that section, not an invitation to restructure the post. Keep the blast radius to the section plus its fit-ups.
+
+### 4. Promote the Article
+
+After the user is happy with the draft (or after publishing), ask:
+
+> "Would you like to promote this post? I can help you submit to newsletters, post on social media, and cross-post to other platforms."
+
+If the user says yes:
+
+1. **Check article publication status first (Non-Negotiable).** If the article has a dev.to `id` in its frontmatter and a dev.to API key is available in `pass`, query the dev.to API (`GET /api/articles/{id}`) to confirm actual publication status and retrieve the live URL. Do NOT assume publication status from local frontmatter fields — the local `published` field may not reflect the actual dev.to state.
+
+2. **Load the config file** `~/.ac-writing-blog-posts.yml`. If it doesn't exist:
+   - Suggest common outlets (PyCoder's Weekly, Django News, Hacker News, Reddit, LinkedIn, dev.to).
+   - Ask the user which ones they care about and any extras they want to add.
+   - Create the config file with their selections. See [`references/promotion.md`](references/promotion.md) for the full format.
+
+3. **Ask about outlet info freshness.** Ask the user whether to re-verify outlet submission methods (by fetching each outlet's page) or proceed with what `references/promotion.md` already knows. Re-verification is recommended if the info is more than a month old (check the "verified on" date at the top of the reference file). If re-verifying, fetch each outlet's submission page, confirm the method is still accurate, and update the reference file with any changes found.
+
+4. **Filter outlets by article topic.** Match the article's tags/topic against each outlet's `tags` field. Present only relevant outlets.
+
+5. **Dry-run first (Non-Negotiable).** For each relevant outlet, show the user exactly what will be sent and where:
+   - **Form outlets:** Draft the text fields. Show the submission URL. Let the user copy-paste or open the form.
+   - **GitHub PR outlets:** Draft the PR description and show the target repo.
+   - **Social media:** Draft the post text per platform (see Social Media Generation below).
+   - **Cross-posting platforms:** Generate platform-ready markdown if applicable.
+
+6. **No AI-generated content where banned (Non-Negotiable).** Some platforms explicitly prohibit AI-generated content (e.g., Hacker News bans AI-generated comments). Check `references/promotion.md` for per-outlet restrictions. For these platforms, only draft titles/URLs — the user must write any accompanying text themselves.
+
+7. **Wait for explicit approval** before taking any action. The user must confirm each outlet individually or approve all at once.
+
+8. **Credentials via `pass`.** If an outlet requires authentication (API key, login):
+   - Check the `credentials` section of the config file for a `pass` entry name.
+   - Read it with `pass show <entry>`. Never store credentials in plain text, in the config file, or in memory.
+   - If no `pass` entry exists, ask the user: "I need a credential for X. Do you have it in `pass`? What's the entry name?"
+
+9. **Present all pending outlets at once (Non-Negotiable).** Display a single list/table of all pending outlets with:
+   - Outlet name
+   - Submission URL (clickable)
+   - Draft text (ready to copy-paste)
+
+   Do NOT open the browser or walk through outlets one by one. The user works through submissions at their own pace. If a draft needs clipboard copying, offer it on request — don't push it.
+
+   **dev.to** is the exception: if the user has a dev.to API key in `pass`, the agent can push via the dev.to API or the CI workflow from [`references/devto-publishing.md`](references/devto-publishing.md).
+
+10. **Track what was submitted.** After the user confirms which outlets they submitted to, update the cache file status lines. List remaining pending outlets so the user can resume later.
+
+## Social Media Generation
+
+When asked to generate social media content (or when the user passes a platform name), generate a short promotional message for the specified platform. Output to console — do not save to a file unless asked.
+
+### Supported Platforms
+
+| Platform | Style | Length | Notes |
+|----------|-------|--------|-------|
+| **linkedin** | Professional, descriptive | 200-300 words | Include 3-5 hashtags. Mention role/company if known. Put article link directly in the post body — don't use "link in first comment." |
+| **mastodon** | Technical, community-focused | Under 500 chars | Include 3-5 hashtags. Link to repo/article. |
+| **hackernews** | Minimal, factual | Title + 2-3 sentence comment | No hashtags. Focus on technical merit. Avoid self-promotion tone — HN readers detect it instantly. |
+| **reddit** | Conversational, community-aware | Title + short body | Suggest appropriate subreddits (r/programming, r/python, r/django, etc.). Be genuine, not salesy. |
+
+### Generation Process
+
+1. Read the blog post being promoted.
+2. Extract the 2-3 most compelling points for the target audience.
+3. Generate the message following platform conventions.
+4. Present to the user for review — never post automatically.
+
+### Asking User for Social Media Preferences
+
+On first social media generation, ask:
+
+- "Which platforms do you typically post to?"
+- "Do you have specific handles or hashtags you always include?"
+- "Any platforms where you prefer a specific tone?"
+
+Save answers as `user` type memories with descriptive titles for future use.
+
+## Promotion Cache
+
+Approved promotion drafts are cached in `${XDG_DATA_HOME:-$HOME/.local/share}/ac-writing-blog-posts/` with one file per article:
+
+- `promotion-<post-filename>.md` — mirrors the post's filename (e.g., `promotion-20260309-introducing-teatree.md` for `posts/20260309-introducing-teatree.md`). Contains all outlet drafts for that article, plus metadata (dev.to ID, URLs, tags, generation date).
+
+### When to use the cache
+
+- Before drafting new promotion content, check if a cache file already exists for the article.
+- If cached drafts exist, present them instead of regenerating.
+- Update the cache when drafts are revised after user feedback.
+
+### Cache file format
+
+```markdown
+# Promotion Drafts: <Article Title>
+
+source: posts/<filename>.md
+devto_id: <id>
+devto_url: <url>
+github_url: <url>
+tags: [<tags>]
+generated: <YYYY-MM-DD>
+
+## <Outlet Name>
+
+status: pending | submitted (<YYYY-MM-DD>) | skipped (<reason>)
+
+<draft content per outlet>
+```
+
+### Tracking submissions
+
+Each outlet section has a `status:` line:
+
+- `pending` — not yet submitted (default)
+- `submitted (YYYY-MM-DD)` — user confirmed they submitted on that date
+- `skipped (reason)` — intentionally skipped (e.g., "no account", "not relevant")
+
+After the user submits (or skips) an outlet, update the status line in the cache file. When resuming promotion in a future session, read the cache to show only pending outlets.
+
+## File Conventions
+
+- Blog posts go in the project's `blog/` directory.
+- Filename format: `YYYYMMDD-slug.md` (e.g., `20260310-introducing-teatree.md`).
+- Images go in `blog/assets/` or alongside the post.
+
+## Publishing to dev.to
+
+This skill ships a reusable two-repo pattern for publishing markdown to dev.to when your blog repo is private. See the reference docs for the full architecture, and the reference workflow for a copy-paste GitHub Action.
+
+> **Before adopting:** search for newer approaches. dev.to may have added an image upload API, or better actions may exist. The references were written in March 2026.
+
+### How It Works (Summary)
+
+A private blog repo holds source markdown. A public "assets" repo hosts images (static + generated diagrams). CI hashes images and only pushes changed ones, then generates platform-ready markdown with rewritten URLs. Publishing is a manual workflow dispatch.
+
+For the full pattern — repo layout, manifest format, image pipeline, workflow triggers, secrets — see [`references/devto-publishing.md`](references/devto-publishing.md).
+
+For a ready-to-use GitHub Actions workflow, see [`references/publish-devto.yml`](references/publish-devto.yml). Replace `<user>` with your GitHub username.
+
+### dev.to Frontmatter
+
+```yaml
+---
+title: "Article Title"
+published: false           # Set to true only when ready to go live
+description: "One-liner"
+tags: ai, automation        # Max 4 tags on dev.to
+cover_image: assets/banner.jpg   # Rewritten to CDN URL by CI
+# id: 1234567              # Added automatically after first publish
+---
+```
+
+### The Platform Draft Is a Second Writing Surface (Non-Negotiable)
+
+Once a post has a platform draft (a dev.to `id` in its frontmatter), the author may edit on the platform at any time. **Before any local edit to such a post, run the pull/diff against the platform first** and fold the author's on-platform edits into the source. Editing locally without syncing clobbers their work on the next push. The order is always: pull → edit → push.
+
+### Pulling Changes Back from dev.to
+
+If the author edits a post directly on dev.to (typos, formatting, wording), those changes can be pulled back into the source markdown without breaking mermaid blocks, local image paths, or cross-article links.
+
+The blog CLI should support a `pull` command (or equivalent) that:
+
+1. Fetches `body_markdown` from the dev.to API
+2. Reverse-transforms: CDN image URLs → local `assets/` paths, dev.to article links → `posts/<slug>.md`, mermaid image refs (`![slug diagram N](url)`) → original ```` ```mermaid ```` source blocks (positional match)
+3. Overwrites the source file in `posts/`
+4. The author reviews with `git diff` and uses `git checkout -p` to accept/reject individual hunks
+
+**Limitation:** if someone deletes or reorders mermaid diagrams on dev.to, the positional matching breaks. For typical edits (typos, rewording, adding paragraphs), it works reliably.
+
+### Platform Limitations (as of March 2026)
+
+- **dev.to:** no public image upload API — images must be hosted externally.
+- **dev.to frontmatter parser is stricter than YAML** (observed June 2026): a folded multi-line `description:` value that a YAML normalizer happily emits makes the API reject the whole document (422 "Title can't be blank"). Keep frontmatter values on a single line — or sidestep frontmatter entirely by sending the API's structured fields (`title`, `description`, `tags`, `series`, `published`, `body_markdown` without frontmatter) on create/update. The structured-field path is the more robust default for programmatic publishing.
+- **Medium:** deprecated their write API, stopped issuing new tokens in January 2025.
+
+## References
+
+- [`references/devto-publishing.md`](references/devto-publishing.md) — two-repo publishing architecture
+- [`references/publish-devto.yml`](references/publish-devto.yml) — reference GitHub Actions workflow
+- [`references/promotion.md`](references/promotion.md) — per-outlet submission guide and config format
